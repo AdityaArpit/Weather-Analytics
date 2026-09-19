@@ -64,8 +64,10 @@ export async function runLifecycleJob(): Promise<LifecycleJobResult> {
       verification_status: string;
       last_observed_at: string;
       present_until: string;
+      ended_at: string | null;
+      archived_at: string | null;
     }>>(
-      `canonical_events?select=id,event_key,title,status,verification_status,last_observed_at,present_until&${statusFilter}&limit=500`
+      `canonical_events?select=id,event_key,title,status,verification_status,last_observed_at,present_until,ended_at,archived_at&${statusFilter}&limit=500`
     );
 
     eventsEvaluated = events.length;
