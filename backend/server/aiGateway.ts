@@ -1785,35 +1785,124 @@ Provide a professional, cited research answer:`;
 }
 
 export async function generateTTSAudio(text: string, voiceName: string = getGroqTtsVoice()): Promise<string | null> {
-  const apiKey = getGroqKey('tts');
-  const baseUrl = getGroqBaseUrl();
-  const ttsModel = getGroqTtsModel();
-  const cleanText = stripMarkdownForSpeech(text).replace(/\[S\d+\]/gi, '').slice(0, 500);
+  const audioKey = getGroqKey('tts');
+  const model = getGroqTtsModel();
+  const url = `${getGroqBaseUrl()}/audio/speech`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${audioKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      input: text,
+      voice: voiceName,
+      response_format: 'mp3',
+    }),
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const base64Audio = Buffer.from(arrayBuffer).toString('base64');
+  return `data:audio/mp3;base64,${base64Audio}`;
+}
+
+// Embedding provider interface and implementation
+export interface EmbeddingResult {
+  embedding: number[];
+  model: string;
+  dimensions: number;
+}
+
+const embeddingCache = new Map<string, { expiresAt: number; result: EmbeddingResult }>();
+const EMBEDDING_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function getEmbeddingModel(): string {
+  return process.env.GROQ_EMBEDDING_MODEL?.trim() || 'nomic-ai/nomic-embed-text-v1.5';
+}
+
+function getEmbeddingDimensions(): number {
+  const model = getEmbeddingModel();
+  if (model.includes('nomic') || model.includes('768')) return 768;
+  if (model.includes('1536') || model.includes('text-embedding')) return 1536;
+  return 1536; // default
+}
+
+/**
+ * Generate embedding for text using configured provider.
+ * Currently supports Groq-compatible embedding APIs.
+ * Returns null if provider is not configured or fails.
+ */
+export async function getEmbedding(text: string): Promise<EmbeddingResult | null> {
+  // Check cache first
+  const cacheKey = `embed:${getEmbeddingModel()}:${Buffer.from(text).toString('base64').slice(0, 64)}`;
+  const cached = embeddingCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
+  const apiKey = process.env.GROQ_API_KEY?.trim() || 
+                 process.env.GROQ_API_KEYS?.split(',')[0]?.trim() ||
+                 process.env.GROQ_API_KEY_01?.trim();
+  
+  if (!apiKey) {
+    // No embedding provider configured - return null gracefully
+    return null;
+  }
+
+  const model = getEmbeddingModel();
+  const dimensions = getEmbeddingDimensions();
+  const baseUrl = process.env.GROQ_BASE_URL?.trim() || 'https://api.groq.com/openai/v1';
+  const url = `${baseUrl}/embeddings`;
 
   try {
-    const response = await fetch(`${baseUrl}/audio/speech`, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: ttsModel,
-        input: cleanText,
-        voice: voiceName || getGroqTtsVoice(),
-        response_format: 'mp3',
+        model,
+        input: text,
+        encoding_format: 'float',
       }),
     });
 
     if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`Groq TTS failed: HTTP ${response.status} ${text}`.trim());
+      const errorText = await response.text().catch(() => 'Unknown error');
+      console.error(`Embedding API error: ${response.status} ${errorText}`);
+      return null;
     }
 
-    const audioBuffer = await response.arrayBuffer();
-    return toBase64(audioBuffer);
+    const data = await response.json() as any;
+    const embedding = data.data?.[0]?.embedding;
+    
+    if (!embedding || !Array.isArray(embedding)) {
+      console.error('Invalid embedding response format');
+      return null;
+    }
+
+    const result: EmbeddingResult = {
+      embedding,
+      model,
+      dimensions,
+    };
+
+    // Cache the result
+    embeddingCache.set(cacheKey, {
+      expiresAt: Date.now() + EMBEDDING_CACHE_TTL_MS,
+      result,
+    });
+
+    return result;
   } catch (error) {
-    console.log('Groq TTS fallback:', (error as Error).message);
+    console.error('Embedding generation failed:', (error as Error).message);
     return null;
   }
 }
