@@ -11,14 +11,15 @@ export interface CreateAppOptions {
 }
 
 function getAllowedOrigins(): Set<string> {
+  const isProd = process.env.NODE_ENV === 'production';
   const raw = [
     process.env.CORS_ORIGINS,
     process.env.FRONTEND_URL,
     process.env.APP_URL,
     process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '',
-    process.env.NODE_ENV === 'development' ? 'http://localhost:5173' : '',
-    process.env.NODE_ENV === 'development' ? 'http://127.0.0.1:5173' : '',
-    process.env.NODE_ENV === 'development' ? 'http://localhost:3000' : '',
+    // Localhost defaults exist ONLY in development; production fails closed and
+    // requires explicitly configured origins.
+    ...(isProd ? [] : ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000']),
   ]
     .filter((value): value is string => Boolean(value))
     .flatMap((value) => value.split(','))
@@ -32,10 +33,16 @@ function corsMiddleware(req: Request, res: Response, next: NextFunction) {
   const origin = req.headers.origin as string | undefined;
   const allowedOrigins = getAllowedOrigins();
 
-  if (origin && (allowedOrigins.size === 0 || allowedOrigins.has(origin))) {
+  if (origin && allowedOrigins.has(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
+  } else if (origin) {
+    // Origin not allowlisted: do not reflect it. The browser blocks the response.
+    if (req.method === 'OPTIONS') {
+      res.status(403).end();
+      return;
+    }
   }
 
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');

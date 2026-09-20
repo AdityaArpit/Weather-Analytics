@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Mic, Square, Loader2, AlertCircle } from 'lucide-react';
-import { apiUrl } from '../../lib/api';
+import { apiUrl, getAccessToken } from '../../lib/api';
 import { uiText } from '../../lib/uiText';
 
 function mimeToExt(mime: string): string {
@@ -142,8 +142,10 @@ export const AudioRecorderButton: React.FC<AudioRecorderButtonProps> = ({
       const formData = new FormData();
       formData.append('file', blob, `audio.${mimeToExt(mimeType)}`);
       formData.append('mimeType', mimeType);
+      const token = await getAccessToken();
       const res = await fetch(apiUrl('/api/transcribe'), {
         method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         body: formData,
       });
 

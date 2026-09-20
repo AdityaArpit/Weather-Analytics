@@ -104,9 +104,16 @@
   font-family: inherit;
 }
 
-/* Force hide all Leaflet attribution badges globally */
+/* Leaflet attribution: legally required; keep visible but visually subtle. */
 .leaflet-control-attribution {
-  display: none !important;
+  background: rgba(255, 255, 255, 0.85) !important;
+  color: #747F8D !important;
+  font-size: 9px !important;
+  padding: 1px 6px !important;
+  border-radius: 6px 0 0 0 !important;
+}
+.leaflet-control-attribution a {
+  color: #747F8D !important;
 }
 
 /* Make Lakshadweep islands visible by removing white borders that cover small paths */

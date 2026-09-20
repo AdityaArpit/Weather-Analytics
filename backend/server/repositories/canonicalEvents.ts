@@ -1,4 +1,3 @@
-import { HISTORICAL_DISASTERS_CATALOG } from '../data/historicalDisasters';
 import { isSupabaseConfigured, supabaseRest } from '../db/supabase';
 import type { CanonicalEventDto, CanonicalEventListResponse, EventCitationDto } from '../types/canonicalEvent';
 
@@ -12,6 +11,7 @@ type CanonicalEventRow = {
   urgency: string | null;
   certainty: string | null;
   description: string | null;
+  instruction: string | null;
   location_name: string | null;
   city: string | null;
   district: string | null;
@@ -20,7 +20,6 @@ type CanonicalEventRow = {
   latitude?: number | null;
   longitude?: number | null;
   centroid?: { coordinates?: [number, number] } | null;
-  geometry: unknown;
   started_at: string | null;
   last_observed_at: string | null;
   last_verified_at: string | null;
@@ -37,6 +36,13 @@ type CanonicalEventRow = {
   updated_at: string;
 };
 
+/** Public surfaces must never expose PENDING or REJECTED events. */
+export const PUBLIC_VERIFICATION_STATUSES = ['OFFICIAL_VERIFIED', 'CROSS_SOURCE_VERIFIED', 'PROVISIONALLY_VERIFIED'] as const;
+
+function publicVerificationFilter(): string {
+  return `verification_status=in.(${PUBLIC_VERIFICATION_STATUSES.join(',')})`;
+}
+
 function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
   const coordinates = row.centroid?.coordinates;
   return {
@@ -49,6 +55,7 @@ function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
     urgency: row.urgency || 'Unknown',
     certainty: row.certainty || 'Unknown',
     description: row.description || '',
+    instruction: row.instruction || undefined,
     locationName: row.location_name || [row.district, row.state].filter(Boolean).join(', ') || 'India',
     city: row.city || undefined,
     district: row.district || undefined,
@@ -56,7 +63,6 @@ function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
     country: row.country || 'India',
     longitude: row.longitude ?? coordinates?.[0],
     latitude: row.latitude ?? coordinates?.[1],
-    geometry: row.geometry || undefined,
     startedAt: row.started_at || undefined,
     lastObservedAt: row.last_observed_at || undefined,
     lastVerifiedAt: row.last_verified_at || undefined,
@@ -74,93 +80,120 @@ function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
   };
 }
 
-function seedEvents(): CanonicalEventDto[] {
-  const now = new Date().toISOString();
-  return HISTORICAL_DISASTERS_CATALOG.slice(0, 12).map((item) => ({
-    id: item.id,
-    eventKey: item.id,
-    title: item.eventName,
-    eventType: item.disasterType,
-    status: 'ARCHIVED',
-    severity: 'Severe',
-    urgency: 'Past',
-    certainty: 'Observed',
-    description: item.whatHappened,
-    locationName: `${item.location}, ${item.state}`,
-    state: item.state,
-    country: item.country,
-    startedAt: item.eventDate,
-    lastObservedAt: item.eventDate,
-    lastVerifiedAt: item.synthesizedAt,
-    endedAt: item.eventDate,
-    verificationStatus: 'PROVISIONALLY_VERIFIED',
-    verificationScore: item.evidenceStatus === 'High Confidence' ? 0.82 : 0.62,
-    verificationMethod: 'SEED_FIXTURE_RECONCILIATION',
-    verificationReason: 'Seeded from existing verified historical fixture for initial database population fallback.',
-    locationConfidence: 0.55,
-    sourceCount: item.sources.length,
-    citations: item.sources.map((source) => ({
-      id: source.id,
-      sourceName: source.publisher,
-      sourceType: 'SEED',
-      publisher: source.publisher,
-      title: source.title,
-      url: source.url,
-      publishedAt: source.publishedAt,
-      retrievedAt: item.synthesizedAt,
-      summary: source.summary,
-    })),
-    createdAt: now,
-    updatedAt: item.synthesizedAt || now,
+function toDtoList(rows: CanonicalEventRow[]): CanonicalEventDto[] {
+  return rows.map(rowToDto);
+}
+
+const VIEW_SELECT = 'id,event_key,title,event_type,status,severity,urgency,certainty,description,instruction,location_name,city,district,state,country,latitude,longitude,started_at,last_observed_at,last_verified_at,present_until,ended_at,verification_status,verification_score,verification_method,verification_reason,location_confidence,source_count,citations,created_at,updated_at';
+
+export async function listActiveCanonicalEvents(limit = 200): Promise<CanonicalEventListResponse> {
+  if (!isSupabaseConfigured()) {
+    return { items: [], count: 0, retrievedAt: new Date().toISOString(), cacheStatus: 'SEED_FALLBACK' };
+  }
+
+  // Fail-soft: an unreachable or not-yet-migrated database yields an empty
+  // public listing (the API layer decides whether to report degraded health).
+  const rows = await supabaseRest<CanonicalEventRow[]>(
+    `active_canonical_events?select=${VIEW_SELECT}&${publicVerificationFilter()}&order=last_observed_at.desc.nullslast&limit=${limit}`,
+  ).catch((error: Error) => {
+    console.warn('[canonicalEvents] active listing failed:', error.message);
+    return [] as CanonicalEventRow[];
+  });
+  const items = toDtoList(rows);
+  return { items, count: items.length, retrievedAt: new Date().toISOString(), cacheStatus: 'SUPABASE' };
+}
+
+export async function listArchivedCanonicalEvents(limit = 200): Promise<CanonicalEventListResponse> {
+  if (!isSupabaseConfigured()) {
+    return { items: [], count: 0, retrievedAt: new Date().toISOString(), cacheStatus: 'SEED_FALLBACK' };
+  }
+
+  const rows = await supabaseRest<CanonicalEventRow[]>(
+    `past_canonical_events?select=${VIEW_SELECT}&${publicVerificationFilter()}&order=started_at.desc.nullslast&limit=${limit}`,
+  ).catch((error: Error) => {
+    console.warn('[canonicalEvents] archive listing failed:', error.message);
+    return [] as CanonicalEventRow[];
+  });
+  const items = toDtoList(rows);
+  return { items, count: items.length, retrievedAt: new Date().toISOString(), cacheStatus: 'SUPABASE' };
+}
+
+export async function getCanonicalEventById(id: string): Promise<CanonicalEventDto | null> {
+  if (!isSupabaseConfigured()) return null;
+
+  // The event lives in exactly one lifecycle view (active or past); probe both.
+  const byView = (view: string) =>
+    supabaseRest<CanonicalEventRow[]>(
+      `${view}?id=eq.${encodeURIComponent(id)}&select=${VIEW_SELECT}&${publicVerificationFilter()}&limit=1`,
+    ).catch(() => [] as CanonicalEventRow[]);
+
+  const [active, past] = await Promise.all([byView('active_canonical_events'), byView('past_canonical_events')]);
+  const row = active[0] || past[0];
+  return row ? rowToDto(row) : null;
+}
+
+export async function searchCanonicalEventsLexical(query: string, limit = 50): Promise<CanonicalEventDto[]> {
+  if (!isSupabaseConfigured()) return [];
+  const encoded = encodeURIComponent(`%${query.replace(/[%_]/g, '')}%`);
+  const rows = await supabaseRest<CanonicalEventRow[]>(
+    `past_canonical_events?select=${VIEW_SELECT}&${publicVerificationFilter()}&or=(title.ilike.${encoded},description.ilike.${encoded},state.ilike.${encoded},district.ilike.${encoded},location_name.ilike.${encoded},event_type.ilike.${encoded})&order=started_at.desc.nullslast&limit=${limit}`,
+  ).catch((error: Error) => {
+    console.warn('[canonicalEvents] lexical search failed:', error.message);
+    return [] as CanonicalEventRow[];
+  });
+  return toDtoList(rows);
+}
+
+export async function getEventCitations(eventId: string): Promise<EventCitationDto[]> {
+  const rows = await supabaseRest<Array<{
+    source_id: string;
+    citation_id: string | null;
+    source_definitions: { name: string; source_type: string } | null;
+    source_observations: { id: string; title: string; source_url: string | null; publisher: string | null; published_at: string | null; retrieved_at: string | null; raw_content: string | null } | null;
+  }>>(
+    `event_sources?event_id=eq.${encodeURIComponent(eventId)}&select=source_id,citation_id,source_definitions(name,source_type),source_observations(id,title,source_url,publisher,published_at,retrieved_at,raw_content)`,
+    { method: 'GET' },
+  ).catch(() => []);
+
+  return rows.map((row, index) => ({
+    id: row.citation_id || `S${index + 1}`,
+    sourceId: row.source_id,
+    sourceName: row.source_definitions?.name || 'Unknown Source',
+    sourceType: (row.source_definitions?.source_type || 'NEWS') as EventCitationDto['sourceType'],
+    publisher: row.source_observations?.publisher || row.source_definitions?.name || undefined,
+    title: row.source_observations?.title || row.source_definitions?.name || 'Source observation',
+    url: row.source_observations?.source_url || undefined,
+    publishedAt: row.source_observations?.published_at || undefined,
+    retrievedAt: row.source_observations?.retrieved_at || undefined,
+    summary: (row.source_observations?.raw_content || '').slice(0, 600) || undefined,
   }));
 }
 
-export async function listActiveCanonicalEvents(): Promise<CanonicalEventListResponse> {
-  if (!isSupabaseConfigured()) {
-    return {
-      items: [],
-      count: 0,
-      retrievedAt: new Date().toISOString(),
-      cacheStatus: 'SEED_FALLBACK',
-    };
-  }
-
-  const rows = await supabaseRest<CanonicalEventRow[]>(
-    'active_canonical_events?select=*&order=last_observed_at.desc.nullslast&limit=200',
-  );
-  const items = rows.map(rowToDto);
-  return { items, count: items.length, retrievedAt: new Date().toISOString(), cacheStatus: 'SUPABASE' };
-}
-
-export async function listArchivedCanonicalEvents(): Promise<CanonicalEventListResponse> {
-  if (!isSupabaseConfigured()) {
-    const items = seedEvents();
-    return { items, count: items.length, retrievedAt: new Date().toISOString(), cacheStatus: 'SEED_FALLBACK' };
-  }
-
-  const rows = await supabaseRest<CanonicalEventRow[]>(
-    'past_canonical_events?select=*&order=started_at.desc.nullslast&limit=200',
-  );
-  const items = rows.map(rowToDto);
-  return { items, count: items.length, retrievedAt: new Date().toISOString(), cacheStatus: 'SUPABASE' };
-}
-
-export async function searchCanonicalEvents(query: string): Promise<CanonicalEventDto[]> {
-  const q = query.trim();
-  if (!q) return [];
-
-  if (!isSupabaseConfigured()) {
-    const lower = q.toLowerCase();
-    return seedEvents().filter((item) =>
-      [item.title, item.eventType, item.state, item.locationName, item.description].some((value) =>
-        String(value || '').toLowerCase().includes(lower),
-      ),
-    );
-  }
-
-  const encoded = encodeURIComponent(`%${q.replace(/[%_]/g, '')}%`);
-  const rows = await supabaseRest<CanonicalEventRow[]>(
-    `past_canonical_events?select=*&or=(title.ilike.${encoded},description.ilike.${encoded},state.ilike.${encoded},district.ilike.${encoded},event_type.ilike.${encoded})&order=started_at.desc.nullslast&limit=50`,
-  );
-  return rows.map(rowToDto);
+export async function getEventTimeline(eventId: string): Promise<Array<{
+  id: string;
+  status: string | null;
+  severity: string | null;
+  description: string | null;
+  observedAt: string;
+  createdAt: string;
+}>> {
+  const rows = await supabaseRest<Array<{
+    id: string;
+    status: string | null;
+    severity: string | null;
+    description: string | null;
+    observed_at: string;
+    created_at: string;
+  }>>(
+    `event_updates?event_id=eq.${encodeURIComponent(eventId)}&select=id,status,severity,description,observed_at,created_at&order=observed_at.asc`,
+    { method: 'GET' },
+  ).catch(() => []);
+  return rows.map((row) => ({
+    id: row.id,
+    status: row.status,
+    severity: row.severity,
+    description: row.description,
+    observedAt: row.observed_at,
+    createdAt: row.created_at,
+  }));
 }

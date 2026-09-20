@@ -36,6 +36,7 @@ export const CompareModal: React.FC<CompareModalProps> = ({
 }) => {
   const [comparisonData, setComparisonData] = useState<ComparisonMatrix | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const t = UI_TEXT;
 
   useEffect(() => {
@@ -47,8 +48,14 @@ export const CompareModal: React.FC<CompareModalProps> = ({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bundles }),
     })
-      .then((res) => res.json())
-      .then((data) => {
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          const message = typeof data?.error === 'string'
+            ? data.error
+            : data?.error?.message || data?.details || `Comparison failed (HTTP ${res.status})`;
+          throw new Error(message);
+        }
         if (isMounted) {
           setComparisonData(data as ComparisonMatrix);
           setIsLoading(false);
@@ -56,7 +63,10 @@ export const CompareModal: React.FC<CompareModalProps> = ({
       })
       .catch((err) => {
         console.error('Comparison error:', err);
-        if (isMounted) setIsLoading(false);
+        if (isMounted) {
+          setLoadError((err as Error).message || 'Comparison failed');
+          setIsLoading(false);
+        }
       });
 
     return () => {
@@ -86,7 +96,12 @@ export const CompareModal: React.FC<CompareModalProps> = ({
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
-          {isLoading ? (
+          {loadError ? (
+            <div className="p-8 text-center space-y-2">
+              <p className="text-sm font-bold text-slate-900">Comparison unavailable</p>
+              <p className="text-xs text-slate-500">{loadError}</p>
+            </div>
+          ) : isLoading ? (
             <div className="p-12 text-center space-y-3">
               <div className="w-10 h-10 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mx-auto"></div>
               <p className="text-xs text-slate-500">Reconciling comparative metrics across retrieved evidence...</p>

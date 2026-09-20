@@ -357,7 +357,7 @@ export const IndiaLiveMap: React.FC<IndiaLiveMapProps> = ({
         L.tileLayer(
           'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
           {
-            attribution: 'Tiles &copy; Esri',
+            attribution: 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics',
             maxZoom: 19,
           }
         ).addTo(map);
@@ -502,7 +502,7 @@ export const IndiaLiveMap: React.FC<IndiaLiveMapProps> = ({
         <div class="relative flex items-center justify-center">
           <div class="w-4 h-4 rounded-full bg-indigo-600 ring-4 ring-indigo-200 shadow-lg animate-pulse"></div>
           <div class="absolute -top-6 px-2 py-0.5 rounded-full bg-indigo-600 text-white font-bold text-[9px] shadow whitespace-nowrap">
-            ${uiText('present.yourLocation')}
+            ${uiText('present.monitoredLocation')}
           </div>
         </div>
       `;
@@ -546,7 +546,7 @@ export const IndiaLiveMap: React.FC<IndiaLiveMapProps> = ({
         <div className="space-y-3">
           <div className="flex items-center gap-2 text-amber-700 font-semibold text-sm">
             <AlertTriangle className="w-5 h-5" />
-            <span>{uiText('present.yourLocation')}</span>
+            <span>{uiText('present.mapOffline')}</span>
           </div>
           <div className="divide-y divide-slate-100 max-h-60 overflow-y-auto">
             {alerts.map((a) => (
@@ -572,7 +572,7 @@ export const IndiaLiveMap: React.FC<IndiaLiveMapProps> = ({
           className="self-start px-4 py-2 rounded-xl bg-slate-100 text-xs font-semibold text-slate-700 hover:bg-slate-200 flex items-center gap-1.5 transition-colors"
         >
           <RefreshCw className="w-3.5 h-3.5" />
-          <span>{uiText('present.yourLocation')}</span>
+          <span>{uiText('present.retryMap')}</span>
         </button>
       </div>
     );
@@ -620,24 +620,24 @@ export const IndiaLiveMap: React.FC<IndiaLiveMapProps> = ({
       <div className="absolute bottom-3 left-3 z-10 bg-white/95 backdrop-blur-md border border-slate-200 rounded-2xl p-3 shadow-lg max-w-xs hidden sm:block pointer-events-auto text-xs space-y-1.5">
         <div className="font-bold text-[11px] uppercase tracking-wider text-slate-500 flex items-center gap-1">
           <Activity className="w-3.5 h-3.5 text-indigo-600" />
-          <span>{uiText('present.yourLocation')}</span>
+          <span>{uiText('present.legendTitle')}</span>
         </div>
         <div className="grid grid-cols-1 gap-y-1.5 text-[11px] text-slate-700">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
-            <span>{uiText('present.yourLocation')}</span>
+            <span>{uiText('present.legendHighPriority')}</span>
           </div>
           <div className="flex items-center gap-2">
             <Wind className="w-3.5 h-3.5 text-amber-500" />
-            <span>{uiText('present.yourLocation')}</span>
+            <span>{uiText('present.legendModeratePriority')}</span>
           </div>
           <div className="flex items-center gap-2">
             <Layers className="w-3.5 h-3.5 text-rose-500" />
-            <span>{uiText('present.yourLocation')}</span>
+            <span>{uiText('present.legendBoundary')}</span>
           </div>
           <div className="flex items-center gap-2">
             <MapPin className="w-3.5 h-3.5 text-indigo-600" />
-            <span>{uiText('present.yourLocation')}</span>
+            <span>{uiText('present.legendYourLocation')}</span>
           </div>
         </div>
       </div>

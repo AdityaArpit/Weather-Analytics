@@ -17,6 +17,8 @@ import { Radio, Layers, MapPin, RefreshCw, AlertTriangle } from 'lucide-react';
 import { uiText } from '../../lib/uiText';
 import { apiUrl } from '../../lib/api';
 import { canonicalEventToSachetAlert, type CanonicalEventDto } from '../../lib/canonicalEvents';
+import { dataCache } from '../../lib/dataCache';
+import { useRealtime } from '../../lib/useRealtime';
 
 interface PresentWorkspaceProps {
   onFeedStatusChange?: (status: 'LIVE_FETCH' | 'ETAG_CACHED' | 'FALLBACK_SNAPSHOT' | 'ERROR', lastUpdated: string) => void;
@@ -130,6 +132,19 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
     }
   }, [alerts, userLocation]);
 
+  // True realtime: database-triggered broadcast when a verified event appears
+  // or changes. Refresh the map immediately instead of waiting for polling;
+  // a SACHET-style toast surfaces the event through the relevance engine.
+  useRealtime({
+    eventRadiusKm: userLocation ? 500 : null,
+    referenceLat: userLocation?.lat ?? null,
+    referenceLng: userLocation?.lng ?? null,
+    onEvent: () => {
+      void fetchAlerts();
+      if (onFeedStatusChange) onFeedStatusChange('LIVE_FETCH', new Date().toISOString());
+    },
+  });
+
   const displayAlerts = useMemo(
     () => alerts.filter((alert, index) => Boolean(resolveAlertMapPoint(alert, index))),
     [alerts]
@@ -143,8 +158,37 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
   const topRelevance =
     relevanceResults.find((r) => r.isInsideBoundary && r.status !== 'NOT_RELEVANT') || null;
 
-  const handleSelectAlert = (alert: SachetAlert) => {
+  const handleSelectAlert = async (alert: SachetAlert) => {
     setSelectedAlert(alert);
+
+    if (alert.id) {
+      const cacheKey = dataCache.normalizeKey(['event', alert.id]);
+      const cached = dataCache.get<SachetAlert>('eventDetail', cacheKey);
+      if (cached && !cached.stale) {
+        setSelectedAlert(cached.value);
+        return;
+      }
+
+      try {
+        const data = await dataCache.dedupe<SachetAlert>(
+          'eventDetail',
+          cacheKey,
+          async () => {
+            const res = await fetch(apiUrl(`/api/events/${alert.id}`));
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const result = await res.json();
+            if (result.event) {
+              return canonicalEventToSachetAlert(result.event);
+            }
+            return alert;
+          },
+          { ttlSeconds: 120, staleSeconds: 60 },
+        );
+        setSelectedAlert(data);
+      } catch {
+        // Keep the summary data from the list
+      }
+    }
   };
 
   const handleCheckCustomLocation = (loc: UserLocation) => {
@@ -198,7 +242,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
           }`}
         >
           <MapPin className="w-3.5 h-3.5" />
-          <span>{uiText('present.indiaOverview', { count: alerts.length || nearbyAlerts.length })}</span>
+          <span>{uiText('present.nearMe', { count: nearbyAlerts.length })}</span>
         </button>
       </div>
 
@@ -208,7 +252,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
           <div className="flex items-center gap-2">
             <Radio className="w-4 h-4 text-[#0F1B29] animate-pulse" />
             <h2 className="font-bold text-sm sm:text-base text-[#0F1B29]">
-              {uiText('present.yourLocation')}
+              {uiText('present.mapTitle')}
             </h2>
             <span className="text-xs px-2.5 py-0.5 rounded-full bg-[#ECF8F8] text-[#0F1B29] font-mono font-medium border border-[#DDDDDD]">
               {uiText('present.indiaOverview', { count: alerts.length || nearbyAlerts.length })}
@@ -224,14 +268,14 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
               alerts={displayAlerts}
               selectedAlertId={selectedAlert?.id || null}
               onSelectAlert={handleSelectAlert}
-              userCoordinates={userLocation ? [userLocation.lat, userLocation.lng] : undefined}
+              userCoordinates={userLocation ? [userLocation.lat, userLocation.lng] : undefined}
             />
 
             {!userLocation && (
               <div className="rounded-2xl bg-white border border-dashed border-[#DDDDDD] px-4 py-3 shadow-sm flex items-center gap-3">
                 <MapPin className="w-5 h-5 text-[#0F1B29] shrink-0" />
                 <p className="text-xs text-[#747F8D] leading-relaxed">
-                  {uiText('present.yourLocation')}
+                  {uiText('present.locationOptional')}
                 </p>
               </div>
             )}
@@ -253,7 +297,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
               onSelectAlert={handleSelectAlert}
               onCheckCustomLocation={handleCheckCustomLocation}
               onResetToGPS={handleResetToGPS}
-              onOpenShareModal={(a, r) => handleOpenShare(a, r)}
+              onOpenShareModal={(a, r) => handleOpenShare(a, r)}
             />
           )}
         </div>
@@ -268,7 +312,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
               nearbyAlerts={nearbyAlerts}
               userLocation={userLocation}
               selectedAlertId={selectedAlert?.id || null}
-              onSelectAlert={handleSelectAlert}
+              onSelectAlert={handleSelectAlert}
             />
           )}
         </div>
@@ -278,7 +322,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
       <RealtimeWarningToast
         topRelevance={topRelevance}
         onViewDetails={handleSelectAlert}
-        onShare={(a, r) => handleOpenShare(a, r)}
+        onShare={(a, r) => handleOpenShare(a, r)}
       />
 
       {/* Slide-over Alert Details Drawer */}
@@ -286,7 +330,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
         <AlertDetailDrawer
           alert={selectedAlert}
           onClose={() => setSelectedAlert(null)}
-          onShare={(a) => handleOpenShare(a)}
+          onShare={(a) => handleOpenShare(a)}
         />
       )}
 
@@ -298,7 +342,7 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
           onClose={() => {
             setShareAlert(null);
             setShareRelevance(null);
-          }}
+          }}
         />
       )}
     </div>

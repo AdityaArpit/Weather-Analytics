@@ -83,7 +83,9 @@ export const LocationIntelligencePanel: React.FC<LocationIntelligencePanelProps>
       const data = await res.json();
 
       if (!res.ok) {
-        throw new Error(data?.error || 'Unable to resolve location');
+        throw new Error(
+          (typeof data?.error === 'string' ? data.error : data?.error?.message) || 'Unable to resolve location',
+        );
       }
 
       const places = Array.isArray(data.places) ? data.places : [];

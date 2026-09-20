@@ -5,7 +5,6 @@ export const UI_TEXT = {
   officialInstructionTitle: 'Official Instructions',
   compareNow: 'Compare Now',
   voiceAssistantTitle: 'AI Research Assistant',
-  searchLanguagePlaceholder: '',
 };
 
 const LABELS: Record<string, string> = {
@@ -24,6 +23,11 @@ const LABELS: Record<string, string> = {
   'present.centerLocation': 'Center on location',
   'present.monitoredLocation': 'Monitored location',
   'present.liveGps': 'Live GPS',
+  'present.legendTitle': 'Map Legend',
+  'present.legendHighPriority': 'Extreme / Severe hazard',
+  'present.legendModeratePriority': 'Moderate / Minor hazard',
+  'present.legendBoundary': 'Affected boundary',
+  'present.legendYourLocation': 'Your location',
   'present.indiaOverview': 'India overview ({count})',
   'alerts.shareAlert': 'Share alert',
   'alerts.closeDrawer': 'Close alert details',

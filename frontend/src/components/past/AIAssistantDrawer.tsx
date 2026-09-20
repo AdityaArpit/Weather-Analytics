@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Bot, Loader2, Send, Sparkles, User, Volume2, VolumeX, X } from 'lucide-react';
 import type { CitedSource, EvidenceBundle } from '../../types/disaster';
-import { apiUrl } from '../../lib/api';
+import { apiUrl, getAccessToken } from '../../lib/api';
 import { AudioRecorderButton } from '../common/AudioRecorderButton';
 import { ChatSkeleton } from '../common/Skeletons';
 
@@ -70,16 +70,21 @@ export const AIAssistantDrawer: React.FC<AIAssistantDrawerProps> = ({
 
     setIsPlayingAudio(true);
     try {
+      // Orpheus returns WAV; truncate to the 200-character provider limit.
+      const token = await getAccessToken();
       const response = await fetch(apiUrl('/api/tts'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: cleanText, voiceName: 'Kore' }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ text: cleanText.slice(0, 200), voiceName: 'austin' }),
       });
       const data = await response.json().catch(() => null);
       if (data?.audioBase64) {
         const audio = audioRef.current || new Audio();
         audioRef.current = audio;
-        audio.src = `data:audio/mp3;base64,${data.audioBase64}`;
+        audio.src = `data:audio/wav;base64,${data.audioBase64}`;
         audio.onended = () => setIsPlayingAudio(false);
         audio.onerror = () => setIsPlayingAudio(false);
         await audio.play();
@@ -114,7 +119,12 @@ export const AIAssistantDrawer: React.FC<AIAssistantDrawerProps> = ({
         }),
       });
       const data = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(data?.details || data?.error || 'AI Assistant query failed');
+      if (!response.ok) {
+        const message = typeof data?.error === 'string'
+          ? data.error
+          : data?.error?.message || data?.details || 'AI Assistant query failed';
+        throw new Error(message);
+      }
       setMessages((current) => [...current, {
         id: `a-${Date.now()}`,
         role: 'assistant',

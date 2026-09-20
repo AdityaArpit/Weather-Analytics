@@ -48,9 +48,15 @@ export async function getPastArchive(): Promise<any> {
   }
 
   const res = await fetch(apiUrl('/api/past/archive'));
-  const data = await res.json();
+  const data = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(data?.details || data?.error || 'Failed to load recent archive');
+    // Normalize the backend error contract { success, error: { code, message } }
+    const message = typeof data?.error === 'string'
+      ? data.error
+      : data?.error?.message
+        || (typeof data?.details === 'string' ? data.details : null)
+        || `Archive unavailable (HTTP ${res.status})`;
+    throw new Error(message);
   }
 
   pastArchiveCache.put('archive_data', data);

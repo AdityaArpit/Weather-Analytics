@@ -216,7 +216,7 @@ function getGroqBaseUrl(): string {
 }
 
 function getGroqChatModels(): string[] {
-  return (process.env.GROQ_MODEL_FALLBACKS || process.env.GROQ_MODEL || 'llama-3.3-70b-versatile')
+  return (process.env.GROQ_MODEL_FALLBACKS || process.env.GROQ_MODEL || 'openai/gpt-oss-120b')
     .split(',')
     .map((model) => model.trim())
     .filter(Boolean);
@@ -235,30 +235,161 @@ function getGroqTtsVoice(): string {
 }
 
 export function isGroqConfigured(): boolean {
-  return Boolean(process.env.GROQ_API_KEY?.trim());
+  // The key pool is the canonical source: any configured, non-disabled key counts.
+  keyPool.initialize();
+  return keyPool.getHealth().some((entry) => !entry.disabled);
 }
 
-function getGroqKey(scope: GroqKeyScope = 'default'): string {
-  const scopeEnvMap: Record<Exclude<GroqKeyScope, 'default'>, string[]> = {
-    past: ['GROQ_API_KEY_PAST', 'GROQ_API_KEY_HISTORY', 'GROQ_API_KEY'],
-    pastFilters: ['GROQ_API_KEY_PAST_FILTERS'],
-    chat: ['GROQ_API_KEY_CHAT', 'GROQ_API_KEY_ASSISTANT', 'GROQ_API_KEY'],
-    stt: ['GROQ_API_KEY_STT', 'GROQ_API_KEY_AUDIO', 'GROQ_API_KEY'],
-    tts: ['GROQ_API_KEY_TTS', 'GROQ_API_KEY_AUDIO', 'GROQ_API_KEY'],
-  };
+interface KeyPoolEntry {
+  key: string;
+  healthy: boolean;
+  busy: number;
+  cooldownUntil: number;
+  failures: number;
+  lastUsed: number;
+  disabled: boolean;
+}
 
-  const envNames =
-    scope === 'default'
-      ? ['GROQ_API_KEY']
-      : scopeEnvMap[scope];
+class GroqKeyPool {
+  private keys: KeyPoolEntry[] = [];
+  private maxConcurrency: number;
+  private perKeyConcurrency: number;
+  private maxRetries: number;
+  private initialized = false;
 
-  for (const envName of envNames) {
-    const apiKey = process.env[envName]?.trim();
-    if (apiKey) return apiKey;
+  constructor() {
+    this.maxConcurrency = parseInt(process.env.GROQ_MAX_CONCURRENCY || '8', 10);
+    this.perKeyConcurrency = parseInt(process.env.GROQ_PER_KEY_CONCURRENCY || '1', 10);
+    this.maxRetries = parseInt(process.env.GROQ_MAX_RETRIES || '3', 10);
   }
 
-  const label = scope === 'default' ? 'GROQ_API_KEY' : envNames.join(' or ');
-  throw new Error(`${label} is not configured.`);
+  initialize(): void {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const keySet = new Set<string>();
+
+    const commaKeys = process.env.GROQ_API_KEYS?.split(',').map((k) => k.trim()).filter(Boolean) || [];
+    for (const k of commaKeys) keySet.add(k);
+
+    for (let i = 1; i <= 100; i++) {
+      const envName = `GROQ_API_KEY_${String(i).padStart(2, '0')}`;
+      const key = process.env[envName]?.trim();
+      if (key) keySet.add(key);
+    }
+
+    const primary = process.env.GROQ_API_KEY?.trim();
+    if (primary) keySet.add(primary);
+
+    this.keys = Array.from(keySet).map((key) => ({
+      key,
+      healthy: true,
+      busy: 0,
+      cooldownUntil: 0,
+      failures: 0,
+      lastUsed: 0,
+      disabled: false,
+    }));
+  }
+
+  private getTotalBusy(): number {
+    return this.keys.reduce((sum, k) => sum + k.busy, 0);
+  }
+
+  acquire(): string {
+    this.initialize();
+    const now = Date.now();
+
+    if (this.getTotalBusy() >= this.maxConcurrency) {
+      const leastBusy = this.keys
+        .filter((k) => !k.disabled && k.healthy && k.cooldownUntil <= now && k.busy < this.perKeyConcurrency)
+        .sort((a, b) => a.busy - b.busy)[0];
+      if (leastBusy) {
+        leastBusy.busy++;
+        leastBusy.lastUsed = now;
+        return leastBusy.key;
+      }
+    }
+
+    const available = this.keys
+      .filter((k) => !k.disabled && k.healthy && k.cooldownUntil <= now && k.busy < this.perKeyConcurrency)
+      .sort((a, b) => a.lastUsed - b.lastUsed);
+
+    if (available.length > 0) {
+      const chosen = available[0];
+      chosen.busy++;
+      chosen.lastUsed = now;
+      return chosen.key;
+    }
+
+    const fallback = this.keys.find((k) => !k.disabled && k.healthy);
+    if (fallback) {
+      fallback.busy++;
+      fallback.lastUsed = now;
+      return fallback.key;
+    }
+
+    throw new Error('All Groq API keys are exhausted or disabled.');
+  }
+
+  release(key: string): void {
+    const entry = this.keys.find((k) => k.key === key);
+    if (entry) entry.busy = Math.max(0, entry.busy - 1);
+  }
+
+  report429(key: string): void {
+    const entry = this.keys.find((k) => k.key === key);
+    if (!entry) return;
+    entry.failures++;
+    const cooldownMs = Math.min(30000, 1000 * Math.pow(2, entry.failures)) + Math.random() * 1000;
+    entry.cooldownUntil = Date.now() + cooldownMs;
+    entry.busy = Math.max(0, entry.busy - 1);
+  }
+
+  reportSuccess(key: string): void {
+    const entry = this.keys.find((k) => k.key === key);
+    if (entry) {
+      entry.failures = Math.max(0, entry.failures - 1);
+      if (entry.cooldownUntil <= Date.now()) {
+        entry.healthy = true;
+      }
+    }
+  }
+
+  reportFailure(key: string): void {
+    const entry = this.keys.find((k) => k.key === key);
+    if (!entry) return;
+    entry.failures++;
+    entry.busy = Math.max(0, entry.busy - 1);
+    if (entry.failures >= 5) {
+      entry.disabled = true;
+    }
+  }
+
+  getHealth(): Array<{ keySuffix: string; healthy: boolean; busy: number; failures: number; disabled: boolean }> {
+    this.initialize();
+    return this.keys.map((k) => ({
+      keySuffix: k.key.slice(-6),
+      healthy: k.healthy,
+      busy: k.busy,
+      failures: k.failures,
+      disabled: k.disabled,
+    }));
+  }
+}
+
+const keyPool = new GroqKeyPool();
+
+function getGroqKey(_scope: GroqKeyScope = 'default'): string {
+  return keyPool.acquire();
+}
+
+function releaseGroqKey(key: string): void {
+  keyPool.release(key);
+}
+
+export function getKeyPoolHealth() {
+  return keyPool.getHealth();
 }
 
 function stripCodeFences(text: string): string {
@@ -466,46 +597,64 @@ async function groqChatCompletion(params: {
   maxTokens?: number;
   keyScope?: GroqKeyScope;
 }): Promise<string> {
-  const apiKey = getGroqKey(params.keyScope || 'default');
-  const baseUrl = getGroqBaseUrl();
+  const models = [params.model, ...getGroqChatModels()].filter(Boolean);
   let lastError: Error | null = null;
 
-  for (const model of [params.model, ...getGroqChatModels()].filter(Boolean)) {
+  for (let attempt = 0; attempt < keyPool['maxRetries']; attempt++) {
+    let apiKey: string;
     try {
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          messages: params.messages,
-          temperature: params.temperature ?? 0.2,
-          ...(params.maxTokens ? { max_completion_tokens: params.maxTokens } : {}),
-        }),
-      });
+      apiKey = getGroqKey(params.keyScope || 'default');
+    } catch (err) {
+      throw err;
+    }
 
-      if (!response.ok) {
-        const text = await response.text().catch(() => '');
-        throw new Error(`Groq chat completion failed for ${model}: HTTP ${response.status} ${text}`.trim());
+    for (const model of models) {
+      try {
+        const baseUrl = getGroqBaseUrl();
+        const response = await fetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            messages: params.messages,
+            temperature: params.temperature ?? 0.2,
+            ...(params.maxTokens ? { max_completion_tokens: params.maxTokens } : {}),
+          }),
+        });
+
+        if (response.status === 429) {
+          keyPool.report429(apiKey);
+          lastError = new Error(`Rate limited on ${model}`);
+          break;
+        }
+
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          throw new Error(`Groq chat completion failed for ${model}: HTTP ${response.status} ${text}`.trim());
+        }
+
+        const data = (await response.json()) as {
+          choices?: Array<{ message?: { content?: unknown } }>;
+        };
+        const content = data?.choices?.[0]?.message?.content;
+        if (typeof content === 'string' && content.trim()) {
+          keyPool.reportSuccess(apiKey);
+          releaseGroqKey(apiKey);
+          return content.trim();
+        }
+
+        throw new Error(`Groq chat completion returned an empty response for ${model}.`);
+      } catch (error) {
+        lastError = error as Error;
+        keyPool.reportFailure(apiKey);
       }
-
-      const data = (await response.json()) as {
-        choices?: Array<{ message?: { content?: unknown } }>;
-      };
-      const content = data?.choices?.[0]?.message?.content;
-      if (typeof content === 'string' && content.trim()) {
-        return content.trim();
-      }
-
-      throw new Error(`Groq chat completion returned an empty response for ${model}.`);
-    } catch (error) {
-      lastError = error as Error;
     }
   }
 
-  throw lastError || new Error('Groq chat completion failed.');
+  throw lastError || new Error('Groq chat completion failed after all retries.');
 }
 
 function mimeToExt(mime: string): string {
@@ -1651,6 +1800,8 @@ export async function chatResearchAssistant(params: {
 }): Promise<{
   reply: string;
   sources: CitedSource[];
+  /** Where the grounding evidence came from (set by the API layer). */
+  groundingSource?: 'database' | 'multi_source_research' | 'conversation';
 }> {
   const { message, history, associatedBundle } = params;
   const englishMessage = message;
@@ -1788,7 +1939,15 @@ export async function generateTTSAudio(text: string, voiceName: string = getGroq
   const apiKey = getGroqKey('tts');
   const baseUrl = getGroqBaseUrl();
   const ttsModel = getGroqTtsModel();
-  const cleanText = stripMarkdownForSpeech(text).replace(/\[S\d+\]/gi, '').slice(0, 500);
+
+  // Orpheus contract (current Groq docs): max 200 characters, WAV output only.
+  // Strip Markdown, citations and normalize whitespace, then truncate safely.
+  const spokenText = stripMarkdownForSpeech(text)
+    .replace(/\[[Ss]\d+\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+  if (!spokenText) return null;
 
   try {
     const response = await fetch(`${baseUrl}/audio/speech`, {
@@ -1799,18 +1958,22 @@ export async function generateTTSAudio(text: string, voiceName: string = getGroq
       },
       body: JSON.stringify({
         model: ttsModel,
-        input: cleanText,
+        input: spokenText,
         voice: voiceName || getGroqTtsVoice(),
-        response_format: 'mp3',
+        response_format: 'wav',
       }),
     });
 
     if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`Groq TTS failed: HTTP ${response.status} ${text}`.trim());
+      const errText = await response.text().catch(() => '');
+      throw new Error(`Groq TTS failed: HTTP ${response.status} ${errText.slice(0, 200)}`.trim());
     }
 
     const audioBuffer = await response.arrayBuffer();
+    if (!audioBuffer || audioBuffer.byteLength < 44) {
+      // Empty/invalid audio payload; treat as failure rather than serving silence.
+      throw new Error('Groq TTS returned an empty audio payload');
+    }
     return toBase64(audioBuffer);
   } catch (error) {
     console.log('Groq TTS fallback:', (error as Error).message);

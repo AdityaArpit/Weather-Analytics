@@ -1,0 +1,84 @@
+# Aapda Drishti — production job scheduler.
+#
+# Tiered cadence (see README "Background jobs"):
+#   */10 * * * *  → ingest + notifications  (life-safety: SACHET warnings, alert dispatch)
+#   */15 * * * *  → lifecycle               (evidence-based present→past transitions)
+#   5 * * * *     → verify-reports          (citizen report pipeline, hourly at :05)
+#   20 */6 * * *  → reconcile               (six-hour data reconciliation per architecture diagram)
+#   40 */6 * * *  → embeddings              (backfill vectors, six-hour)
+#   0 3 * * 0     → backfill                (weekly historical archive top-up)
+#
+# Requires repository secrets: API_BASE_URL (e.g. https://api.example.com) and
+# CRON_SECRET. Each step tolerates failure so one slow job never blocks the rest.
+name: aapda-jobs
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+    - cron: '*/15 * * * *'
+    - cron: '5 * * * *'
+    - cron: '20 */6 * * *'
+    - cron: '40 */6 * * *'
+    - cron: '0 3 * * 0'
+  workflow_dispatch: # manual trigger for testing
+
+permissions:
+  contents: read
+
+jobs:
+  high-frequency:
+    # ingest + notifications + lifecycle: every run window (10/15 min overlap is fine —
+    # jobs are idempotent and lock via job_runs).
+    if: github.event.schedule == '*/10 * * * *' || github.event.schedule == '*/15 * * * *'
+    runs-on: ubuntu-latest
+    timeout_minutes: 8
+    steps:
+      - name: Ingest sources
+        run: |
+          curl -fsS --max-time 240 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/ingest" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "ingest failed (non-blocking)"
+      - name: Dispatch notifications
+        run: |
+          curl -fsS --max-time 240 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/notifications" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "notifications failed (non-blocking)"
+      - name: Advance lifecycle
+        run: |
+          curl -fsS --max-time 240 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/lifecycle" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "lifecycle failed (non-blocking)"
+
+  hourly:
+    if: github.event.schedule == '5 * * * *'
+    runs-on: ubuntu-latest
+    timeout_minutes: 8
+    steps:
+      - name: Verify citizen reports
+        run: |
+          curl -fsS --max-time 300 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/verify-reports" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "verify-reports failed (non-blocking)"
+
+  six-hour-reconciliation:
+    # The "6-hour data reconciliation" tier from the architecture diagram.
+    if: github.event.schedule == '20 */6 * * *' || github.event.schedule == '40 */6 * * *'
+    runs-on: ubuntu-latest
+    timeout_minutes: 10
+    steps:
+      - name: Reconcile evidence
+        if: github.event.schedule == '20 */6 * * *'
+        run: |
+          curl -fsS --max-time 420 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/reconcile" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "reconcile failed (non-blocking)"
+      - name: Backfill embeddings
+        if: github.event.schedule == '40 */6 * * *'
+        run: |
+          curl -fsS --max-time 420 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/embeddings" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "embeddings failed (non-blocking)"
+
+  weekly:
+    if: github.event.schedule == '0 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout_minutes: 15
+    steps:
+      - name: Historical backfill
+        run: |
+          curl -fsS --max-time 600 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/backfill" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "backfill failed (non-blocking)"

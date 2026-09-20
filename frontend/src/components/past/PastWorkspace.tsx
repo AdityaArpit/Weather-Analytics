@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Calendar, History, MapPin, Search, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { Calendar, History, MapPin, Search, ShieldCheck, Sparkles, X, Scale } from 'lucide-react';
 import type { EvidenceBundle } from '../../types/disaster';
 import { apiUrl } from '../../lib/api';
 import { getPastArchive } from '../../lib/pastCache';
@@ -7,6 +7,7 @@ import { formatDisasterDate } from '../../lib/dateFormat';
 import { EventCardSkeleton } from '../common/Skeletons';
 import { EventDetailView } from './EventDetailView';
 import { AIAssistantDrawer } from './AIAssistantDrawer';
+import { CompareModal } from './CompareModal';
 
 interface PastWorkspaceProps {
   isVoiceAssistantOpen?: boolean;
@@ -33,6 +34,8 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
   const [selectedBundle, setSelectedBundle] = useState<EvidenceBundle | null>(null);
   const [activeChatBundle, setActiveChatBundle] = useState<EvidenceBundle | null>(null);
   const [localChatOpen, setLocalChatOpen] = useState(false);
+  const [compareSelection, setCompareSelection] = useState<EvidenceBundle[]>([]);
+  const [showCompare, setShowCompare] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,9 +76,14 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
         body: JSON.stringify({ query: q }),
       });
       const data = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(data?.details || data?.error || 'Search failed');
+      if (!response.ok) {
+        const message = typeof data?.error === 'string'
+          ? data.error
+          : data?.error?.message || data?.details || 'Search failed';
+        throw new Error(message);
+      }
       if (!data?.bundle) {
-        setError(data?.details || 'No verified evidence was found for that query.');
+        setError(typeof data?.details === 'string' ? data.details : 'No verified evidence was found for that query.');
         return;
       }
       const bundle = data.bundle as ArchiveItem;
@@ -92,6 +100,15 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
     setActiveChatBundle(bundle);
     if (onOpenVoiceAssistant) onOpenVoiceAssistant();
     else setLocalChatOpen(true);
+  };
+
+  const toggleCompare = (bundle: EvidenceBundle) => {
+    setCompareSelection((prev) => {
+      const exists = prev.find((b) => b.id === bundle.id);
+      if (exists) return prev.filter((b) => b.id !== bundle.id);
+      if (prev.length >= 4) return prev;
+      return [...prev, bundle];
+    });
   };
 
   if (selectedBundle) {
@@ -125,8 +142,18 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
             </div>
             <div>
               <h2 className="font-bold text-lg sm:text-xl text-[#0F1B29]">Historical Disaster Intelligence Archive</h2>
-              <p className="text-xs text-[#747F8D]">Database-first archive with external research only when the database has no verified match.</p>
-            </div>
+          <p className="text-xs text-[#747F8D]">Database-first archive with external research only when the database has no verified match.</p>
+        </div>
+        {compareSelection.length >= 2 && (
+          <button
+            type="button"
+            onClick={() => setShowCompare(true)}
+            className="px-4 py-2 rounded-xl bg-[#0F1B29] hover:bg-[#0f1b29]/90 text-white font-bold text-xs flex items-center gap-2 transition-all"
+          >
+            <Scale className="w-4 h-4" />
+            Compare {compareSelection.length} Events
+          </button>
+        )}
           </div>
           <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold">
             <ShieldCheck className="w-4 h-4" />
@@ -205,6 +232,22 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
                 </div>
               </div>
               <p className="text-xs text-[#747F8D] line-clamp-3 leading-relaxed">{item.whatHappened}</p>
+              <div className="flex items-center gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleCompare(item);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+                    compareSelection.some((b) => b.id === item.id)
+                      ? 'bg-[#0F1B29] text-white border-[#0F1B29]'
+                      : 'bg-white text-[#0F1B29] border-[#DDDDDD] hover:border-[#747F8D]'
+                  }`}
+                >
+                  {compareSelection.some((b) => b.id === item.id) ? 'In Compare' : 'Add Compare'}
+                </button>
+              </div>
             </button>
           ))}
         </div>
@@ -218,6 +261,16 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
         }}
         associatedBundle={activeChatBundle}
       />
+
+      {showCompare && compareSelection.length >= 2 && (
+        <CompareModal
+          bundles={compareSelection}
+          onClose={() => {
+            setShowCompare(false);
+            setCompareSelection([]);
+          }}
+        />
+      )}
     </div>
   );
 };

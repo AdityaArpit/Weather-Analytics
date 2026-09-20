@@ -3,7 +3,7 @@ import {
   RefreshCw,
   Bot,
   Menu,
-  X
+  X,
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -26,13 +26,11 @@ export const Navbar: React.FC<NavbarProps> = ({
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const navItems = [
-    { label: 'Home', path: '/' },
     { label: 'Present', path: '/present' },
     { label: 'Past', path: '/past' },
     { label: 'Report Incident', path: '/report' },
     { label: 'Profile', path: '/profile' },
     { label: 'Admin', path: '/admin' },
-    { label: 'Team', path: '/team' },
   ];
 
   return (
@@ -97,6 +95,8 @@ export const Navbar: React.FC<NavbarProps> = ({
               <RefreshCw className="w-4 h-4" />
             </button>
           )}
+
+
         </div>
 
         {/* Mobile Menu Controls */}

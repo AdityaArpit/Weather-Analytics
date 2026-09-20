@@ -33,5 +33,16 @@ export async function supabaseRest<T>(path: string, init: RequestInit = {}): Pro
   }
 
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+
+  // Read the body once as text and parse only when non-empty. PostgREST can
+  // legitimately return 200/201 with an EMPTY body (e.g. Prefer:
+  // resolution=ignore-duplicates when every row already existed) — calling
+  // response.json() there throws "Unexpected end of JSON input".
+  const text = await response.text();
+  if (!text || text.trim() === '') return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Supabase REST returned non-JSON body (${response.status}): ${text.slice(0, 300)}`);
+  }
 }

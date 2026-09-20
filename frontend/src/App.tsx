@@ -6,9 +6,12 @@ import { TeamPage } from './components/TeamPage';
 import { HeroPage } from './components/HeroPage';
 import { AIAssistantDrawer } from './components/past/AIAssistantDrawer';
 import { prefetchPastArchive } from './lib/pastCache';
+import { AuthProvider } from './lib/AuthContext';
 import { ProfilePage } from './components/auth/ProfilePage';
 import { ReportIncidentPage } from './components/reports/ReportIncidentPage';
 import { AdminPage } from './components/admin/AdminPage';
+import { AdminRoute } from './components/auth/AdminRoute';
+import { AdminLoginPage } from './components/auth/AdminLoginPage';
 
 export function App() {
   const [currentRoute, setCurrentRoute] = useState<string>(() =>
@@ -41,7 +44,7 @@ export function App() {
     setCurrentRoute(route);
   };
 
-  const isKnownRoute = ['/', '/present', '/past', '/report', '/profile', '/admin', '/team'].includes(currentRoute);
+  const isKnownRoute = ['/', '/present', '/past', '/report', '/profile', '/admin', '/admin/login', '/team'].includes(currentRoute);
 
   if (!isKnownRoute) {
     return (
@@ -69,6 +72,7 @@ export function App() {
   }
 
   return (
+    <AuthProvider>
     <div className="h-screen bg-[#ECF8F8] text-[#0F1B29] flex flex-col selection:bg-[#747F8D] selection:text-white font-sans overflow-hidden">
       {/* Top Navigation Bar */}
       <Navbar
@@ -112,7 +116,9 @@ export function App() {
 
         {currentRoute === '/profile' && <ProfilePage />}
 
-        {currentRoute === '/admin' && <AdminPage />}
+        {currentRoute === '/admin' && <AdminRoute><AdminPage /></AdminRoute>}
+
+        {currentRoute === '/admin/login' && <AdminLoginPage />}
       </main>
 
       {/* Floating Global Chatbot Drawer (accessible from navbar bot button) */}
@@ -122,6 +128,7 @@ export function App() {
       />
 
     </div>
+    </AuthProvider>
   );
 }
 
