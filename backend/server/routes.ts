@@ -87,6 +87,15 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto): EvidenceBundl
   }));
 
   const year = event.startedAt ? new Date(event.startedAt).getFullYear() : new Date(event.updatedAt).getFullYear();
+  const sourceText = sources.map((source) => `${source.title}. ${source.summary}`).join(' ');
+  const casualtyFacts = extractSourceFacts(sources, /\b(?:\d[\d,]*(?:\s*-\s*\d[\d,]*)?\s+)?(?:dead|deaths?|killed|fatalit(?:y|ies)|injured|missing|casualt(?:y|ies)|evacuat(?:ed|ion)|displaced|affected)\b[^.;]{0,160}/gi, 3);
+  const damageFacts = extractSourceFacts(sources, /\b(?:rs\.?|₹|inr|crore|lakh|damage(?:d)?|destroyed|collapsed|washed away|houses?|roads?|bridges?|power|infrastructure|crop|loss)\b[^.;]{0,180}/gi, 3);
+  const responseFacts = extractSourceFacts(sources, /\b(?:rescue|relief|ndrf|sdrf|army|navy|government|administration|evacuat(?:ed|ion)|shelter|compensation|aid)\b[^.;]{0,180}/gi, 3);
+  const recoveryFacts = extractSourceFacts(sources, /\b(?:recovery|rehabilitation|reconstruction|restoration|relief camp|compensation|survivors?|aftermath)\b[^.;]{0,180}/gi, 3);
+  const timeline = buildTimelineFromSources(sources, event.startedAt || event.lastObservedAt || event.updatedAt);
+  const sourceCount = Math.max(event.sourceCount, sources.length);
+  const distinctPublishers = new Set(sources.map((source) => publisherKey(source))).size;
+  const synthesizedSummary = summarizeFromSources(sources, event.description);
 
   return {
     id: event.id,
@@ -97,37 +106,128 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto): EvidenceBundl
     country: event.country,
     eventDate: event.startedAt,
     dateRange: event.startedAt ? new Date(event.startedAt).toLocaleDateString('en-IN') : 'Date unavailable',
-    reportedCasualties: 'Impact figures were not quantified in the verified database record; refer to source citations.',
-    reportedDamage: 'Impact figures were not quantified in the verified database record; refer to source citations.',
+    reportedCasualties: casualtyFacts.length
+      ? casualtyFacts.join('; ')
+      : extractCasualtyFallback(sourceText, sources[0]?.id) || 'No quantified casualty figure was found in the verified citations.',
+    reportedDamage: damageFacts.length
+      ? damageFacts.join('; ')
+      : 'No quantified damage or loss figure was found in the verified citations.',
     sources,
-    timeline: [
-      {
-        date: event.lastObservedAt || event.updatedAt,
-        event: event.status,
-        description: event.description,
-        citations: sources.slice(0, 2).map((source) => source.id),
-      },
-    ],
-    whatHappened: event.description,
+    timeline,
+    whatHappened: synthesizedSummary,
     affectedAreas: event.locationName,
-    humanImpact: 'Refer to source citations for confirmed public impact details.',
-    infrastructureDamage: 'Refer to source citations for confirmed infrastructure impact details.',
-    economicImpact: '',
-    governmentResponse: event.verificationReason,
-    rescueRelief: event.instruction || 'No verified instruction was attached to this record.',
+    humanImpact: casualtyFacts.length ? casualtyFacts.join('; ') : '',
+    infrastructureDamage: damageFacts.length ? damageFacts.join('; ') : '',
+    economicImpact: damageFacts.filter((fact) => /rs\.?|₹|inr|crore|lakh|loss/i.test(fact)).join('; '),
+    governmentResponse: responseFacts.length ? responseFacts.join('; ') : event.verificationReason,
+    rescueRelief: responseFacts.length ? responseFacts.join('; ') : event.instruction || '',
     recovery: event.status === 'ARCHIVED' || event.status === 'ENDED'
-      ? 'Event is available in the historical archive.'
-      : 'Event remains active or developing.',
-    sourceAssessment: `${event.verificationStatus} via ${event.verificationMethod}. Verification score ${Math.round(event.verificationScore * 100)}%.`,
+      ? recoveryFacts.join('; ')
+      : '',
+    sourceAssessment: `${event.verificationStatus} via ${event.verificationMethod}. Verification score ${Math.round(event.verificationScore * 100)}%. Coverage: ${sourceCount} source(s), ${distinctPublishers} distinct publisher(s), ${timeline.length} timeline milestone(s).`,
     conflictingReports: [],
     synthesizedAt: event.updatedAt,
     evidenceStatus: event.verificationScore >= 0.8 ? 'High Confidence' : event.verificationScore >= 0.55 ? 'Moderate Evidence' : 'Limited Coverage',
     retrievalMetadata: {
       queriesExecuted: ['canonical_events'],
-      rawSourcesCount: event.sourceCount,
-      dedupedSourcesCount: event.sourceCount,
+      rawSourcesCount: sourceCount,
+      dedupedSourcesCount: sourceCount,
     },
   };
+}
+
+function publisherKey(source: { publisher?: string | null; url?: string | null }): string {
+  const publisher = String(source.publisher || '').toLowerCase().replace(/^www\./, '').trim();
+  if (publisher) return publisher;
+  try {
+    return source.url ? new URL(source.url).hostname.replace(/^www\./, '') : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function cleanSnippet(value: string): string {
+  return value
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.;:])/g, '$1')
+    .trim()
+    .replace(/^[-:;,\s]+/, '')
+    .slice(0, 260);
+}
+
+function extractSourceFacts(
+  sources: Array<{ id: string; title: string; summary: string }>,
+  pattern: RegExp,
+  maxFacts: number,
+): string[] {
+  const facts: string[] = [];
+  const seen = new Set<string>();
+  for (const source of sources) {
+    const text = `${source.title}. ${source.summary}`;
+    pattern.lastIndex = 0;
+    const matches = Array.from(text.matchAll(pattern));
+    for (const match of matches) {
+      const snippet = cleanSnippet(match[0]);
+      if (snippet.length < 12) continue;
+      const normalized = snippet.toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      facts.push(`[${source.id}] ${snippet}`);
+      if (facts.length >= maxFacts) return facts;
+    }
+  }
+  return facts;
+}
+
+function extractCasualtyFallback(text: string, sourceId?: string): string {
+  const match = text.match(/\b\d[\d,]*(?:\s*-\s*\d[\d,]*)?\s+(?:people\s+)?(?:dead|deaths?|killed|injured|missing|casualt(?:y|ies)|affected)\b[^.;]{0,80}/i);
+  return match ? `${sourceId ? `[${sourceId}] ` : ''}${cleanSnippet(match[0])}` : '';
+}
+
+function summarizeFromSources(
+  sources: Array<{ id: string; title: string; summary: string }>,
+  fallback: string,
+): string {
+  const fragments = sources.slice(0, 5).map((source) => {
+    const summary = cleanSnippet(source.summary || source.title);
+    return summary ? `${summary} [${source.id}]` : '';
+  }).filter(Boolean);
+  return fragments.length ? fragments.join(' ') : fallback;
+}
+
+function buildTimelineFromSources(
+  sources: Array<{ id: string; title: string; summary: string; publishedAt: string }>,
+  fallbackDate: string,
+): EvidenceBundle['timeline'] {
+  const fallbackTime = Date.parse(fallbackDate);
+  return sources
+    .map((source, index) => {
+      const parsed = Date.parse(source.publishedAt);
+      const date = Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallbackDate;
+      return {
+        date,
+        event: cleanSnippet(source.title).slice(0, 120) || `Source update ${index + 1}`,
+        description: `${cleanSnippet(source.summary || source.title)} [${source.id}]`,
+        citations: [source.id],
+        sortTime: Number.isFinite(parsed) ? parsed : Number.isFinite(fallbackTime) ? fallbackTime + index : Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .filter((step) => step.description.length > 8)
+    .sort((a, b) => a.sortTime - b.sortTime)
+    .slice(0, 12)
+    .map(({ sortTime: _sortTime, ...step }) => step);
+}
+
+function queryMatchesBundle(query: string, bundle: EvidenceBundle): boolean {
+  const lower = query.toLowerCase();
+  const text = `${bundle.eventName} ${bundle.disasterType} ${bundle.location} ${bundle.state}`.toLowerCase();
+  const disasterTypes = ['cyclone', 'flood', 'earthquake', 'landslide', 'tsunami', 'lightning', 'thunderstorm', 'heat'];
+  const requestedType = disasterTypes.find((type) => lower.includes(type));
+  if (requestedType && !text.includes(requestedType)) return false;
+
+  const stop = new Set(['what', 'happened', 'during', 'tell', 'about', 'india', 'indian', 'disaster']);
+  const important = lower.split(/[^a-z0-9]+/).filter((token) => token.length >= 4 && !stop.has(token) && token !== requestedType);
+  return important.length === 0 || important.some((token) => text.includes(token));
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +314,52 @@ function normalizeSearchQuery(query: string): string {
  */
 function persistenceSucceeded(p: PersistedResearch | null): boolean {
   return Boolean(p && p.eventId && p.observationsPersisted > 0 && p.errors.length === 0);
+}
+
+const RICH_BUNDLE_DOCUMENT_TITLE = '__AAPDA_RICH_EVIDENCE_BUNDLE__';
+
+async function persistRichEvidenceBundle(eventId: string | null | undefined, bundle: EvidenceBundle): Promise<void> {
+  if (!eventId || !isSupabaseConfigured()) return;
+  const storedBundle: EvidenceBundle = { ...bundle, id: eventId };
+  const now = new Date().toISOString();
+  const documentHash = contentHash(`rich-evidence-bundle|${eventId}`);
+
+  await supabaseRest('search_documents?on_conflict=document_hash', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates' },
+    body: JSON.stringify({
+      document_type: 'external_research',
+      event_id: eventId,
+      title: RICH_BUNDLE_DOCUMENT_TITLE,
+      content: JSON.stringify(storedBundle),
+      source_url: storedBundle.sources?.[0]?.url || null,
+      document_hash: documentHash,
+      indexed_at: now,
+    }),
+  });
+}
+
+async function getPersistedEvidenceBundle(eventId: string): Promise<EvidenceBundle | null> {
+  if (!isSupabaseConfigured()) return null;
+  const rows = await supabaseRest<Array<{ content: string }>>(
+    `search_documents?event_id=eq.${eventId}&document_type=eq.external_research&title=eq.${encodeURIComponent(RICH_BUNDLE_DOCUMENT_TITLE)}&select=content&limit=1`,
+    { method: 'GET' },
+  ).catch(() => []);
+
+  const raw = rows[0]?.content;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as EvidenceBundle;
+    if (!parsed?.eventName || !Array.isArray(parsed.sources)) return null;
+    return { ...parsed, id: eventId };
+  } catch {
+    return null;
+  }
+}
+
+async function bundleForCanonicalEvent(event: CanonicalEventDto): Promise<EvidenceBundle> {
+  const stored = await getPersistedEvidenceBundle(event.id);
+  return stored || canonicalEventToEvidenceBundle(event);
 }
 
 async function persistExternalResearch(query: string, bundle: EvidenceBundle): Promise<void> {
@@ -318,6 +464,7 @@ async function persistExternalResearch(query: string, bundle: EvidenceBundle): P
     if (eventDocId) {
       await embedAndStoreSearchDocument(eventDocId, `${bundle.eventName}. ${bundle.whatHappened}`);
     }
+    await persistRichEvidenceBundle(eventId, bundle);
   } catch (error) {
     // Persistence failures must not break the response, but are logged loudly.
     console.error('[search:persist] external research persistence failed:', (error as Error).message);
@@ -347,8 +494,9 @@ router.post('/search', async (req: Request, res: Response) => {
     ]);
 
     if (canonicalMatches.length > 0) {
+      const results = await Promise.all(canonicalMatches.slice(0, 10).map(bundleForCanonicalEvent));
       const response = {
-        results: canonicalMatches.slice(0, 10).map(canonicalEventToEvidenceBundle),
+        results,
         source: 'database',
         provenance: 'lexical',
       };
@@ -365,7 +513,7 @@ router.post('/search', async (req: Request, res: Response) => {
           { method: 'GET' },
         ).catch(() => []);
         if (rows.length > 0) {
-          const response = { results: rows.map(canonicalEventToEvidenceBundle), source: 'database', provenance: 'lexical_documents' };
+          const response = { results: await Promise.all(rows.map(bundleForCanonicalEvent)), source: 'database', provenance: 'lexical_documents' };
           cache.set('search', cacheKey, response, cache.getTTL('search'));
           res.json(response);
           return;
@@ -383,7 +531,7 @@ router.post('/search', async (req: Request, res: Response) => {
           { method: 'GET' },
         ).catch(() => []);
         if (rows.length > 0) {
-          const response = { results: rows.map(canonicalEventToEvidenceBundle), source: 'database', provenance: 'vector' };
+          const response = { results: await Promise.all(rows.map(bundleForCanonicalEvent)), source: 'database', provenance: 'vector' };
           cache.set('search', cacheKey, response, cache.getTTL('search'));
           res.json(response);
           return;
@@ -460,7 +608,7 @@ router.get('/past/archive', async (req: Request, res: Response) => {
     if (!isSupabaseConfigured()) throw unavailable('Database not configured');
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 200);
     const archive = await listArchivedCanonicalEvents(limit);
-    const items = archive.items.map(canonicalEventToEvidenceBundle);
+    const items = await Promise.all(archive.items.map(bundleForCanonicalEvent));
 
     const category = typeof req.query.category === 'string' && !/^all/i.test(req.query.category) ? req.query.category : undefined;
     const state = typeof req.query.state === 'string' && !/^all/i.test(req.query.state) ? req.query.state : undefined;
@@ -498,10 +646,12 @@ router.post('/past/search', async (req: Request, res: Response) => {
     if (research.source === 'database' && research.event?.id) {
       const dto = await getCanonicalEventById(research.event.id);
       if (dto) {
-        const bundle = canonicalEventToEvidenceBundle(dto);
-        res.setHeader('Cache-Control', 'private, max-age=900');
-        res.json({ bundle, source: 'database', retrieval: research.retrieval });
-        return;
+        const bundle = await bundleForCanonicalEvent(dto);
+        if (queryMatchesBundle(query, bundle)) {
+          res.setHeader('Cache-Control', 'private, max-age=900');
+          res.json({ bundle, source: 'database', retrieval: research.retrieval });
+          return;
+        }
       }
     }
 
@@ -519,8 +669,12 @@ router.post('/past/search', async (req: Request, res: Response) => {
     // Research path: synthesize a dossier from the retrieved evidence with
     // per-claim citations; persistence state is reported explicitly.
     const evidenceBundle = await buildHistoricalEvidenceBundle(query);
+    const eventId = research.persistence?.eventId || research.event?.id || null;
+    if (eventId) await persistRichEvidenceBundle(eventId, evidenceBundle).catch((error) => {
+      console.error('[past:search] rich dossier persistence failed:', (error as Error).message);
+    });
     res.json({
-      bundle: evidenceBundle,
+      bundle: eventId ? { ...evidenceBundle, id: eventId } : evidenceBundle,
       source: 'multi_source_research',
       event: research.event,
       citations: research.citations,
@@ -583,14 +737,17 @@ router.post('/past/chat', async (req: Request, res: Response) => {
       if (research.source === 'database' && research.event?.id) {
         const dto = await getCanonicalEventById(research.event.id);
         if (dto) {
-          groundingBundle = canonicalEventToEvidenceBundle(dto);
+          groundingBundle = await bundleForCanonicalEvent(dto);
           groundingSource = 'database';
         }
       } else if (research.source === 'multi_source_research' && research.evidence.length > 0) {
         // No canonical record: build the dossier from freshly researched
         // evidence (the orchestrator already persisted + embedded it).
         try {
-          groundingBundle = await buildHistoricalEvidenceBundle(message);
+          const builtBundle = await buildHistoricalEvidenceBundle(message);
+          const eventId = research.persistence?.eventId || research.event?.id || null;
+          if (eventId) await persistRichEvidenceBundle(eventId, builtBundle).catch(() => undefined);
+          groundingBundle = eventId ? { ...builtBundle, id: eventId } : builtBundle;
           groundingSource = 'multi_source_research';
         } catch {
           groundingBundle = null;
@@ -1631,40 +1788,77 @@ router.get('/admin/sources/:id/observations', requireAuth, requireAdmin, async (
 
 router.post('/admin/research/historical', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
-    const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
-    if (!query) throw badRequest('Query is required');
-    if (query.length > 300) throw badRequest('Query is too long (max 300 characters)');
+    const rawQueries: unknown[] = Array.isArray(req.body?.queries)
+      ? req.body.queries
+      : [req.body?.query];
+    const queries: string[] = Array.from(new Set(rawQueries
+      .filter((value: unknown): value is string => typeof value === 'string')
+      .map((value: string) => value.trim())
+      .filter((value: string) => Boolean(value))));
+    if (queries.length === 0) throw badRequest('Query is required');
+    if (queries.length > 12) throw badRequest('Run at most 12 research queries in one shift');
+    if (queries.some((query) => query.length > 300)) throw badRequest('Each query must be 300 characters or less');
     rateLimit(req, `admin-research:${req.user!.id}`, 10, 60_000);
 
     const forceResearch = req.body?.forceResearch === true;
+    const allowedResearchSources = [
+      'sachet-cap', 'imd', 'cwc', 'incois', 'fsi', 'dgre', 'state-disaster-authorities',
+      'google-news-rss', 'national-news', 'regional-news', 'citizen', 'reddit',
+      'youtube', 'x', 'data-gov',
+    ];
     const requestedSources = Array.isArray(req.body?.sources)
       ? req.body.sources.filter((s: unknown): s is SourceKey =>
-          typeof s === 'string' && ['sachet-cap', 'google-news-rss', 'citizen', 'reddit', 'youtube', 'data-gov'].includes(s))
+          typeof s === 'string' && allowedResearchSources.includes(s))
       : undefined;
 
-    const research = await researchHistoricalDisaster(query, {
-      historical: true,
-      forceResearch,
-      sources: requestedSources,
-    });
+    const runOne = async (query: string) => {
+      const research = await researchHistoricalDisaster(query, {
+        historical: true,
+        forceResearch,
+        sources: requestedSources,
+      });
 
-    res.json({
-      query: research.query,
-      source: research.source,
-      event: research.event,
-      citations: research.citations,
-      verification: research.verification,
-      retrieval: research.retrieval,
-      persistence: {
-        succeeded: persistenceSucceeded(research.persistence),
-        eventId: research.persistence?.eventId || null,
-        eventKey: research.persistence?.eventKey || null,
-        observationsPersisted: research.persistence?.observationsPersisted || 0,
-        documentsPersisted: research.persistence?.documentsPersisted || 0,
-        embedded: research.persistence?.embedded || false,
-        errors: research.persistence?.errors || [],
-      },
-    });
+      let bundle: EvidenceBundle | null = null;
+      if (research.source === 'database' && research.event?.id) {
+        const dto = await getCanonicalEventById(research.event.id);
+        bundle = dto ? await bundleForCanonicalEvent(dto) : null;
+      } else if (research.source === 'multi_source_research') {
+        bundle = await buildHistoricalEvidenceBundle(query).catch(() => null);
+        const eventId = research.persistence?.eventId || research.event?.id || null;
+        if (bundle && eventId) {
+          await persistRichEvidenceBundle(eventId, bundle).catch((error) => {
+            console.error('[admin:research] rich dossier persistence failed:', (error as Error).message);
+          });
+          bundle = { ...bundle, id: eventId };
+        }
+      }
+
+      return {
+        query: research.query,
+        source: research.source,
+        event: research.event,
+        bundle,
+        citations: research.citations,
+        verification: research.verification,
+        retrieval: research.retrieval,
+        persistence: {
+          succeeded: persistenceSucceeded(research.persistence),
+          eventId: research.persistence?.eventId || null,
+          eventKey: research.persistence?.eventKey || null,
+          observationsPersisted: research.persistence?.observationsPersisted || 0,
+          documentsPersisted: research.persistence?.documentsPersisted || 0,
+          embedded: research.persistence?.embedded || false,
+          errors: research.persistence?.errors || [],
+        },
+      };
+    };
+
+    const results: Awaited<ReturnType<typeof runOne>>[] = [];
+    for (const query of queries) {
+      results.push(await runOne(query));
+    }
+
+    res.json(queries.length === 1 ? results[0] : { batch: true, count: results.length, results });
   } catch (error) {
     sendError(res, error);
   }

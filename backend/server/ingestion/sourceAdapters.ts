@@ -35,6 +35,13 @@ export interface SourceAdapter {
   healthCheck(): Promise<SourceHealth>;
 }
 
+function isMostlyEnglishText(text: string): boolean {
+  const letters = [...text].filter((char) => /\p{L}/u.test(char));
+  if (letters.length < 12) return true;
+  const latinLetters = letters.filter((char) => /\p{Script=Latin}/u.test(char));
+  return latinLetters.length / letters.length >= 0.85;
+}
+
 export class SachetCapAdapter implements SourceAdapter {
   sourceKey: SourceKey = 'sachet-cap';
   type: SourceType = 'OFFICIAL';
@@ -42,7 +49,13 @@ export class SachetCapAdapter implements SourceAdapter {
   async fetchRecent(): Promise<RawObservation[]> {
     if (process.env.SOURCE_SACHET_ENABLED === 'false') return [];
     const result = await getSachetAlerts();
-    return result.alerts.map((alert) => ({
+    return result.alerts.filter((alert) => isMostlyEnglishText([
+      alert.headline,
+      alert.event,
+      alert.description,
+      alert.instruction,
+      alert.areaDesc,
+    ].filter(Boolean).join(' '))).map((alert) => ({
       sourceKey: this.sourceKey,
       sourceType: this.type,
       externalId: alert.identifier,
@@ -69,10 +82,15 @@ export class SachetCapAdapter implements SourceAdapter {
 }
 
 export class GoogleNewsAdapter implements SourceAdapter {
-  sourceKey: SourceKey = 'google-news-rss';
+  sourceKey: SourceKey;
   type: SourceType = 'NEWS';
 
-  constructor(private readonly query = 'India disaster weather alert') {}
+  constructor(
+    sourceKey: SourceKey = 'google-news-rss',
+    private readonly query = 'India disaster weather alert',
+  ) {
+    this.sourceKey = sourceKey;
+  }
 
   async fetchRecent(): Promise<RawObservation[]> {
     if (process.env.SOURCE_GOOGLE_NEWS_ENABLED === 'false') return [];
@@ -105,6 +123,8 @@ export class GoogleNewsAdapter implements SourceAdapter {
 export function getConfiguredSourceAdapters(): SourceAdapter[] {
   return [
     new SachetCapAdapter(),
-    new GoogleNewsAdapter(),
+    new GoogleNewsAdapter('google-news-rss', 'India disaster weather alert'),
+    new GoogleNewsAdapter('national-news', 'site:thehindu.com OR site:indianexpress.com OR site:hindustantimes.com India flood cyclone earthquake landslide weather alert'),
+    new GoogleNewsAdapter('regional-news', 'India state regional news flood cyclone heavy rain landslide alert'),
   ];
 }

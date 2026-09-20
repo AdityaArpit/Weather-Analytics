@@ -365,7 +365,20 @@ create table public.source_health (
 insert into public.source_definitions (source_key, name, source_type, base_url, enabled, priority, trust_weight, health_status)
 values
   ('sachet-cap', 'SACHET / NDMA CAP Alerts', 'OFFICIAL', 'https://sachet.ndma.gov.in', true, 10, 0.95, 'UNKNOWN'),
+  ('imd', 'India Meteorological Department', 'OFFICIAL', 'https://mausam.imd.gov.in', true, 11, 0.95, 'UNKNOWN'),
+  ('cwc', 'Central Water Commission', 'OFFICIAL', 'https://cwc.gov.in', true, 12, 0.95, 'UNKNOWN'),
+  ('incois', 'INCOIS Ocean Alerts', 'OFFICIAL', 'https://incois.gov.in', true, 13, 0.95, 'UNKNOWN'),
+  ('fsi', 'Forest Survey of India', 'OFFICIAL', 'https://fsi.nic.in', true, 14, 0.95, 'UNKNOWN'),
+  ('dgre', 'DGRE Snow and Avalanche Warnings', 'OFFICIAL', 'https://www.drdo.gov.in/labs-and-establishments/defence-geoinformatics-research-establishment-dgre', true, 15, 0.95, 'UNKNOWN'),
+  ('state-disaster-authorities', 'State Disaster Management Authorities', 'OFFICIAL', null, true, 25, 0.9, 'UNKNOWN'),
   ('google-news-rss', 'Google News (India disaster coverage)', 'NEWS', 'https://news.google.com', true, 50, 0.55, 'UNKNOWN'),
+  ('national-news', 'Major Indian National News', 'NEWS', 'https://news.google.com', true, 51, 0.55, 'UNKNOWN'),
+  ('regional-news', 'Major Indian Regional News', 'NEWS', 'https://news.google.com', true, 52, 0.55, 'UNKNOWN'),
+  ('reddit', 'Reddit (r/India disaster threads)', 'SOCIAL', 'https://www.reddit.com', true, 70, 0.25, 'UNKNOWN'),
+  ('youtube', 'YouTube News Channels', 'SOCIAL', 'https://www.googleapis.com/youtube/v3', true, 71, 0.3, 'UNKNOWN'),
+  ('x', 'X / Public Social Signals', 'SOCIAL', 'https://developer.x.com', false, 72, 0.25, 'DISABLED'),
+  ('data-gov', 'data.gov.in Open Datasets', 'DATASET', 'https://api.data.gov.in', true, 35, 0.75, 'UNKNOWN'),
+  ('historical-catalog', 'Curated Historical Disaster Catalog', 'SEED', null, true, 40, 0.8, 'UNKNOWN'),
   ('citizen', 'Citizen Reports', 'CITIZEN', null, true, 60, 0.35, 'UNKNOWN')
 on conflict (source_key) do nothing;
 
