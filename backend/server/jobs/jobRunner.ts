@@ -106,6 +106,15 @@ export async function recordSourceHealth(
       headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
       body: JSON.stringify(payload),
     });
+
+    await supabaseRest(`source_definitions?id=eq.${sourceId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        health_status: params.status,
+        ...(params.lastSuccessAt ? { last_success_at: params.lastSuccessAt } : {}),
+        ...(params.lastFailureAt ? { last_failure_at: params.lastFailureAt } : {}),
+      }),
+    }).catch(() => undefined);
   } catch (err) {
     console.warn(`Failed to record source health for ${sourceKey}:`, (err as Error).message);
   }

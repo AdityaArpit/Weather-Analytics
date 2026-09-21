@@ -185,7 +185,7 @@ select 'rls', 'search_documents_enabled', count(*) > 0 from pg_class c
   join pg_namespace n on n.oid = c.relnamespace
   where n.nspname = 'public' and c.relname = 'search_documents' and c.relrowsecurity
 union all
-select 'seeds', 'source_definitions=3', count(*) = 3 from public.source_definitions
+select 'seeds', 'source_definitions_seeded', count(*) >= 12 from public.source_definitions
 union all
 select 'triggers', 'on_auth_user_created', count(*) > 0 from pg_trigger t
   join pg_class c on c.oid = t.tgrelid

@@ -1,13 +1,20 @@
-const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
-export const SUPABASE_PUBLISHABLE_KEY = String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
-export const SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '');
-
-export function isSupabaseConfigured(): boolean {
-  return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
+export function getSupabaseUrl(): string {
+  return String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 }
 
-export function getSupabaseUrl(): string {
-  return SUPABASE_URL;
+export function getSupabaseSecretKey(): string {
+  return String(process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+}
+
+export function getSupabasePublishableKey(): string {
+  return String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
+}
+
+export const SUPABASE_PUBLISHABLE_KEY = getSupabasePublishableKey();
+export const SUPABASE_SECRET_KEY = getSupabaseSecretKey();
+
+export function isSupabaseConfigured(): boolean {
+  return Boolean(getSupabaseUrl() && getSupabaseSecretKey());
 }
 
 export async function supabaseRest<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -15,11 +22,14 @@ export async function supabaseRest<T>(path: string, init: RequestInit = {}): Pro
     throw new Error('Supabase is not configured');
   }
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path.replace(/^\/+/, '')}`, {
+  const url = getSupabaseUrl();
+  const secretKey = getSupabaseSecretKey();
+
+  const response = await fetch(`${url}/rest/v1/${path.replace(/^\/+/, '')}`, {
     ...init,
     headers: {
-      apikey: SUPABASE_SECRET_KEY,
-      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      apikey: secretKey,
+      Authorization: `Bearer ${secretKey}`,
       Accept: 'application/json',
       'Content-Type': 'application/json',
       Prefer: 'return=representation',

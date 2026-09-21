@@ -31,6 +31,7 @@ import {
 import { searchGoogleNews } from '../googleNews';
 import { searchYouTube } from '../adapters/youtube';
 import { searchReddit } from '../adapters/reddit';
+import { searchX } from '../adapters/x';
 import { searchDataGov } from '../adapters/dataGov';
 import { searchCitizenEvidence } from './citizenEvidence';
 import { verificationFromSignals, PUBLIC_VERIFICATION_STATUSES, type EvidenceSignal } from './verification';
@@ -75,6 +76,7 @@ export interface RawHistoricalEvidence {
 // Provider configuration (key presence checked lazily so health reads stay cheap).
 const youtubeEnabled = () => Boolean(process.env.YOUTUBE_API_KEY);
 const redditEnabled = () => Boolean(process.env.REDDIT_CLIENT_ID && process.env.REDDIT_CLIENT_SECRET);
+const xEnabled = () => Boolean(process.env.X_BEARER_TOKEN || process.env.TWITTER_BEARER_TOKEN);
 const dataGovEnabled = () => Boolean(process.env.DATA_GOV_API_KEY);
 
 export const PROVIDER_REGISTRY: ProviderCapability[] = [
@@ -125,6 +127,74 @@ export const PROVIDER_REGISTRY: ProviderCapability[] = [
     },
   },
   {
+    sourceKey: 'national-news',
+    sourceType: 'NEWS',
+    enabled: () => true,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.55,
+    search: async (query, { historical, maxResults }) => {
+      const articles = await searchGoogleNews(`${query} site:thehindu.com OR site:indianexpress.com OR site:hindustantimes.com`, {
+        isCurrentNews: !historical,
+        maxResults,
+      });
+      return articles.map((article) => ({
+        sourceKey: 'national-news' as SourceKey,
+        sourceType: 'NEWS' as const,
+        externalId: normalizeUrl(article.url) || article.url,
+        title: article.title,
+        content: article.summary,
+        url: article.url,
+        publisher: article.publisher,
+        publishedAt: article.publishedAt || null,
+        retrievedAt: new Date().toISOString(),
+        locationText: null,
+        disasterType: null,
+        eventDate: article.publishedAt || null,
+        state: null,
+        district: null,
+        city: null,
+        metadata: { queryUsed: query },
+        confidence: 0.55,
+      }));
+    },
+  },
+  {
+    sourceKey: 'regional-news',
+    sourceType: 'NEWS',
+    enabled: () => true,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.55,
+    search: async (query, { historical, maxResults }) => {
+      const articles = await searchGoogleNews(`${query} Indian regional news`, {
+        isCurrentNews: !historical,
+        maxResults,
+      });
+      return articles.map((article) => ({
+        sourceKey: 'regional-news' as SourceKey,
+        sourceType: 'NEWS' as const,
+        externalId: normalizeUrl(article.url) || article.url,
+        title: article.title,
+        content: article.summary,
+        url: article.url,
+        publisher: article.publisher,
+        publishedAt: article.publishedAt || null,
+        retrievedAt: new Date().toISOString(),
+        locationText: null,
+        disasterType: null,
+        eventDate: article.publishedAt || null,
+        state: null,
+        district: null,
+        city: null,
+        metadata: { queryUsed: query },
+        confidence: 0.55,
+      }));
+    },
+  },
+  {
     sourceKey: 'youtube',
     sourceType: 'SOCIAL',
     enabled: youtubeEnabled,
@@ -143,6 +213,16 @@ export const PROVIDER_REGISTRY: ProviderCapability[] = [
     supportsSearch: true,
     trustWeight: 0.25,
     search: async (query, { maxResults }) => searchReddit(query, { maxResults }),
+  },
+  {
+    sourceKey: 'x',
+    sourceType: 'SOCIAL',
+    enabled: xEnabled,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.25,
+    search: async (query, { maxResults }) => searchX(query, { maxResults }),
   },
   {
     sourceKey: 'data-gov',
@@ -311,6 +391,21 @@ export function decideVerification(evidence: RawHistoricalEvidence[]): Verificat
     };
   }
 
+  const trustedIndependentSources = new Set(
+    evidence
+      .filter((item) => item.sourceType === 'NEWS' || item.sourceType === 'DATASET' || item.sourceType === 'OFFICIAL')
+      .map((item) => item.sourceKey),
+  );
+  if (trustedIndependentSources.size >= 2) {
+    const score = Math.max(scored.score, trustedIndependentSources.size >= 3 ? 0.72 : 0.58);
+    return {
+      status: trustedIndependentSources.size >= 3 ? 'CROSS_SOURCE_VERIFIED' : 'PROVISIONALLY_VERIFIED',
+      score,
+      method: 'CROSS_SOURCE_CORROBORATION',
+      reason: `Corroborated by ${trustedIndependentSources.size} independent trusted source providers.`,
+    };
+  }
+
   return {
     status: scored.status,
     score: scored.score,
@@ -333,6 +428,30 @@ function deterministicEventKey(nq: NormalizedQuery): string {
     slug(nq.normalized).slice(0, 40) || 'event',
   ];
   return parts.join('-');
+}
+
+function meaningfulTokens(value: string): Set<string> {
+  const stop = new Set(['what', 'happened', 'during', 'tell', 'about', 'india', 'indian', 'the', 'and', 'with', 'for']);
+  return new Set(
+    value.toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length >= 4 && !stop.has(token)),
+  );
+}
+
+function isRelevantDatabaseHit(
+  nq: NormalizedQuery,
+  hit: { title?: string | null; event_type?: string | null; state?: string | null; location_name?: string | null },
+): boolean {
+  const queryTokens = meaningfulTokens(nq.normalized);
+  const hitText = `${hit.title || ''} ${hit.event_type || ''} ${hit.state || ''} ${hit.location_name || ''}`;
+  const hitTokens = meaningfulTokens(hitText);
+  const overlap = [...queryTokens].filter((token) => hitTokens.has(token));
+  const typeOk = !nq.disasterType || (hit.event_type || '').toLowerCase().includes(nq.disasterType.toLowerCase());
+  const stateOk = !nq.state || hitText.toLowerCase().includes(nq.state.toLowerCase());
+  const namedQueryTokens = [...queryTokens].filter((token) => token !== (nq.disasterType || '').toLowerCase());
+  const namedOk = namedQueryTokens.length === 0 || namedQueryTokens.some((token) => hitTokens.has(token));
+  return typeOk && stateOk && namedOk && overlap.length > 0;
 }
 
 export interface PersistedResearch {
@@ -411,23 +530,34 @@ export async function persistResearchResult(
         const source = await resolveSource(item.sourceKey);
         const hash = contentHash(`${item.title}|${item.content}|${item.url || ''}`);
         const inserted = await supabaseRest<Array<{ id: string }>>(
-          'source_observations?on_conflict=source_id,external_id',
+          'source_observations?on_conflict=source_id,content_hash',
           {
             method: 'POST',
             headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
             body: JSON.stringify({
-            source_id: source.id,
-            external_id: item.externalId,
-            content_hash: hash,
-            title: item.title.slice(0, 500),
-            raw_content: item.content.slice(0, 8000),
-            source_url: item.url,
-            publisher: item.publisher,
-            published_at: item.publishedAt,
-            retrieved_at: item.retrievedAt,
-          }),
-        });
-        const observationId = inserted[0]?.id;
+              source_id: source.id,
+              external_id: item.externalId,
+              content_hash: hash,
+              title: item.title.slice(0, 500),
+              raw_content: item.content.slice(0, 8000),
+              raw_payload: item.metadata || {},
+              source_url: item.url,
+              publisher: item.publisher,
+              published_at: item.publishedAt,
+              retrieved_at: item.retrievedAt,
+              location_text: item.locationText,
+              event_category: item.disasterType,
+            }),
+          },
+        );
+        let observationId = inserted[0]?.id || null;
+        if (!observationId) {
+          const existing = await supabaseRest<Array<{ id: string }>>(
+            `source_observations?and=(source_id.eq.${source.id},content_hash.eq.${hash})&select=id&limit=1`,
+            { method: 'GET' },
+          ).catch(() => []);
+          observationId = existing[0]?.id || null;
+        }
         if (!observationId) {
           out.errors.push(`Observation upsert returned no id for ${item.sourceKey}`);
           continue;
@@ -533,7 +663,12 @@ async function searchDatabaseFirst(
 
   // 1. Lexical canonical search.
   const lexical = await searchCanonicalEventsLexical(nq.normalized, 5);
-  const best = lexical[0] || null;
+  const best = lexical.find((event) => isRelevantDatabaseHit(nq, {
+    title: event.title,
+    event_type: event.eventType,
+    state: event.state || null,
+    location_name: event.locationName,
+  })) || null;
   if (best) {
     return {
       event: {
@@ -558,7 +693,8 @@ async function searchDatabaseFirst(
   }
 
   // 2. Vector event search.
-  const vectorHits = await vectorEventSearch(nq.normalized, 5, 0.4);
+  const vectorHits = (await vectorEventSearch(nq.normalized, 5, 0.55))
+    .filter((hit) => isRelevantDatabaseHit(nq, hit));
   if (vectorHits.length > 0) {
     const rows = await supabaseRest<Array<Record<string, unknown>>>(
       `canonical_events?id=in.(${vectorHits.map((hit) => hit.event_id).join(',')})&select=id,event_key,title,verification_status,verification_score&limit=1`,

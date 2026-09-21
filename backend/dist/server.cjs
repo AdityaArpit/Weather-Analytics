@@ -32,6 +32,7 @@ var import_path = __toESM(require("path"), 1);
 
 // server/routes.ts
 var import_express = require("express");
+var import_node_crypto = require("node:crypto");
 var import_multer = __toESM(require("multer"), 1);
 
 // server/sachet.ts
@@ -57,10 +58,10 @@ function coerceIsoDate(value) {
 }
 
 // server/lib/relevanceEngine.ts
-function isAlertExpired(alert, now = /* @__PURE__ */ new Date()) {
+function isAlertExpired(alert, now2 = /* @__PURE__ */ new Date()) {
   if (!alert.expires) return false;
   const expiryTime = new Date(alert.expires).getTime();
-  return !isNaN(expiryTime) && expiryTime <= now.getTime();
+  return !isNaN(expiryTime) && expiryTime <= now2.getTime();
 }
 
 // server/sachet.ts
@@ -633,13 +634,13 @@ function parseCapPayload(rawContent) {
   }
 }
 async function getSachetAlerts(clientEtag) {
-  const now = /* @__PURE__ */ new Date();
+  const now2 = /* @__PURE__ */ new Date();
   const cacheAgeMs = Date.now() - new Date(
     sachetCache.lastUpdated
   ).getTime();
   if (sachetCache.data.length > 0 && cacheAgeMs < 45e3 && clientEtag === sachetCache.etag) {
     const active = sachetCache.data.filter(
-      (a) => !isAlertExpired(a, now)
+      (a) => !isAlertExpired(a, now2)
     );
     return {
       alerts: active,
@@ -692,7 +693,7 @@ async function getSachetAlerts(clientEtag) {
       err.message
     );
     sachetLiveAlerts = sachetCache.data.filter(
-      (a) => a.feedOrigin === "NDMA_SACHET_LIVE" && !isAlertExpired(a, now)
+      (a) => a.feedOrigin === "NDMA_SACHET_LIVE" && !isAlertExpired(a, now2)
     );
   }
   const usgsAlerts = await fetchUSGSIndianEarthquakes();
@@ -701,7 +702,7 @@ async function getSachetAlerts(clientEtag) {
     ...usgsAlerts
   ];
   const activeAlerts = combinedAlerts.filter(
-    (a) => !isAlertExpired(a, now)
+    (a) => !isAlertExpired(a, now2)
   ).sort(
     (a, b) => new Date(
       b.sent || b.effective
@@ -771,7 +772,7 @@ function deduplicateNewsArticles(articles) {
   }
   return results;
 }
-function evaluateTemporalGate(publishedAtStr, now = /* @__PURE__ */ new Date(), windowHours = 72) {
+function evaluateTemporalGate(publishedAtStr, now2 = /* @__PURE__ */ new Date(), windowHours = 72) {
   if (!publishedAtStr) {
     return {
       isEligible: false,
@@ -782,7 +783,7 @@ function evaluateTemporalGate(publishedAtStr, now = /* @__PURE__ */ new Date(), 
   }
   const pubDate = new Date(publishedAtStr);
   const pubTime = pubDate.getTime();
-  const nowTime = now.getTime();
+  const nowTime = now2.getTime();
   if (isNaN(pubTime)) {
     return {
       isEligible: false,
@@ -1013,7 +1014,7 @@ async function searchGoogleNews(query, options = {}) {
       const parsed = xmlParser2.parse(xmlText);
       const items = parsed?.rss?.channel?.item || parsed?.feed?.entry || [];
       const itemsArray = Array.isArray(items) ? items : [items];
-      const now = /* @__PURE__ */ new Date();
+      const now2 = /* @__PURE__ */ new Date();
       for (let i = 0; i < itemsArray.length && articles.length < maxResults; i++) {
         const item = itemsArray[i];
         if (!item || !item.title) continue;
@@ -1033,7 +1034,7 @@ async function searchGoogleNews(query, options = {}) {
         }
         const rawDesc = String(item.description || item.summary || "");
         const summary = cleanNewsText(rawDesc) || cleanNewsText(title);
-        const gateResult = evaluateTemporalGate(pubDateStr, now, windowHours);
+        const gateResult = evaluateTemporalGate(pubDateStr, now2, windowHours);
         if (isCurrentNews && !gateResult.isEligible) {
           continue;
         }
@@ -1065,9 +1066,6 @@ async function searchGoogleNews(query, options = {}) {
 
 // server/aiGateway.ts
 var evidenceBundleCache = /* @__PURE__ */ new Map();
-var recentArchiveCache = /* @__PURE__ */ new Map();
-var eraDiscoveryCache = /* @__PURE__ */ new Map();
-var recentArchiveWarmupStarted = false;
 var EVIDENCE_BUNDLE_CACHE_TTL_MS = 10 * 60 * 1e3;
 var RECENT_ARCHIVE_CACHE_TTL_MS = 20 * 60 * 1e3;
 var ERA_DISCOVERY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1e3;
@@ -1195,7 +1193,17 @@ function getGroqBaseUrl() {
   return process.env.GROQ_BASE_URL?.trim() || "https://api.groq.com/openai/v1";
 }
 function getGroqChatModels() {
-  return (process.env.GROQ_MODEL_FALLBACKS || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").split(",").map((model) => model.trim()).filter(Boolean);
+  const configured = (process.env.GROQ_MODEL_FALLBACKS || "").split(",").map((model) => model.trim()).filter(Boolean);
+  const primary = process.env.GROQ_MODEL?.trim() || "openai/gpt-oss-120b";
+  return Array.from(
+    /* @__PURE__ */ new Set([
+      primary,
+      ...configured,
+      "openai/gpt-oss-20b",
+      "qwen/qwen3.8-27b",
+      "llama-3.3-70b-versatile"
+    ])
+  );
 }
 function getGroqSttModel() {
   return process.env.GROQ_STT_MODEL?.trim() || "whisper-large-v3-turbo";
@@ -1207,23 +1215,119 @@ function getGroqTtsVoice() {
   return process.env.GROQ_TTS_VOICE?.trim() || "austin";
 }
 function isGroqConfigured() {
-  return Boolean(process.env.GROQ_API_KEY?.trim());
+  keyPool.initialize();
+  return keyPool.getHealth().some((entry) => !entry.disabled);
 }
-function getGroqKey(scope = "default") {
-  const scopeEnvMap = {
-    past: ["GROQ_API_KEY_PAST", "GROQ_API_KEY_HISTORY", "GROQ_API_KEY"],
-    pastFilters: ["GROQ_API_KEY_PAST_FILTERS"],
-    chat: ["GROQ_API_KEY_CHAT", "GROQ_API_KEY_ASSISTANT", "GROQ_API_KEY"],
-    stt: ["GROQ_API_KEY_STT", "GROQ_API_KEY_AUDIO", "GROQ_API_KEY"],
-    tts: ["GROQ_API_KEY_TTS", "GROQ_API_KEY_AUDIO", "GROQ_API_KEY"]
-  };
-  const envNames = scope === "default" ? ["GROQ_API_KEY"] : scopeEnvMap[scope];
-  for (const envName of envNames) {
-    const apiKey = process.env[envName]?.trim();
-    if (apiKey) return apiKey;
+var GroqKeyPool = class {
+  constructor() {
+    this.keys = [];
+    this.initialized = false;
+    this.maxConcurrency = parseInt(process.env.GROQ_MAX_CONCURRENCY || "8", 10);
+    this.perKeyConcurrency = parseInt(process.env.GROQ_PER_KEY_CONCURRENCY || "1", 10);
+    this.maxRetries = parseInt(process.env.GROQ_MAX_RETRIES || "3", 10);
   }
-  const label = scope === "default" ? "GROQ_API_KEY" : envNames.join(" or ");
-  throw new Error(`${label} is not configured.`);
+  initialize() {
+    if (this.initialized) return;
+    this.initialized = true;
+    const keySet = /* @__PURE__ */ new Set();
+    const commaKeys = process.env.GROQ_API_KEYS?.split(",").map((k) => k.trim()).filter(Boolean) || [];
+    for (const k of commaKeys) keySet.add(k);
+    for (let i = 1; i <= 100; i++) {
+      const envName = `GROQ_API_KEY_${String(i).padStart(2, "0")}`;
+      const key = process.env[envName]?.trim();
+      if (key) keySet.add(key);
+    }
+    const primary = process.env.GROQ_API_KEY?.trim();
+    if (primary) keySet.add(primary);
+    this.keys = Array.from(keySet).map((key) => ({
+      key,
+      healthy: true,
+      busy: 0,
+      cooldownUntil: 0,
+      failures: 0,
+      lastUsed: 0,
+      disabled: false
+    }));
+  }
+  getTotalBusy() {
+    return this.keys.reduce((sum, k) => sum + k.busy, 0);
+  }
+  acquire() {
+    this.initialize();
+    const now2 = Date.now();
+    if (this.getTotalBusy() >= this.maxConcurrency) {
+      const leastBusy = this.keys.filter((k) => !k.disabled && k.healthy && k.cooldownUntil <= now2 && k.busy < this.perKeyConcurrency).sort((a, b) => a.busy - b.busy)[0];
+      if (leastBusy) {
+        leastBusy.busy++;
+        leastBusy.lastUsed = now2;
+        return leastBusy.key;
+      }
+    }
+    const available = this.keys.filter((k) => !k.disabled && k.healthy && k.cooldownUntil <= now2 && k.busy < this.perKeyConcurrency).sort((a, b) => a.lastUsed - b.lastUsed);
+    if (available.length > 0) {
+      const chosen = available[0];
+      chosen.busy++;
+      chosen.lastUsed = now2;
+      return chosen.key;
+    }
+    const fallback = this.keys.find((k) => !k.disabled && k.healthy);
+    if (fallback) {
+      fallback.busy++;
+      fallback.lastUsed = now2;
+      return fallback.key;
+    }
+    throw new Error("All Groq API keys are exhausted or disabled.");
+  }
+  release(key) {
+    const entry = this.keys.find((k) => k.key === key);
+    if (entry) entry.busy = Math.max(0, entry.busy - 1);
+  }
+  report429(key) {
+    const entry = this.keys.find((k) => k.key === key);
+    if (!entry) return;
+    entry.failures++;
+    const cooldownMs = Math.min(3e4, 1e3 * Math.pow(2, entry.failures)) + Math.random() * 1e3;
+    entry.cooldownUntil = Date.now() + cooldownMs;
+    entry.busy = Math.max(0, entry.busy - 1);
+  }
+  reportSuccess(key) {
+    const entry = this.keys.find((k) => k.key === key);
+    if (entry) {
+      entry.failures = Math.max(0, entry.failures - 1);
+      if (entry.cooldownUntil <= Date.now()) {
+        entry.healthy = true;
+      }
+    }
+  }
+  reportFailure(key) {
+    const entry = this.keys.find((k) => k.key === key);
+    if (!entry) return;
+    entry.failures++;
+    entry.busy = Math.max(0, entry.busy - 1);
+    if (entry.failures >= 5) {
+      entry.disabled = true;
+    }
+  }
+  getHealth() {
+    this.initialize();
+    return this.keys.map((k) => ({
+      keySuffix: k.key.slice(-6),
+      healthy: k.healthy,
+      busy: k.busy,
+      failures: k.failures,
+      disabled: k.disabled
+    }));
+  }
+};
+var keyPool = new GroqKeyPool();
+function getGroqKey(_scope = "default") {
+  return keyPool.acquire();
+}
+function releaseGroqKey(key) {
+  keyPool.release(key);
+}
+function getKeyPoolHealth() {
+  return keyPool.getHealth();
 }
 function stripCodeFences(text) {
   return text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
@@ -1281,13 +1385,6 @@ function inferLocation(text, fallbackState) {
   }
   if (fallbackState !== "India") return fallbackState;
   return "India";
-}
-function deriveYearFromBundle(bundle) {
-  const eventDate = coerceIsoDate(bundle.eventDate);
-  if (eventDate) return new Date(eventDate).getFullYear();
-  const dateRangeYear = bundle.dateRange?.match(/\b(19\d\d|20\d\d)\b/)?.[0];
-  if (dateRangeYear) return Number(dateRangeYear);
-  return new Date(bundle.synthesizedAt).getFullYear();
 }
 function formatCasualtyRange(range) {
   if (!range.rangeMin && !range.rangeMax) return null;
@@ -1365,54 +1462,60 @@ function normalizeSynthesizedData(raw, fallbackQuery, sources) {
     timeline: Array.isArray(data.timeline) ? data.timeline : []
   };
 }
-function sortArchiveItems(items) {
-  return items.sort((a, b) => {
-    const aTime = a.eventDate ? new Date(a.eventDate).getTime() : NaN;
-    const bTime = b.eventDate ? new Date(b.eventDate).getTime() : NaN;
-    if (Number.isFinite(aTime) && Number.isFinite(bTime) && aTime !== bTime) return bTime - aTime;
-    if (Number.isFinite(aTime)) return -1;
-    if (Number.isFinite(bTime)) return 1;
-    return b.year - a.year;
-  });
-}
 function toBase64(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   return Buffer.from(bytes).toString("base64");
 }
 async function groqChatCompletion(params) {
-  const apiKey = getGroqKey(params.keyScope || "default");
-  const baseUrl = getGroqBaseUrl();
+  const models = [params.model, ...getGroqChatModels()].filter(Boolean);
   let lastError = null;
-  for (const model of [params.model, ...getGroqChatModels()].filter(Boolean)) {
+  for (let attempt = 0; attempt < keyPool["maxRetries"]; attempt++) {
+    let apiKey;
     try {
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model,
-          messages: params.messages,
-          temperature: params.temperature ?? 0.2,
-          ...params.maxTokens ? { max_completion_tokens: params.maxTokens } : {}
-        })
-      });
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(`Groq chat completion failed for ${model}: HTTP ${response.status} ${text}`.trim());
+      apiKey = getGroqKey(params.keyScope || "default");
+    } catch (err) {
+      throw err;
+    }
+    for (const model of models) {
+      try {
+        const baseUrl = getGroqBaseUrl();
+        const response = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model,
+            messages: params.messages,
+            temperature: params.temperature ?? 0.2,
+            ...params.maxTokens ? { max_completion_tokens: params.maxTokens } : {}
+          })
+        });
+        if (response.status === 429) {
+          keyPool.report429(apiKey);
+          lastError = new Error(`Rate limited on ${model}`);
+          break;
+        }
+        if (!response.ok) {
+          const text = await response.text().catch(() => "");
+          throw new Error(`Groq chat completion failed for ${model}: HTTP ${response.status} ${text}`.trim());
+        }
+        const data = await response.json();
+        const content = data?.choices?.[0]?.message?.content;
+        if (typeof content === "string" && content.trim()) {
+          keyPool.reportSuccess(apiKey);
+          releaseGroqKey(apiKey);
+          return content.trim();
+        }
+        throw new Error(`Groq chat completion returned an empty response for ${model}.`);
+      } catch (error) {
+        lastError = error;
+        keyPool.reportFailure(apiKey);
       }
-      const data = await response.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (typeof content === "string" && content.trim()) {
-        return content.trim();
-      }
-      throw new Error(`Groq chat completion returned an empty response for ${model}.`);
-    } catch (error) {
-      lastError = error;
     }
   }
-  throw lastError || new Error("Groq chat completion failed.");
+  throw lastError || new Error("Groq chat completion failed after all retries.");
 }
 function mimeToExt(mime) {
   const base = mime.split(";")[0].trim().toLowerCase();
@@ -1872,346 +1975,6 @@ ${depthInstruction}`,
   });
   return bundle;
 }
-var RECENT_ARCHIVE_SEARCHES = [
-  "Kerala flood 2024 India",
-  "Assam flood 2024 India",
-  "Himachal Pradesh landslide 2024 India",
-  "Wayanad landslide 2024 India",
-  "Sikkim earthquake 2023 India",
-  "Odisha cyclone 2024 India",
-  "Maharashtra flood 2024 India",
-  "Delhi heat wave 2024 India",
-  "Rajasthan flood 2024 India",
-  "Tamil Nadu cyclone 2024 India",
-  "Karnataka rain flood 2024 India",
-  "Bihar flood 2024 India",
-  "West Bengal flood 2024 India",
-  "Uttarakhand landslide 2024 India",
-  "Punjab flood 2024 India",
-  "Gujarat heat wave 2024 India",
-  "Andhra Pradesh cyclone 2024 India",
-  "Telangana flood 2024 India",
-  "Goa heavy rain 2024 India",
-  "Arunachal Pradesh landslide 2024 India",
-  "Meghalaya flood 2024 India",
-  "Mizoram landslide 2024 India",
-  "Nagaland heavy rain 2024 India",
-  "Chhattisgarh forest fire 2024 India",
-  "Ladakh avalanche 2024 India",
-  "Jammu Kashmir snow avalanche 2024 India",
-  "Madhya Pradesh flood 2024 India",
-  "Uttar Pradesh flood 2024 India",
-  "West Bengal cyclone 2024 India",
-  "Bengaluru urban flood 2024 India",
-  "Tripura flood 2024 India",
-  "Jammu Kashmir flood 2024 India",
-  "Sikkim landslide 2024 India",
-  "Odisha heat wave 2024 India",
-  "Haryana heat wave 2024 India"
-];
-function buildArchiveQueryPool(options) {
-  const limit = Math.max(options?.limit || 30, 1);
-  const category = options?.categoryFilter?.trim() || "";
-  const state = options?.stateFilter?.trim() || "";
-  const decade = options?.decadeFilter?.trim() || "";
-  const decadeYearHints = {
-    "1990s": ["1993", "1998", "1999"],
-    "2000s": ["2001", "2004", "2008", "2009"],
-    "2010s": ["2013", "2014", "2015", "2018", "2019"],
-    "2020s": ["2020", "2021", "2022", "2023", "2024", "2025", "2026"]
-  };
-  const searchRoots = [
-    category && state ? `${state} ${category}` : "",
-    state ? `${state} disaster` : "",
-    category ? `India ${category}` : "",
-    state && decade ? `${state} ${decade}` : ""
-  ].filter(Boolean);
-  const hints = decadeYearHints[decade] || ["2024", "2025", "2026"];
-  const decorateQuery = (query) => {
-    const parts = [query, category, state, decade ? hints.slice(0, 3).join(" ") : ""].filter(Boolean).join(" ");
-    return `${parts} India`.replace(/\s+/g, " ").trim();
-  };
-  const targeted = searchRoots.flatMap((root) => {
-    const variants = [root, `${root} flood`, `${root} disaster`, ...hints.map((year) => `${root} ${year}`)];
-    return variants.map(decorateQuery);
-  });
-  const combined = [
-    ...targeted,
-    ...RECENT_ARCHIVE_SEARCHES.map(decorateQuery)
-  ];
-  const deduped = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const query of combined) {
-    const key = query.toLowerCase().trim();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(query);
-    if (deduped.length >= Math.min(Math.max(limit * 3, 100), 240)) break;
-  }
-  return deduped;
-}
-function bundleToArchiveItem(bundle, index) {
-  const year = deriveYearFromBundle(bundle);
-  return {
-    ...bundle,
-    year,
-    numericCasualties: bundle.numericCasualtiesRange?.max || Number(bundle.reportedCasualties?.match(/(\d[\d,]*)/)?.[1]?.replace(/,/g, "") || 0),
-    decade: year < 2e3 ? "1990s" : year < 2010 ? "2000s" : year < 2020 ? "2010s" : "2020s",
-    id: bundle.id || `archive-${index}`
-  };
-}
-async function buildArchiveEvidenceBundle(query, index, seed) {
-  try {
-    const bundle = await buildHistoricalEvidenceBundle(
-      seed ? `${seed.eventName} ${seed.approxDate}` : query,
-      seed?.disasterType,
-      seed?.state
-    );
-    return bundleToArchiveItem(bundle, index);
-  } catch (error) {
-    const message = error.message;
-    if (/no live google news sources|insufficient relevant historical evidence/i.test(message)) {
-      return null;
-    }
-    console.warn("Archive evidence research failed:", message);
-    return null;
-  }
-}
-async function discoverEraDisasters(params) {
-  const cacheKey = JSON.stringify({
-    decade: params.decade || "2020s",
-    state: params.state || "",
-    category: params.category || "",
-    limit: params.limit
-  }).toLowerCase();
-  const cached = eraDiscoveryCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.events;
-  const fallbackSeeds = [
-    { eventName: "1999 Odisha Super Cyclone", approxDate: "1999-10-29", location: "Odisha coast", state: "Odisha", disasterType: "Cyclone" },
-    { eventName: "1993 Latur earthquake", approxDate: "1993-09-30", location: "Latur and Osmanabad", state: "Maharashtra", disasterType: "Earthquake" },
-    { eventName: "1998 Malpa landslide", approxDate: "1998-08-18", location: "Malpa, Pithoragarh", state: "Uttarakhand", disasterType: "Landslide" },
-    { eventName: "2001 Gujarat earthquake", approxDate: "2001-01-26", location: "Bhuj and Kutch", state: "Gujarat", disasterType: "Earthquake" },
-    { eventName: "2004 Indian Ocean tsunami Tamil Nadu", approxDate: "2004-12-26", location: "Tamil Nadu coast", state: "Tamil Nadu", disasterType: "Tsunami" },
-    { eventName: "2008 Bihar Kosi flood", approxDate: "2008-08-18", location: "Kosi basin", state: "Bihar", disasterType: "Flood" },
-    { eventName: "2013 Uttarakhand floods", approxDate: "2013-06-16", location: "Kedarnath and Garhwal", state: "Uttarakhand", disasterType: "Flood" },
-    { eventName: "2014 Kashmir floods", approxDate: "2014-09-05", location: "Jammu and Kashmir", state: "Jammu and Kashmir", disasterType: "Flood" },
-    { eventName: "2018 Kerala floods", approxDate: "2018-08-15", location: "Kerala", state: "Kerala", disasterType: "Flood" },
-    { eventName: "2020 Cyclone Amphan", approxDate: "2020-05-20", location: "West Bengal and Odisha coast", state: "West Bengal", disasterType: "Cyclone" },
-    { eventName: "2021 Chamoli disaster", approxDate: "2021-02-07", location: "Chamoli", state: "Uttarakhand", disasterType: "Flood" },
-    { eventName: "2024 Wayanad landslides", approxDate: "2024-07-30", location: "Wayanad", state: "Kerala", disasterType: "Landslide" }
-  ];
-  const raw = await generateWithFallback({
-    keyScope: "pastFilters",
-    responseMimeType: "application/json",
-    systemInstruction: "You list only real, verifiable, well-known Indian disaster events. Return strict JSON only. Do not invent events.",
-    prompt: `List up to ${Math.min(Math.max(params.limit, 1), 20)} real, notable Indian disaster events matching:
-decade: ${params.decade || "any, prefer 2020s"}
-state: ${params.state || "any"}
-category: ${params.category || "any"}
-Return {"events":[{"eventName":"","approxDate":"YYYY-MM-DD or YYYY-MM","location":"","state":"","disasterType":"Cyclone | Flood | Earthquake | Landslide | Heavy Rain | Heat Wave | Tsunami | Avalanche | Forest Fire | Drought | General Alert"}]}.
-Prefer high-confidence events with known names and dates.`
-  });
-  let discovered = [];
-  if (raw) {
-    try {
-      const parsed = JSON.parse(stripCodeFences(raw));
-      discovered = Array.isArray(parsed?.events) ? parsed.events.map((event) => ({
-        eventName: String(event.eventName || "").trim(),
-        approxDate: String(event.approxDate || "").trim(),
-        eventDate: coerceIsoDate(event.approxDate),
-        location: String(event.location || "").trim(),
-        state: String(event.state || "").trim() || void 0,
-        disasterType: event.disasterType || "General Alert"
-      })).filter((event) => event.eventName && event.location && event.eventDate) : [];
-    } catch (error) {
-      console.warn("Era discovery parse failed:", error.message);
-    }
-  }
-  const decade = params.decade && params.decade !== "all" ? params.decade : void 0;
-  const state = params.state && params.state !== "All States" ? params.state.toLowerCase() : void 0;
-  const category = params.category && params.category !== "all" ? params.category.toLowerCase() : void 0;
-  const deterministic = fallbackSeeds.filter((event) => {
-    const year = new Date(coerceIsoDate(event.approxDate) || event.approxDate).getFullYear();
-    if (decade) {
-      const eventDecade = year < 2e3 ? "1990s" : year < 2010 ? "2000s" : year < 2020 ? "2010s" : "2020s";
-      if (eventDecade !== decade) return false;
-    }
-    if (state && !(event.state || "").toLowerCase().includes(state) && !event.location.toLowerCase().includes(state)) return false;
-    if (category && !event.disasterType.toLowerCase().includes(category)) return false;
-    return true;
-  });
-  const merged = [...discovered, ...deterministic].filter((event, idx, all) => all.findIndex((candidate) => candidate.eventName.toLowerCase() === event.eventName.toLowerCase()) === idx).slice(0, params.limit);
-  eraDiscoveryCache.set(cacheKey, {
-    expiresAt: Date.now() + ERA_DISCOVERY_CACHE_TTL_MS,
-    events: merged
-  });
-  return merged;
-}
-async function buildRecentIndiaArchive(limit = 100, options) {
-  const cacheKey = JSON.stringify({
-    limit,
-    categoryFilter: options?.categoryFilter || "",
-    stateFilter: options?.stateFilter || "",
-    decadeFilter: options?.decadeFilter || ""
-  });
-  const cached = recentArchiveCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.items;
-  }
-  if (options?.decadeFilter && options.decadeFilter !== "all") {
-    const seeds = await discoverEraDisasters({
-      decade: options.decadeFilter,
-      state: options.stateFilter,
-      category: options.categoryFilter,
-      limit
-    });
-    const results = await Promise.allSettled(
-      seeds.map((seed, index) => buildArchiveEvidenceBundle(`${seed.eventName} ${seed.approxDate}`, index, seed))
-    );
-    const sorted2 = sortArchiveItems(results.filter((result) => result.status === "fulfilled").map((result) => result.value).filter((item) => Boolean(item))).slice(0, limit);
-    recentArchiveCache.set(cacheKey, { expiresAt: Date.now() + RECENT_ARCHIVE_CACHE_TTL_MS, items: sorted2 });
-    return sorted2;
-  }
-  const queries = buildArchiveQueryPool({ ...options, limit });
-  const archive = [];
-  const seen = /* @__PURE__ */ new Set();
-  const concurrency = 4;
-  const matchesFilters = (item) => {
-    if (options?.categoryFilter && options.categoryFilter !== "all") {
-      const category = options.categoryFilter.toLowerCase();
-      const matchesCategory = item.disasterType.toLowerCase().includes(category) || category === "landslide" && item.disasterType.toLowerCase().includes("avalanche");
-      if (!matchesCategory) return false;
-    }
-    if (options?.stateFilter && options.stateFilter !== "All States") {
-      const state = options.stateFilter.toLowerCase();
-      if (!item.state.toLowerCase().includes(state) && !item.location.toLowerCase().includes(state)) return false;
-    }
-    if (options?.decadeFilter && options.decadeFilter !== "all" && item.decade !== options.decadeFilter) {
-      return false;
-    }
-    return true;
-  };
-  for (let i = 0; i < queries.length && archive.length < limit; i += concurrency) {
-    const batch = queries.slice(i, i + concurrency);
-    const batchResults = await Promise.allSettled(
-      batch.map((query, offset) => buildArchiveEvidenceBundle(query, i + offset))
-    );
-    for (const result of batchResults) {
-      if (result.status !== "fulfilled" || !result.value) continue;
-      const item = result.value;
-      if (!matchesFilters(item)) continue;
-      const dedupeKey = `${item.eventName.toLowerCase()}|${item.state.toLowerCase()}|${item.dateRange.toLowerCase()}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-      archive.push(item);
-      if (archive.length >= limit) break;
-    }
-    if (archive.length >= limit) break;
-  }
-  const sorted = sortArchiveItems(archive).slice(0, limit);
-  recentArchiveCache.set(cacheKey, {
-    expiresAt: Date.now() + RECENT_ARCHIVE_CACHE_TTL_MS,
-    items: sorted
-  });
-  return sorted;
-}
-async function buildFilterSearchPlan(options, limit) {
-  const filterSummary = [
-    options.categoryFilter && options.categoryFilter !== "all" ? `hazard: ${options.categoryFilter}` : "",
-    options.stateFilter && options.stateFilter !== "All States" ? `state: ${options.stateFilter}` : "",
-    options.decadeFilter && options.decadeFilter !== "all" ? `era: ${options.decadeFilter}` : ""
-  ].filter(Boolean).join("; ") || "all Indian disasters";
-  const planned = await generateWithFallback({
-    keyScope: "pastFilters",
-    responseMimeType: "application/json",
-    systemInstruction: "You plan evidence searches for Indian disaster research. Return only JSON. Every query must target India and the requested filter. Do not invent events or facts.",
-    prompt: `Create up to ${Math.min(Math.max(limit, 10), 40)} concise Google News search queries for this filter: ${filterSummary}.
-Return exactly {"queries":["..."]}. Use specific Indian states, hazards, districts, or documented event names when helpful. For an era, include the era years in the queries.`
-  });
-  let plannedQueries = [];
-  if (planned) {
-    try {
-      const parsed = JSON.parse(stripCodeFences(planned));
-      plannedQueries = Array.isArray(parsed?.queries) ? parsed.queries.filter((query) => typeof query === "string") : [];
-    } catch (error) {
-      console.warn("Filter search plan parse failed:", error.message);
-    }
-  }
-  const generated = plannedQueries.map((query) => query.replace(/\s+/g, " ").trim()).filter((query) => query.length >= 8 && /india/i.test(query)).slice(0, 40);
-  const deterministicQueries = buildArchiveQueryPool({ ...options, limit });
-  return Array.from(/* @__PURE__ */ new Set([...generated, ...deterministicQueries]));
-}
-async function buildFilteredIndiaArchive(limit = 100, options = {}) {
-  const safeLimit = Math.min(Math.max(Math.floor(limit) || 100, 1), 100);
-  const cacheKey = `filter:${JSON.stringify({
-    limit: safeLimit,
-    categoryFilter: options.categoryFilter || "",
-    stateFilter: options.stateFilter || "",
-    decadeFilter: options.decadeFilter || ""
-  })}`;
-  const cached = recentArchiveCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.items;
-  }
-  const seeds = options.decadeFilter && options.decadeFilter !== "all" ? await discoverEraDisasters({
-    decade: options.decadeFilter,
-    state: options.stateFilter,
-    category: options.categoryFilter,
-    limit: safeLimit
-  }) : [];
-  const queries = seeds.length ? seeds.map((seed) => `${seed.eventName} ${seed.approxDate}`) : await buildFilterSearchPlan(options, safeLimit);
-  const archive = [];
-  const seen = /* @__PURE__ */ new Set();
-  const concurrency = 4;
-  const matchesFilters = (item) => {
-    if (options.categoryFilter && options.categoryFilter !== "all") {
-      const category = options.categoryFilter.toLowerCase();
-      const matchesCategory = item.disasterType.toLowerCase().includes(category) || category === "landslide" && item.disasterType.toLowerCase().includes("avalanche");
-      if (!matchesCategory) return false;
-    }
-    if (options.stateFilter && options.stateFilter !== "All States") {
-      const state = options.stateFilter.toLowerCase();
-      const itemState = item.state.toLowerCase();
-      const stateMatches = itemState === state || itemState.includes(state) || itemState === "india" && item.location.toLowerCase().includes(state);
-      if (!stateMatches) return false;
-    }
-    if (options.decadeFilter && options.decadeFilter !== "all" && item.decade !== options.decadeFilter) {
-      return false;
-    }
-    return true;
-  };
-  for (let i = 0; i < queries.length && archive.length < safeLimit; i += concurrency) {
-    const batch = queries.slice(i, i + concurrency);
-    const batchResults = await Promise.allSettled(
-      batch.map((query, offset) => buildArchiveEvidenceBundle(query, i + offset, seeds[i + offset]))
-    );
-    for (const result of batchResults) {
-      if (result.status !== "fulfilled" || !result.value || !matchesFilters(result.value)) continue;
-      const item = result.value;
-      const dedupeKey = `${item.eventName.toLowerCase()}|${item.state.toLowerCase()}|${item.dateRange.toLowerCase()}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-      archive.push(item);
-      if (archive.length >= safeLimit) break;
-    }
-  }
-  const sorted = sortArchiveItems(archive).slice(0, safeLimit);
-  recentArchiveCache.set(cacheKey, {
-    expiresAt: Date.now() + RECENT_ARCHIVE_CACHE_TTL_MS,
-    items: sorted
-  });
-  return sorted;
-}
-function warmRecentIndiaArchive(limit = 100) {
-  if (recentArchiveWarmupStarted) {
-    return;
-  }
-  recentArchiveWarmupStarted = true;
-  void buildRecentIndiaArchive(limit).catch((error) => {
-    recentArchiveWarmupStarted = false;
-    console.warn("Archive warmup failed:", error.message);
-  });
-}
 function buildDeterministicFallbackSynthesis(query, sources) {
   const qLower = query.toLowerCase();
   let type = "General Alert";
@@ -2462,7 +2225,8 @@ async function generateTTSAudio(text, voiceName = getGroqTtsVoice()) {
   const apiKey = getGroqKey("tts");
   const baseUrl = getGroqBaseUrl();
   const ttsModel = getGroqTtsModel();
-  const cleanText = stripMarkdownForSpeech(text).replace(/\[S\d+\]/gi, "").slice(0, 500);
+  const spokenText = stripMarkdownForSpeech(text).replace(/\[[Ss]\d+\]/g, "").replace(/\s+/g, " ").trim().slice(0, 200);
+  if (!spokenText) return null;
   try {
     const response = await fetch(`${baseUrl}/audio/speech`, {
       method: "POST",
@@ -2472,19 +2236,22 @@ async function generateTTSAudio(text, voiceName = getGroqTtsVoice()) {
       },
       body: JSON.stringify({
         model: ttsModel,
-        input: cleanText,
+        input: spokenText,
         voice: voiceName || getGroqTtsVoice(),
-        response_format: "mp3"
+        response_format: "wav"
       })
     });
     if (!response.ok) {
-      const text2 = await response.text().catch(() => "");
-      throw new Error(`Groq TTS failed: HTTP ${response.status} ${text2}`.trim());
+      const errText = await response.text().catch(() => "");
+      throw new Error(`Groq TTS failed: HTTP ${response.status} ${errText.slice(0, 200)}`.trim());
     }
     const audioBuffer = await response.arrayBuffer();
+    if (!audioBuffer || audioBuffer.byteLength < 44) {
+      throw new Error("Groq TTS returned an empty audio payload");
+    }
     return toBase64(audioBuffer);
   } catch (error) {
-    console.log("Groq TTS fallback:", error.message);
+    console.error("Embedding generation failed:", error.message);
     return null;
   }
 }
@@ -2516,28 +2283,32 @@ function moderateChatInput(value) {
   return match ? { allowed: false, category: match.category } : { allowed: true };
 }
 
-// server/data/historicalDisasters.ts
-var HISTORICAL_DISASTERS_CATALOG = [];
-
 // server/db/supabase.ts
-var SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/+$/, "");
-var SUPABASE_PUBLISHABLE_KEY = String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || "");
-var SUPABASE_SECRET_KEY = String(process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "");
-function isSupabaseConfigured() {
-  return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
-}
 function getSupabaseUrl() {
-  return SUPABASE_URL;
+  return String(process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+}
+function getSupabaseSecretKey() {
+  return String(process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "");
+}
+function getSupabasePublishableKey() {
+  return String(process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || "");
+}
+var SUPABASE_PUBLISHABLE_KEY = getSupabasePublishableKey();
+var SUPABASE_SECRET_KEY = getSupabaseSecretKey();
+function isSupabaseConfigured() {
+  return Boolean(getSupabaseUrl() && getSupabaseSecretKey());
 }
 async function supabaseRest(path2, init = {}) {
   if (!isSupabaseConfigured()) {
     throw new Error("Supabase is not configured");
   }
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path2.replace(/^\/+/, "")}`, {
+  const url = getSupabaseUrl();
+  const secretKey = getSupabaseSecretKey();
+  const response = await fetch(`${url}/rest/v1/${path2.replace(/^\/+/, "")}`, {
     ...init,
     headers: {
-      apikey: SUPABASE_SECRET_KEY,
-      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      apikey: secretKey,
+      Authorization: `Bearer ${secretKey}`,
       Accept: "application/json",
       "Content-Type": "application/json",
       Prefer: "return=representation",
@@ -2549,10 +2320,20 @@ async function supabaseRest(path2, init = {}) {
     throw new Error(`Supabase REST request failed (${response.status}): ${detail || response.statusText}`);
   }
   if (response.status === 204) return void 0;
-  return response.json();
+  const text = await response.text();
+  if (!text || text.trim() === "") return void 0;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Supabase REST returned non-JSON body (${response.status}): ${text.slice(0, 300)}`);
+  }
 }
 
 // server/repositories/canonicalEvents.ts
+var PUBLIC_VERIFICATION_STATUSES = ["OFFICIAL_VERIFIED", "CROSS_SOURCE_VERIFIED", "PROVISIONALLY_VERIFIED"];
+function publicVerificationFilter() {
+  return `verification_status=in.(${PUBLIC_VERIFICATION_STATUSES.join(",")})`;
+}
 function rowToDto(row) {
   const coordinates = row.centroid?.coordinates;
   return {
@@ -2565,6 +2346,7 @@ function rowToDto(row) {
     urgency: row.urgency || "Unknown",
     certainty: row.certainty || "Unknown",
     description: row.description || "",
+    instruction: row.instruction || void 0,
     locationName: row.location_name || [row.district, row.state].filter(Boolean).join(", ") || "India",
     city: row.city || void 0,
     district: row.district || void 0,
@@ -2572,7 +2354,6 @@ function rowToDto(row) {
     country: row.country || "India",
     longitude: row.longitude ?? coordinates?.[0],
     latitude: row.latitude ?? coordinates?.[1],
-    geometry: row.geometry || void 0,
     startedAt: row.started_at || void 0,
     lastObservedAt: row.last_observed_at || void 0,
     lastVerifiedAt: row.last_verified_at || void 0,
@@ -2589,96 +2370,140 @@ function rowToDto(row) {
     updatedAt: row.updated_at
   };
 }
-function seedEvents() {
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  return HISTORICAL_DISASTERS_CATALOG.slice(0, 12).map((item) => ({
-    id: item.id,
-    eventKey: item.id,
-    title: item.eventName,
-    eventType: item.disasterType,
-    status: "ARCHIVED",
-    severity: "Severe",
-    urgency: "Past",
-    certainty: "Observed",
-    description: item.whatHappened,
-    locationName: `${item.location}, ${item.state}`,
-    state: item.state,
-    country: item.country,
-    startedAt: item.eventDate,
-    lastObservedAt: item.eventDate,
-    lastVerifiedAt: item.synthesizedAt,
-    endedAt: item.eventDate,
-    verificationStatus: "PROVISIONALLY_VERIFIED",
-    verificationScore: item.evidenceStatus === "High Confidence" ? 0.82 : 0.62,
-    verificationMethod: "SEED_FIXTURE_RECONCILIATION",
-    verificationReason: "Seeded from existing verified historical fixture for initial database population fallback.",
-    locationConfidence: 0.55,
-    sourceCount: item.sources.length,
-    citations: item.sources.map((source) => ({
-      id: source.id,
-      sourceName: source.publisher,
-      sourceType: "SEED",
-      publisher: source.publisher,
-      title: source.title,
-      url: source.url,
-      publishedAt: source.publishedAt,
-      retrievedAt: item.synthesizedAt,
-      summary: source.summary
-    })),
-    createdAt: now,
-    updatedAt: item.synthesizedAt || now
+function toDtoList(rows) {
+  return rows.map(rowToDto).filter((event) => {
+    const materialText = `${event.title} ${event.description} ${event.instruction || ""}`;
+    const letters = [...materialText].filter((char) => /\p{L}/u.test(char));
+    if (letters.length < 12) return true;
+    const latinLetters = letters.filter((char) => /\p{Script=Latin}/u.test(char));
+    return latinLetters.length / letters.length >= 0.85;
+  });
+}
+var VIEW_SELECT = "id,event_key,title,event_type,status,severity,urgency,certainty,description,instruction,location_name,city,district,state,country,latitude,longitude,started_at,last_observed_at,last_verified_at,present_until,ended_at,verification_status,verification_score,verification_method,verification_reason,location_confidence,source_count,citations,created_at,updated_at";
+async function listActiveCanonicalEvents(limit = 200) {
+  if (!isSupabaseConfigured()) {
+    return { items: [], count: 0, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SEED_FALLBACK" };
+  }
+  const rows = await supabaseRest(
+    `active_canonical_events?select=${VIEW_SELECT}&${publicVerificationFilter()}&order=last_observed_at.desc.nullslast&limit=${limit}`
+  ).catch((error) => {
+    console.warn("[canonicalEvents] active listing failed:", error.message);
+    return [];
+  });
+  const items = toDtoList(rows);
+  return { items, count: items.length, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SUPABASE" };
+}
+async function listArchivedCanonicalEvents(limit = 200) {
+  if (!isSupabaseConfigured()) {
+    return { items: [], count: 0, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SEED_FALLBACK" };
+  }
+  const rows = await supabaseRest(
+    `past_canonical_events?select=${VIEW_SELECT}&${publicVerificationFilter()}&order=started_at.desc.nullslast&limit=${limit}`
+  ).catch((error) => {
+    console.warn("[canonicalEvents] archive listing failed:", error.message);
+    return [];
+  });
+  const items = toDtoList(rows);
+  return { items, count: items.length, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SUPABASE" };
+}
+async function getCanonicalEventById(id) {
+  if (!isSupabaseConfigured()) return null;
+  const byView = (view) => supabaseRest(
+    `${view}?id=eq.${encodeURIComponent(id)}&select=${VIEW_SELECT}&${publicVerificationFilter()}&limit=1`
+  ).catch(() => []);
+  const [active, past] = await Promise.all([byView("active_canonical_events"), byView("past_canonical_events")]);
+  const row = active[0] || past[0];
+  return row ? rowToDto(row) : null;
+}
+async function searchCanonicalEventsLexical(query, limit = 50) {
+  if (!isSupabaseConfigured()) return [];
+  const encoded = encodeURIComponent(`%${query.replace(/[%_]/g, "")}%`);
+  const rows = await supabaseRest(
+    `past_canonical_events?select=${VIEW_SELECT}&${publicVerificationFilter()}&or=(title.ilike.${encoded},description.ilike.${encoded},state.ilike.${encoded},district.ilike.${encoded},location_name.ilike.${encoded},event_type.ilike.${encoded})&order=started_at.desc.nullslast&limit=${limit}`
+  ).catch((error) => {
+    console.warn("[canonicalEvents] lexical search failed:", error.message);
+    return [];
+  });
+  return toDtoList(rows);
+}
+async function getEventCitations(eventId) {
+  const rows = await supabaseRest(
+    `event_sources?event_id=eq.${encodeURIComponent(eventId)}&select=source_id,citation_id,source_definitions(name,source_type),source_observations(id,title,source_url,publisher,published_at,retrieved_at,raw_content)`,
+    { method: "GET" }
+  ).catch(() => []);
+  return rows.map((row, index) => ({
+    id: row.citation_id || `S${index + 1}`,
+    sourceId: row.source_id,
+    sourceName: row.source_definitions?.name || "Unknown Source",
+    sourceType: row.source_definitions?.source_type || "NEWS",
+    publisher: row.source_observations?.publisher || row.source_definitions?.name || void 0,
+    title: row.source_observations?.title || row.source_definitions?.name || "Source observation",
+    url: row.source_observations?.source_url || void 0,
+    publishedAt: row.source_observations?.published_at || void 0,
+    retrievedAt: row.source_observations?.retrieved_at || void 0,
+    summary: (row.source_observations?.raw_content || "").slice(0, 600) || void 0
   }));
 }
-async function listActiveCanonicalEvents() {
-  if (!isSupabaseConfigured()) {
-    return {
-      items: [],
-      count: 0,
-      retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      cacheStatus: "SEED_FALLBACK"
-    };
-  }
+async function getEventTimeline(eventId) {
   const rows = await supabaseRest(
-    "active_canonical_events?select=*&order=last_observed_at.desc.nullslast&limit=200"
-  );
-  const items = rows.map(rowToDto);
-  return { items, count: items.length, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SUPABASE" };
+    `event_updates?event_id=eq.${encodeURIComponent(eventId)}&select=id,status,severity,description,observed_at,created_at&order=observed_at.asc`,
+    { method: "GET" }
+  ).catch(() => []);
+  return rows.map((row) => ({
+    id: row.id,
+    status: row.status,
+    severity: row.severity,
+    description: row.description,
+    observedAt: row.observed_at,
+    createdAt: row.created_at
+  }));
 }
-async function listArchivedCanonicalEvents() {
-  if (!isSupabaseConfigured()) {
-    const items2 = seedEvents();
-    return { items: items2, count: items2.length, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SEED_FALLBACK" };
+
+// server/lib/httpError.ts
+var HttpError = class extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.status = status;
+    this.code = code;
   }
-  const rows = await supabaseRest(
-    "past_canonical_events?select=*&order=started_at.desc.nullslast&limit=200"
-  );
-  const items = rows.map(rowToDto);
-  return { items, count: items.length, retrievedAt: (/* @__PURE__ */ new Date()).toISOString(), cacheStatus: "SUPABASE" };
+};
+function badRequest(message, code = "BAD_REQUEST") {
+  return new HttpError(400, code, message);
 }
-async function searchCanonicalEvents(query) {
-  const q = query.trim();
-  if (!q) return [];
-  if (!isSupabaseConfigured()) {
-    const lower = q.toLowerCase();
-    return seedEvents().filter(
-      (item) => [item.title, item.eventType, item.state, item.locationName, item.description].some(
-        (value) => String(value || "").toLowerCase().includes(lower)
-      )
-    );
+function unauthorized(message = "Authentication required") {
+  return new HttpError(401, "UNAUTHENTICATED", message);
+}
+function forbidden(message = "You do not have permission to perform this action") {
+  return new HttpError(403, "FORBIDDEN", message);
+}
+function notFound(message = "Resource not found") {
+  return new HttpError(404, "NOT_FOUND", message);
+}
+function tooMany(message = "Too many requests, please slow down") {
+  return new HttpError(429, "RATE_LIMITED", message);
+}
+function unavailable(message) {
+  return new HttpError(503, "SERVICE_UNAVAILABLE", message);
+}
+function sendError(res, error) {
+  if (error instanceof HttpError) {
+    res.status(error.status).json({ success: false, error: { code: error.code, message: error.message } });
+    return;
   }
-  const encoded = encodeURIComponent(`%${q.replace(/[%_]/g, "")}%`);
-  const rows = await supabaseRest(
-    `past_canonical_events?select=*&or=(title.ilike.${encoded},description.ilike.${encoded},state.ilike.${encoded},district.ilike.${encoded},event_type.ilike.${encoded})&order=started_at.desc.nullslast&limit=50`
-  );
-  return rows.map(rowToDto);
+  const message = error instanceof Error ? error.message : "Unknown error";
+  console.error("[api:error]", message);
+  res.status(500).json({ success: false, error: { code: "INTERNAL_ERROR", message: "The request could not be completed." } });
 }
 
 // server/auth.ts
-async function requireAuth(req, res, next) {
+async function requireAuth(req, _res, next) {
   try {
     const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
-    if (!token) return res.status(401).json({ error: "Authentication required" });
-    if (!isSupabaseConfigured()) return res.status(503).json({ error: "Supabase Auth is not configured" });
+    if (!token) throw unauthorized();
+    if (!isSupabaseConfigured()) {
+      next(new Error("Supabase Auth is not configured on the server"));
+      return;
+    }
     const baseUrl = getSupabaseUrl();
     const response = await fetch(`${baseUrl}/auth/v1/user`, {
       headers: {
@@ -2686,68 +2511,3886 @@ async function requireAuth(req, res, next) {
         Authorization: `Bearer ${token}`
       }
     });
-    if (!response.ok) return res.status(401).json({ error: "Invalid or expired session" });
+    if (response.status === 401) throw unauthorized("Invalid or expired session");
+    if (!response.ok) throw unauthorized("Session could not be validated");
     const user = await response.json();
-    if (!user.id) return res.status(401).json({ error: "Invalid authenticated user" });
-    const profiles = await supabaseRest(
+    if (!user.id) throw unauthorized("Invalid authenticated user");
+    let profiles = await supabaseRest(
       `profiles?id=eq.${encodeURIComponent(user.id)}&select=role&limit=1`,
       { method: "GET" }
-    );
+    ).catch(() => []);
+    if (!profiles[0]) {
+      profiles = await supabaseRest("profiles", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({ id: user.id, email: user.email || null, role: "user" })
+      }).catch(() => []);
+    }
     req.user = {
       id: user.id,
       email: user.email,
+      // Fail closed: anything ambiguous resolves to the least-privileged role.
       role: profiles[0]?.role === "admin" ? "admin" : "user"
     };
     next();
   } catch (error) {
-    res.status(500).json({ error: "Authentication check failed", details: error.message });
+    next(error);
   }
 }
-function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: "Authentication required" });
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin role required" });
+function requireAdmin(req, _res, next) {
+  if (!req.user) {
+    next(unauthorized());
+    return;
+  }
+  if (req.user.role !== "admin") {
+    next(forbidden("Admin role required"));
+    return;
+  }
   next();
+}
+
+// server/lib/cache.ts
+var CacheService = class {
+  constructor() {
+    this.stores = /* @__PURE__ */ new Map();
+  }
+  getStore(name) {
+    if (!this.stores.has(name)) {
+      this.stores.set(name, /* @__PURE__ */ new Map());
+    }
+    return this.stores.get(name);
+  }
+  get(store, key) {
+    const s = this.getStore(store);
+    const entry = s.get(key);
+    if (!entry) return void 0;
+    if (Date.now() > entry.expiresAt) {
+      s.delete(key);
+      return void 0;
+    }
+    return entry.value;
+  }
+  set(store, key, value, ttlSeconds) {
+    const s = this.getStore(store);
+    s.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1e3 });
+  }
+  invalidate(store, key) {
+    if (key) {
+      this.getStore(store).delete(key);
+    } else {
+      this.stores.delete(store);
+    }
+  }
+  invalidatePattern(store, pattern) {
+    const s = this.getStore(store);
+    const regex = new RegExp(pattern);
+    for (const k of s.keys()) {
+      if (regex.test(k)) s.delete(k);
+    }
+  }
+  clear(store) {
+    this.stores.delete(store);
+  }
+  getTTL(storeName) {
+    const envMap = {
+      present: "CACHE_PRESENT_TTL_SECONDS",
+      past: "CACHE_PAST_TTL_SECONDS",
+      search: "CACHE_SEARCH_TTL_SECONDS",
+      chat: "CACHE_CHAT_TTL_SECONDS",
+      geocode: "GEOCODE_CACHE_TTL_SECONDS"
+    };
+    const envKey = envMap[storeName];
+    if (envKey) {
+      const val = Number(process.env[envKey]);
+      if (Number.isFinite(val) && val > 0) return val;
+    }
+    const defaults = {
+      present: 60,
+      past: 300,
+      search: 900,
+      chat: 900,
+      geocode: 86400
+    };
+    return defaults[storeName] || 300;
+  }
+};
+var cache = new CacheService();
+
+// server/lib/embedding.ts
+var GeminiEmbeddingProvider = class {
+  constructor() {
+    this.providerName = "gemini";
+    this.available = false;
+    this.apiKey = process.env.GEMINI_API_KEY?.trim() || "";
+    this.modelName = process.env.GEMINI_EMBEDDING_MODEL?.trim() || "gemini-embedding-2";
+    this.dimensions = parseInt(process.env.GEMINI_EMBEDDING_DIMENSIONS || "1536", 10);
+    this.available = Boolean(this.apiKey);
+  }
+  isAvailable() {
+    return this.available;
+  }
+  async embed(text) {
+    if (!this.available) throw new Error("Gemini API key not configured");
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.modelName}:embedContent?key=${this.apiKey}`;
+    const truncatedText = text.slice(0, 8e3);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3e4);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: `models/${this.modelName}`,
+          content: { parts: [{ text: truncatedText }] },
+          taskType: "RETRIEVAL_DOCUMENT",
+          outputDimensionality: this.dimensions
+        }),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`Gemini embedding failed: HTTP ${response.status} ${detail}`);
+      }
+      const data = await response.json();
+      const values = data?.embedding?.values;
+      if (!Array.isArray(values) || values.length === 0) {
+        throw new Error("Gemini embedding returned empty vector");
+      }
+      if (values.length !== this.dimensions) {
+        throw new Error(`Gemini embedding dimension mismatch: expected ${this.dimensions}, got ${values.length}`);
+      }
+      return values;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+};
+var provider = null;
+function getEmbeddingProvider() {
+  if (!provider) {
+    provider = new GeminiEmbeddingProvider();
+  }
+  return provider;
+}
+function isEmbeddingAvailable() {
+  return getEmbeddingProvider().isAvailable();
+}
+function getEmbeddingDimensions() {
+  return getEmbeddingProvider().dimensions;
+}
+async function generateEmbedding(text) {
+  const p = getEmbeddingProvider();
+  if (!p.isAvailable()) return null;
+  try {
+    return await p.embed(text);
+  } catch (err) {
+    console.warn("Embedding generation failed:", err.message);
+    return null;
+  }
+}
+
+// server/lib/contentHash.ts
+var import_crypto = require("crypto");
+function contentHash(text) {
+  return (0, import_crypto.createHash)("sha256").update(text.toLowerCase().trim()).digest("hex");
+}
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    u.searchParams.delete("utm_source");
+    u.searchParams.delete("utm_medium");
+    u.searchParams.delete("utm_campaign");
+    u.searchParams.delete("utm_content");
+    u.searchParams.delete("utm_term");
+    u.hash = "";
+    return u.toString().replace(/\/+$/, "");
+  } catch {
+    return url.trim().toLowerCase();
+  }
+}
+function titleSimilarity(a, b) {
+  const wordsA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
+  const wordsB = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of wordsA) {
+    if (wordsB.has(w)) intersection++;
+  }
+  return intersection / Math.max(wordsA.size, wordsB.size);
+}
+
+// server/lib/searchRetrieval.ts
+async function lexicalSearch(query, matchCount = 20) {
+  try {
+    return await supabaseRest("rpc/search_documents_lexical", {
+      method: "POST",
+      body: JSON.stringify({ p_query: query, p_match_count: matchCount })
+    });
+  } catch (error) {
+    console.warn("Lexical search RPC failed:", error.message);
+    return [];
+  }
+}
+async function vectorDocumentSearch(query, matchCount = 10, threshold = 0.3) {
+  if (!isEmbeddingAvailable()) return [];
+  const embedding = await generateEmbedding(query);
+  if (!embedding) return [];
+  try {
+    return await supabaseRest("rpc/match_documents", {
+      method: "POST",
+      body: JSON.stringify({
+        query_embedding: embedding,
+        match_count: matchCount,
+        match_threshold: threshold
+      })
+    });
+  } catch (error) {
+    console.warn("Vector document search RPC failed:", error.message);
+    return [];
+  }
+}
+async function vectorEventSearch(query, matchCount = 10, threshold = 0.35) {
+  if (!isEmbeddingAvailable()) return [];
+  const embedding = await generateEmbedding(query);
+  if (!embedding) return [];
+  try {
+    return await supabaseRest("rpc/match_events", {
+      method: "POST",
+      body: JSON.stringify({
+        query_embedding: embedding,
+        match_count: matchCount,
+        match_threshold: threshold
+      })
+    });
+  } catch (error) {
+    console.warn("Vector event search RPC failed:", error.message);
+    return [];
+  }
+}
+async function nearbyEvents(lat, lng, radiusKm = 50) {
+  const bounded = Math.max(1, Math.min(radiusKm, 500));
+  try {
+    return await supabaseRest("rpc/events_nearby", {
+      method: "POST",
+      body: JSON.stringify({
+        center: `SRID=4326;POINT(${lng} ${lat})`,
+        radius_meters: bounded * 1e3
+      })
+    });
+  } catch (error) {
+    console.warn("Nearby events RPC failed:", error.message);
+    return [];
+  }
+}
+async function upsertSearchDocument(input) {
+  const documentHash = contentHash(`${input.title}|${input.content}`);
+  try {
+    const rows = await supabaseRest(
+      "search_documents?on_conflict=document_hash",
+      {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          document_type: input.documentType,
+          event_id: input.eventId || null,
+          observation_id: input.observationId || null,
+          title: input.title.slice(0, 500),
+          content: input.content.slice(0, 8e3),
+          source_url: input.sourceUrl || null,
+          document_hash: documentHash
+        })
+      }
+    );
+    if (rows?.[0]?.id) return rows[0].id;
+    const existing = await supabaseRest(
+      `search_documents?document_hash=eq.${documentHash}&select=id&limit=1`,
+      { method: "GET" }
+    );
+    return existing[0]?.id || null;
+  } catch (error) {
+    console.warn("Search document persistence failed:", error.message);
+    return null;
+  }
+}
+function currentEmbeddingMetadata(previousVersion) {
+  const provider2 = getEmbeddingProvider();
+  return {
+    embedding_provider: provider2.providerName,
+    embedding_model: provider2.modelName,
+    embedding_dimensions: provider2.dimensions,
+    embedding_version: (previousVersion ?? 0) + 1
+  };
+}
+async function embedAndStoreEvent(eventId, text) {
+  const embedding = await generateEmbedding(text.slice(0, 8e3));
+  if (!embedding) return false;
+  const metadata = currentEmbeddingMetadata();
+  try {
+    await supabaseRest("event_embeddings?on_conflict=event_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify({
+        event_id: eventId,
+        embedding: JSON.stringify(embedding),
+        content_text: text.slice(0, 5e3),
+        ...metadata
+      })
+    });
+    return true;
+  } catch (error) {
+    console.warn("Event embedding persistence failed:", error.message);
+    return false;
+  }
+}
+async function embedAndStoreSearchDocument(docId, text) {
+  const embedding = await generateEmbedding(text.slice(0, 8e3));
+  if (!embedding) return false;
+  const metadata = currentEmbeddingMetadata();
+  try {
+    await supabaseRest(`search_documents?id=eq.${docId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ embedding: JSON.stringify(embedding), ...metadata })
+    });
+    return true;
+  } catch (error) {
+    console.warn("Search document embedding persistence failed:", error.message);
+    return false;
+  }
+}
+async function embedAndStoreSourceObservation(observationId, text) {
+  const embedding = await generateEmbedding(text.slice(0, 8e3));
+  if (!embedding) return false;
+  const metadata = currentEmbeddingMetadata();
+  try {
+    await supabaseRest("source_embeddings?on_conflict=observation_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify({
+        observation_id: observationId,
+        embedding: JSON.stringify(embedding),
+        content_text: text.slice(0, 5e3),
+        ...metadata
+      })
+    });
+    return true;
+  } catch (error) {
+    console.warn("Source embedding persistence failed:", error.message);
+    return false;
+  }
+}
+
+// server/lib/rateLimit.ts
+var buckets = /* @__PURE__ */ new Map();
+var sweeper = setInterval(() => {
+  const now2 = Date.now();
+  for (const [key, bucket] of buckets) {
+    if (bucket.resetAt <= now2) buckets.delete(key);
+  }
+}, 6e4);
+sweeper.unref?.();
+function rateLimit(req, scope, limit, windowMs) {
+  const identity = req.user?.id || req.ip || "anonymous";
+  const key = `${scope}:${identity}`;
+  const now2 = Date.now();
+  let bucket = buckets.get(key);
+  if (!bucket || bucket.resetAt <= now2) {
+    bucket = { count: 0, resetAt: now2 + windowMs };
+    buckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > limit) {
+    throw tooMany(`Rate limit exceeded for ${scope}. Try again shortly.`);
+  }
+}
+
+// server/lib/sourceRegistry.ts
+var registryCache = /* @__PURE__ */ new Map();
+var CACHE_TTL_MS = 10 * 60 * 1e3;
+var SOURCE_KEY_TO_TYPE = {
+  "sachet-cap": "OFFICIAL",
+  imd: "OFFICIAL",
+  cwc: "OFFICIAL",
+  incois: "OFFICIAL",
+  fsi: "OFFICIAL",
+  dgre: "OFFICIAL",
+  "state-disaster-authorities": "OFFICIAL",
+  "google-news-rss": "NEWS",
+  "national-news": "NEWS",
+  "regional-news": "NEWS",
+  "citizen": "CITIZEN",
+  "reddit": "SOCIAL",
+  "youtube": "SOCIAL",
+  x: "SOCIAL",
+  "data-gov": "DATASET",
+  "historical-catalog": "SEED"
+};
+var SOURCE_KEY_NAMES = {
+  "sachet-cap": "SACHET / NDMA CAP Alerts",
+  imd: "India Meteorological Department",
+  cwc: "Central Water Commission",
+  incois: "INCOIS Ocean Alerts",
+  fsi: "Forest Survey of India",
+  dgre: "DGRE Snow and Avalanche Warnings",
+  "state-disaster-authorities": "State Disaster Management Authorities",
+  "google-news-rss": "Google News (India disaster coverage)",
+  "national-news": "Major Indian National News",
+  "regional-news": "Major Indian Regional News",
+  "citizen": "Citizen Reports",
+  "reddit": "Reddit (r/India disaster threads)",
+  "youtube": "YouTube News Channels",
+  x: "X / Public Social Signals",
+  "data-gov": "data.gov.in Open Datasets",
+  "historical-catalog": "Curated Historical Disaster Catalog"
+};
+var SOURCE_KEY_BASE_URLS = {
+  "sachet-cap": "https://sachet.ndma.gov.in",
+  imd: "https://mausam.imd.gov.in",
+  cwc: "https://cwc.gov.in",
+  incois: "https://incois.gov.in",
+  fsi: "https://fsi.nic.in",
+  dgre: "https://www.drdo.gov.in/labs-and-establishments/defence-geoinformatics-research-establishment-dgre",
+  "google-news-rss": "https://news.google.com",
+  "national-news": "https://news.google.com",
+  "regional-news": "https://news.google.com",
+  reddit: "https://www.reddit.com",
+  youtube: "https://www.googleapis.com/youtube/v3",
+  x: "https://developer.x.com",
+  "data-gov": "https://api.data.gov.in"
+};
+function defaultTrustWeight(key) {
+  if (SOURCE_KEY_TO_TYPE[key] === "OFFICIAL") return 0.95;
+  if (key === "historical-catalog") return 0.8;
+  if (key === "data-gov") return 0.75;
+  if (key === "google-news-rss" || key === "national-news" || key === "regional-news") return 0.55;
+  if (key === "citizen") return 0.35;
+  return 0.3;
+}
+function defaultPriority(key) {
+  if (SOURCE_KEY_TO_TYPE[key] === "OFFICIAL") return 10;
+  if (key === "data-gov") return 35;
+  if (SOURCE_KEY_TO_TYPE[key] === "NEWS") return 50;
+  return 70;
+}
+async function resolveSource(key) {
+  const cached = registryCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.row;
+  const existing = await supabaseRest(
+    `source_definitions?source_key=eq.${encodeURIComponent(key)}&select=id,source_key,name,source_type,trust_weight,enabled&limit=1`,
+    { method: "GET" }
+  );
+  let row = existing[0];
+  if (!row) {
+    const inserted = await supabaseRest(
+      "source_definitions?on_conflict=source_key",
+      {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          source_key: key,
+          name: SOURCE_KEY_NAMES[key],
+          source_type: SOURCE_KEY_TO_TYPE[key],
+          base_url: SOURCE_KEY_BASE_URLS[key] || null,
+          enabled: true,
+          trust_weight: defaultTrustWeight(key),
+          priority: defaultPriority(key)
+        })
+      }
+    );
+    row = inserted[0];
+  }
+  if (!row) {
+    throw new Error(`Failed to resolve source definition for key: ${key}`);
+  }
+  registryCache.set(key, { row, expiresAt: Date.now() + CACHE_TTL_MS });
+  return row;
+}
+
+// server/adapters/youtube.ts
+var YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3/search";
+async function searchYouTube(query, options = {}) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) return [];
+  const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 25);
+  const url = new URL(YOUTUBE_API_BASE);
+  url.searchParams.set("part", "snippet");
+  url.searchParams.set("q", query);
+  url.searchParams.set("type", "video");
+  url.searchParams.set("maxResults", String(maxResults));
+  url.searchParams.set("regionCode", options.regionCode || "IN");
+  url.searchParams.set("relevanceLanguage", "en");
+  url.searchParams.set("key", apiKey);
+  const response = await fetch(url.toString(), { signal: AbortSignal.timeout(8e3) });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`YouTube API ${response.status}: ${detail.slice(0, 150)}`);
+  }
+  const payload = await response.json();
+  const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+  return (payload.items || []).filter((item) => item.id?.videoId).map((item) => {
+    const videoId = item.id.videoId;
+    return {
+      sourceKey: "youtube",
+      sourceType: "SOCIAL",
+      externalId: videoId,
+      title: item.snippet?.title || `YouTube video ${videoId}`,
+      content: (item.snippet?.description || "").slice(0, 2e3),
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      publisher: item.snippet?.channelTitle || "YouTube",
+      publishedAt: item.snippet?.publishedAt || null,
+      retrievedAt,
+      locationText: null,
+      disasterType: null,
+      eventDate: item.snippet?.publishedAt || null,
+      state: null,
+      district: null,
+      city: null,
+      metadata: { thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.medium?.url || null },
+      confidence: 0.3
+    };
+  });
+}
+
+// server/adapters/reddit.ts
+async function getAccessToken() {
+  const clientId = process.env.REDDIT_CLIENT_ID;
+  const clientSecret = process.env.REDDIT_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return null;
+  try {
+    const response = await fetch("https://www.reddit.com/api/v1/access_token", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "AapdaDrishti/1.0 (disaster research)"
+      },
+      body: "grant_type=client_credentials",
+      signal: AbortSignal.timeout(8e3)
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    return payload.access_token || null;
+  } catch {
+    return null;
+  }
+}
+async function searchReddit(query, options = {}) {
+  const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 25);
+  const token = await getAccessToken();
+  const headers = {
+    "User-Agent": "AapdaDrishti/1.0 (disaster research)",
+    Accept: "application/json"
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const url = new URL("https://www.reddit.com/search.json");
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", String(maxResults));
+  url.searchParams.set("sort", "relevance");
+  url.searchParams.set("t", "all");
+  const response = await fetch(url.toString(), { headers, signal: AbortSignal.timeout(8e3) });
+  if (!response.ok) {
+    throw new Error(`Reddit search ${response.status}`);
+  }
+  const payload = await response.json();
+  const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+  return (payload.data?.children || []).filter((child) => child.data?.id).map((child) => {
+    const post = child.data;
+    const createdAt = post.created_utc ? new Date(post.created_utc * 1e3).toISOString() : null;
+    return {
+      sourceKey: "reddit",
+      sourceType: "SOCIAL",
+      externalId: post.id,
+      title: post.title || `Reddit post ${post.id}`,
+      content: (post.selftext || "").slice(0, 2e3),
+      url: post.permalink ? `https://www.reddit.com${post.permalink}` : null,
+      publisher: post.subreddit ? `r/${post.subreddit}` : "Reddit",
+      publishedAt: createdAt,
+      retrievedAt,
+      locationText: null,
+      disasterType: null,
+      eventDate: createdAt,
+      state: null,
+      district: null,
+      city: null,
+      metadata: { author: post.author || null, score: post.score ?? null },
+      confidence: 0.25
+    };
+  });
+}
+
+// server/adapters/x.ts
+async function searchX(query, options = {}) {
+  const bearer = process.env.X_BEARER_TOKEN || process.env.TWITTER_BEARER_TOKEN;
+  if (!bearer) return [];
+  const maxResults = Math.min(Math.max(options.maxResults ?? 10, 10), 100);
+  const url = new URL("https://api.twitter.com/2/tweets/search/recent");
+  url.searchParams.set("query", `${query} lang:en -is:retweet`);
+  url.searchParams.set("max_results", String(maxResults));
+  url.searchParams.set("tweet.fields", "created_at,author_id,public_metrics");
+  url.searchParams.set("expansions", "author_id");
+  url.searchParams.set("user.fields", "username,name");
+  const response = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${bearer}` },
+    signal: AbortSignal.timeout(8e3)
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`X API ${response.status}: ${detail.slice(0, 150)}`);
+  }
+  const payload = await response.json();
+  const users = new Map((payload.includes?.users || []).map((user) => [user.id, user]));
+  const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+  return (payload.data || []).map((tweet) => {
+    const user = tweet.author_id ? users.get(tweet.author_id) : void 0;
+    const username = user?.username;
+    return {
+      sourceKey: "x",
+      sourceType: "SOCIAL",
+      externalId: tweet.id,
+      title: `X post ${tweet.id}`,
+      content: (tweet.text || "").slice(0, 2e3),
+      url: username ? `https://x.com/${username}/status/${tweet.id}` : `https://x.com/i/web/status/${tweet.id}`,
+      publisher: username ? `@${username}` : user?.name || "X",
+      publishedAt: tweet.created_at || null,
+      retrievedAt,
+      locationText: null,
+      disasterType: null,
+      eventDate: tweet.created_at || null,
+      state: null,
+      district: null,
+      city: null,
+      metadata: { authorId: tweet.author_id || null, metrics: tweet.public_metrics || {} },
+      confidence: 0.25
+    };
+  });
+}
+
+// server/adapters/dataGov.ts
+async function searchDataGov(query, options = {}) {
+  const apiKey = process.env.DATA_GOV_API_KEY;
+  if (!apiKey) return [];
+  const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 50);
+  const url = new URL("https://api.data.gov.in/catalog");
+  url.searchParams.set("api-key", apiKey);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("filters[search]", query);
+  url.searchParams.set("limit", String(maxResults));
+  const response = await fetch(url.toString(), { signal: AbortSignal.timeout(1e4) });
+  if (!response.ok) {
+    throw new Error(`data.gov.in API ${response.status}`);
+  }
+  const payload = await response.json();
+  const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+  return (payload.records || []).filter((record) => record.title).map((record) => {
+    const resourceUrl = record.external_ws || record.target || null;
+    return {
+      sourceKey: "data-gov",
+      sourceType: "DATASET",
+      externalId: resourceUrl || `datagov:${record.title}`,
+      title: record.title,
+      content: (record.desc || record.field || "").slice(0, 2e3),
+      url: resourceUrl,
+      publisher: record.org || "data.gov.in",
+      publishedAt: record.created || record.updated || null,
+      retrievedAt,
+      locationText: null,
+      disasterType: null,
+      eventDate: record.updated || record.created || null,
+      state: null,
+      district: null,
+      city: null,
+      metadata: { exponent: record.exponent ?? null, visibility: record.vis ?? null },
+      confidence: 0.75
+    };
+  });
+}
+
+// server/lib/citizenEvidence.ts
+async function searchCitizenEvidence(query, options = {}) {
+  if (!isSupabaseConfigured()) return [];
+  const maxResults = Math.min(Math.max(options.maxResults ?? 6, 1), 25);
+  const encoded = encodeURIComponent(`%${query.replace(/[%_]/g, "")}%`);
+  const rows = await supabaseRest(
+    `citizen_reports?select=id,report_text,reported_category,reported_at,status,verification_score,linked_event_id,media_urls&or=(report_text.ilike.${encoded},reported_category.ilike.${encoded})&status=in.(VERIFIED,VERIFYING)&order=reported_at.desc&limit=${maxResults}`,
+    { method: "GET" }
+  ).catch(() => []);
+  const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+  return rows.map((report) => ({
+    sourceKey: "citizen",
+    sourceType: "CITIZEN",
+    externalId: report.id,
+    title: `${report.reported_category || "Citizen report"} \u2014 ${report.reported_at.slice(0, 10)}`,
+    content: report.report_text.slice(0, 2e3),
+    url: null,
+    publisher: "Verified citizen report",
+    publishedAt: report.reported_at,
+    retrievedAt,
+    locationText: null,
+    disasterType: report.reported_category,
+    eventDate: report.reported_at,
+    state: null,
+    district: null,
+    city: null,
+    metadata: {
+      reportStatus: report.status,
+      verificationScore: report.verification_score,
+      linkedEventId: report.linked_event_id,
+      mediaCount: (report.media_urls || []).length
+    },
+    confidence: 0.35
+  }));
+}
+
+// server/lib/verification.ts
+var SEVERITY_ORDER = ["Unknown", "Minor", "Moderate", "Severe", "Extreme"];
+var PUBLIC_VERIFICATION_STATUSES2 = ["OFFICIAL_VERIFIED", "CROSS_SOURCE_VERIFIED", "PROVISIONALLY_VERIFIED"];
+function severityValue(severity) {
+  const index = SEVERITY_ORDER.indexOf(severity || "Unknown");
+  return index < 0 ? 0 : index;
+}
+function verificationFromSignals(signals) {
+  if (signals.length === 0) return { score: 0, status: "PENDING", distinctSources: 0 };
+  const official = signals.some((s) => s.source?.source_type === "OFFICIAL");
+  const distinctTrusts = /* @__PURE__ */ new Set();
+  let trustSum = 0;
+  for (const signal of signals) {
+    const key = signal.source ? `${signal.source.source_type}:${signal.source.trust_weight}` : "unknown";
+    distinctTrusts.add(key);
+    trustSum += signal.source?.trust_weight ?? 0.3;
+  }
+  const distinctSources = distinctTrusts.size;
+  let score = 0.1;
+  if (official) score += 0.4;
+  if (distinctSources >= 2) score += 0.2;
+  if (distinctSources >= 3) score += 0.1;
+  score += 0.2 * Math.min(1, trustSum / Math.max(1, signals.length) / 0.9);
+  const times = signals.map((s) => s.publishedAt ? new Date(s.publishedAt).getTime() : NaN).filter(Number.isFinite);
+  if (times.length >= 2) {
+    const spread = (Math.max(...times) - Math.min(...times)) / 36e5;
+    if (spread <= 48) score += 0.1;
+  }
+  score = Math.min(1, Math.round(score * 100) / 100);
+  let status;
+  if (official && distinctSources >= 2) status = "OFFICIAL_VERIFIED";
+  else if (official) status = "OFFICIAL_VERIFIED";
+  else if (distinctSources >= 2 && score >= 0.5) status = "CROSS_SOURCE_VERIFIED";
+  else if (score >= 0.3) status = "PROVISIONALLY_VERIFIED";
+  else status = "PENDING";
+  return { score, status, distinctSources };
+}
+function citizenReportVerification(input) {
+  const reasons = [];
+  let score = 0.45;
+  const text = input.reportText.trim().toLowerCase();
+  const hasDisasterKeywords = /\b(flood|water|rain|heavy|cyclone|landslide|fire|smoke|wind|storm|cloudburst|earthquake|damage|tree|road|blocked|bridge|power|outage|rescue|trapped|casualt|injur|hospital|help)\b/i.test(text);
+  if (hasDisasterKeywords) {
+    score += 0.15;
+    reasons.push("Contains substantive hazard and impact indicators.");
+  }
+  if (text.length >= 50) {
+    score += 0.1;
+    reasons.push("Detailed on-ground observational description provided.");
+  }
+  if (input.nearbyVerifiedEventCount > 0) {
+    score += Math.min(0.3, 0.2 + 0.05 * (input.nearbyVerifiedEventCount - 1));
+    reasons.push(`Corroborated by ${input.nearbyVerifiedEventCount} verified active canonical event(s).`);
+  }
+  if (input.duplicateReportCount >= 2) {
+    score += 0.15;
+    reasons.push(`${input.duplicateReportCount} cluster citizen reports corroborate this area.`);
+  }
+  score = Math.min(1, Math.round(score * 100) / 100);
+  if (input.duplicateReportCount >= 5 && input.nearbyVerifiedEventCount === 0) {
+    return { score, status: "DUPLICATE", reason: `High-frequency duplicate cluster. ${reasons.join(" ")}` };
+  }
+  if (score >= 0.55) return { score, status: "VERIFIED", reason: reasons.join(" ") };
+  if (score >= 0.35) return { score, status: "VERIFYING", reason: reasons.join(" ") };
+  return { score, status: "PENDING", reason: `Awaiting further corroboration. ${reasons.join(" ")}` };
+}
+
+// server/lib/researchOrchestrator.ts
+var youtubeEnabled = () => Boolean(process.env.YOUTUBE_API_KEY);
+var redditEnabled = () => Boolean(process.env.REDDIT_CLIENT_ID && process.env.REDDIT_CLIENT_SECRET);
+var xEnabled = () => Boolean(process.env.X_BEARER_TOKEN || process.env.TWITTER_BEARER_TOKEN);
+var dataGovEnabled = () => Boolean(process.env.DATA_GOV_API_KEY);
+var PROVIDER_REGISTRY = [
+  {
+    sourceKey: "sachet-cap",
+    sourceType: "OFFICIAL",
+    enabled: () => true,
+    supportsCurrent: true,
+    // SACHET exposes current CAP alerts only; there is no public historical
+    // archive/search endpoint, so historical research never queries it.
+    supportsHistorical: false,
+    supportsSearch: false,
+    trustWeight: 0.95,
+    search: async () => []
+  },
+  {
+    sourceKey: "google-news-rss",
+    sourceType: "NEWS",
+    enabled: () => true,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.55,
+    search: async (query, { historical, maxResults }) => {
+      const articles = await searchGoogleNews(query, {
+        isCurrentNews: !historical,
+        maxResults
+      });
+      return articles.map((article) => ({
+        sourceKey: "google-news-rss",
+        sourceType: "NEWS",
+        externalId: normalizeUrl(article.url) || article.url,
+        title: article.title,
+        content: article.summary,
+        url: article.url,
+        publisher: article.publisher,
+        publishedAt: article.publishedAt || null,
+        retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        locationText: null,
+        disasterType: null,
+        eventDate: article.publishedAt || null,
+        state: null,
+        district: null,
+        city: null,
+        metadata: { queryUsed: query },
+        confidence: 0.55
+      }));
+    }
+  },
+  {
+    sourceKey: "national-news",
+    sourceType: "NEWS",
+    enabled: () => true,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.55,
+    search: async (query, { historical, maxResults }) => {
+      const articles = await searchGoogleNews(`${query} site:thehindu.com OR site:indianexpress.com OR site:hindustantimes.com`, {
+        isCurrentNews: !historical,
+        maxResults
+      });
+      return articles.map((article) => ({
+        sourceKey: "national-news",
+        sourceType: "NEWS",
+        externalId: normalizeUrl(article.url) || article.url,
+        title: article.title,
+        content: article.summary,
+        url: article.url,
+        publisher: article.publisher,
+        publishedAt: article.publishedAt || null,
+        retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        locationText: null,
+        disasterType: null,
+        eventDate: article.publishedAt || null,
+        state: null,
+        district: null,
+        city: null,
+        metadata: { queryUsed: query },
+        confidence: 0.55
+      }));
+    }
+  },
+  {
+    sourceKey: "regional-news",
+    sourceType: "NEWS",
+    enabled: () => true,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.55,
+    search: async (query, { historical, maxResults }) => {
+      const articles = await searchGoogleNews(`${query} Indian regional news`, {
+        isCurrentNews: !historical,
+        maxResults
+      });
+      return articles.map((article) => ({
+        sourceKey: "regional-news",
+        sourceType: "NEWS",
+        externalId: normalizeUrl(article.url) || article.url,
+        title: article.title,
+        content: article.summary,
+        url: article.url,
+        publisher: article.publisher,
+        publishedAt: article.publishedAt || null,
+        retrievedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        locationText: null,
+        disasterType: null,
+        eventDate: article.publishedAt || null,
+        state: null,
+        district: null,
+        city: null,
+        metadata: { queryUsed: query },
+        confidence: 0.55
+      }));
+    }
+  },
+  {
+    sourceKey: "youtube",
+    sourceType: "SOCIAL",
+    enabled: youtubeEnabled,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.3,
+    search: async (query, { maxResults }) => searchYouTube(query, { regionCode: "IN", maxResults })
+  },
+  {
+    sourceKey: "reddit",
+    sourceType: "SOCIAL",
+    enabled: redditEnabled,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.25,
+    search: async (query, { maxResults }) => searchReddit(query, { maxResults })
+  },
+  {
+    sourceKey: "x",
+    sourceType: "SOCIAL",
+    enabled: xEnabled,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.25,
+    search: async (query, { maxResults }) => searchX(query, { maxResults })
+  },
+  {
+    sourceKey: "data-gov",
+    sourceType: "DATASET",
+    enabled: dataGovEnabled,
+    supportsCurrent: false,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.75,
+    search: async (query, { maxResults }) => searchDataGov(query, { maxResults })
+  },
+  {
+    sourceKey: "citizen",
+    sourceType: "CITIZEN",
+    enabled: () => true,
+    supportsCurrent: true,
+    supportsHistorical: true,
+    supportsSearch: true,
+    trustWeight: 0.35,
+    search: async (query, { maxResults }) => searchCitizenEvidence(query, { maxResults })
+  }
+];
+var KNOWN_STATES = [
+  "Andhra Pradesh",
+  "Arunachal Pradesh",
+  "Assam",
+  "Bihar",
+  "Chhattisgarh",
+  "Goa",
+  "Gujarat",
+  "Haryana",
+  "Himachal Pradesh",
+  "Jharkhand",
+  "Karnataka",
+  "Kerala",
+  "Madhya Pradesh",
+  "Maharashtra",
+  "Manipur",
+  "Meghalaya",
+  "Mizoram",
+  "Nagaland",
+  "Odisha",
+  "Punjab",
+  "Rajasthan",
+  "Sikkim",
+  "Tamil Nadu",
+  "Telangana",
+  "Tripura",
+  "Uttar Pradesh",
+  "Uttarakhand",
+  "West Bengal",
+  "Delhi",
+  "Jammu and Kashmir",
+  "Ladakh",
+  "Puducherry",
+  "Chandigarh"
+];
+var DISASTER_TYPES = [
+  "Flood",
+  "Cyclone",
+  "Earthquake",
+  "Landslide",
+  "Heavy Rain",
+  "Heat Wave",
+  "Cold Wave",
+  "Avalanche",
+  "Forest Fire",
+  "Thunderstorm",
+  "Lightning",
+  "Drought"
+];
+function normalizeHistoricalQuery(raw) {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  const yearMatch = lower.match(/\b(19|20)\d{2}\b/);
+  const year = yearMatch ? Number(yearMatch[0]) : null;
+  const disasterType = DISASTER_TYPES.find((type) => lower.includes(type.toLowerCase())) || null;
+  const state = KNOWN_STATES.find((candidate) => lower.includes(candidate.toLowerCase())) || // Common short forms.
+  (lower.includes("odisha") ? "Odisha" : null) || (lower.includes("orissa") ? "Odisha" : null) || (lower.includes("pondicherry") ? "Puducherry" : null);
+  const normalized = trimmed.replace(/\b(what happened|tell me about|information about|details of|history of)\b/gi, "").replace(/\s+/g, " ").trim();
+  return { raw: trimmed, normalized, year, disasterType, state };
+}
+function dedupeEvidence(items) {
+  const byIdentity = /* @__PURE__ */ new Map();
+  for (const item of items) {
+    const identity = `${item.sourceKey}::${item.externalId.toLowerCase()}`;
+    if (!byIdentity.has(identity)) byIdentity.set(identity, item);
+  }
+  const byTitle = /* @__PURE__ */ new Map();
+  const result = [];
+  for (const item of byIdentity.values()) {
+    const titleKey = item.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 120);
+    const existingIdentity = byTitle.get(titleKey);
+    if (existingIdentity) {
+      const existing = byIdentity.get(existingIdentity);
+      if (existing && item.confidence > existing.confidence) {
+        result.splice(result.indexOf(existing), 1, item);
+        byTitle.set(titleKey, identityKey(item));
+      }
+      continue;
+    }
+    byTitle.set(titleKey, identityKey(item));
+    result.push(item);
+  }
+  return result;
+}
+function identityKey(item) {
+  return `${item.sourceKey}::${item.externalId.toLowerCase()}`;
+}
+var TYPE_RANK = {
+  OFFICIAL: 5,
+  DATASET: 4,
+  NEWS: 3,
+  CITIZEN: 2,
+  SOCIAL: 1
+};
+function rankEvidence(items) {
+  return [...items].sort((a, b) => {
+    const typeDiff = TYPE_RANK[b.sourceType] - TYPE_RANK[a.sourceType];
+    if (typeDiff !== 0) return typeDiff;
+    return b.confidence - a.confidence;
+  });
+}
+function decideVerification(evidence) {
+  const distinctSources = new Set(evidence.map((item) => item.sourceKey));
+  const signals = evidence.map((item) => ({
+    source: { source_type: item.sourceType, trust_weight: item.confidence },
+    publishedAt: item.publishedAt
+  }));
+  const scored = verificationFromSignals(signals);
+  const official = evidence.some((item) => item.sourceType === "OFFICIAL");
+  const nonCorroborating = evidence.every(
+    (item) => item.sourceType === "SOCIAL" || item.sourceType === "CITIZEN"
+  );
+  if (nonCorroborating) {
+    return {
+      status: "PENDING",
+      score: Math.min(scored.score, 0.4),
+      method: "EVIDENCE_WEIGHTED",
+      reason: "Only social/citizen evidence available; corroboration from news, dataset, or official sources is required."
+    };
+  }
+  if (official && distinctSources.has("sachet-cap")) {
+    return {
+      status: "OFFICIAL_VERIFIED",
+      score: 1,
+      method: "OFFICIAL_SOURCE",
+      reason: "Authoritative government alert present; technical validation passed."
+    };
+  }
+  const trustedIndependentSources = new Set(
+    evidence.filter((item) => item.sourceType === "NEWS" || item.sourceType === "DATASET" || item.sourceType === "OFFICIAL").map((item) => item.sourceKey)
+  );
+  if (trustedIndependentSources.size >= 2) {
+    const score = Math.max(scored.score, trustedIndependentSources.size >= 3 ? 0.72 : 0.58);
+    return {
+      status: trustedIndependentSources.size >= 3 ? "CROSS_SOURCE_VERIFIED" : "PROVISIONALLY_VERIFIED",
+      score,
+      method: "CROSS_SOURCE_CORROBORATION",
+      reason: `Corroborated by ${trustedIndependentSources.size} independent trusted source providers.`
+    };
+  }
+  return {
+    status: scored.status,
+    score: scored.score,
+    method: "EVIDENCE_WEIGHTED",
+    reason: `Distinct evidence sources: ${scored.distinctSources}.`
+  };
+}
+function deterministicEventKey(nq) {
+  const slug2 = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 60);
+  const parts = [
+    nq.disasterType || "disaster",
+    nq.state || "india",
+    nq.year ? String(nq.year) : "unknown-year",
+    slug2(nq.normalized).slice(0, 40) || "event"
+  ];
+  return parts.join("-");
+}
+function meaningfulTokens(value) {
+  const stop = /* @__PURE__ */ new Set(["what", "happened", "during", "tell", "about", "india", "indian", "the", "and", "with", "for"]);
+  return new Set(
+    value.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length >= 4 && !stop.has(token))
+  );
+}
+function isRelevantDatabaseHit(nq, hit) {
+  const queryTokens = meaningfulTokens(nq.normalized);
+  const hitText = `${hit.title || ""} ${hit.event_type || ""} ${hit.state || ""} ${hit.location_name || ""}`;
+  const hitTokens = meaningfulTokens(hitText);
+  const overlap = [...queryTokens].filter((token) => hitTokens.has(token));
+  const typeOk = !nq.disasterType || (hit.event_type || "").toLowerCase().includes(nq.disasterType.toLowerCase());
+  const stateOk = !nq.state || hitText.toLowerCase().includes(nq.state.toLowerCase());
+  const namedQueryTokens = [...queryTokens].filter((token) => token !== (nq.disasterType || "").toLowerCase());
+  const namedOk = namedQueryTokens.length === 0 || namedQueryTokens.some((token) => hitTokens.has(token));
+  return typeOk && stateOk && namedOk && overlap.length > 0;
+}
+async function persistResearchResult(nq, evidence, verification) {
+  const out = {
+    eventId: null,
+    eventKey: null,
+    verification,
+    observationsPersisted: 0,
+    documentsPersisted: 0,
+    embedded: false,
+    errors: []
+  };
+  if (!isSupabaseConfigured() || evidence.length === 0) {
+    out.errors.push("Persistence skipped: database unavailable or no evidence.");
+    return out;
+  }
+  const eventKey = deterministicEventKey(nq);
+  try {
+    const upserted = await supabaseRest(
+      "canonical_events?on_conflict=event_key",
+      {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          event_key: eventKey,
+          title: nq.normalized,
+          event_type: nq.disasterType || "General Alert",
+          status: "ENDED",
+          severity: "Unknown",
+          description: evidence[0]?.content?.slice(0, 2e3) || null,
+          location_name: nq.state || "India",
+          state: nq.state,
+          started_at: nq.year ? `${nq.year}-01-01T00:00:00Z` : evidence[0]?.eventDate || null,
+          verification_status: verification.status,
+          verification_score: verification.score,
+          verification_method: verification.method,
+          verification_reason: verification.reason
+        })
+      }
+    );
+    let eventId = upserted?.[0]?.id || null;
+    if (!eventId) {
+      const existing = await supabaseRest(
+        `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+        { method: "GET" }
+      );
+      eventId = existing[0]?.id || null;
+    }
+    if (!eventId) throw new Error("Canonical event upsert returned no id");
+    out.eventId = eventId;
+    out.eventKey = eventKey;
+    for (const item of evidence) {
+      try {
+        const source = await resolveSource(item.sourceKey);
+        const hash = contentHash(`${item.title}|${item.content}|${item.url || ""}`);
+        const inserted = await supabaseRest(
+          "source_observations?on_conflict=source_id,content_hash",
+          {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+            body: JSON.stringify({
+              source_id: source.id,
+              external_id: item.externalId,
+              content_hash: hash,
+              title: item.title.slice(0, 500),
+              raw_content: item.content.slice(0, 8e3),
+              raw_payload: item.metadata || {},
+              source_url: item.url,
+              publisher: item.publisher,
+              published_at: item.publishedAt,
+              retrieved_at: item.retrievedAt,
+              location_text: item.locationText,
+              event_category: item.disasterType
+            })
+          }
+        );
+        let observationId = inserted[0]?.id || null;
+        if (!observationId) {
+          const existing = await supabaseRest(
+            `source_observations?and=(source_id.eq.${source.id},content_hash.eq.${hash})&select=id&limit=1`,
+            { method: "GET" }
+          ).catch(() => []);
+          observationId = existing[0]?.id || null;
+        }
+        if (!observationId) {
+          out.errors.push(`Observation upsert returned no id for ${item.sourceKey}`);
+          continue;
+        }
+        out.observationsPersisted += 1;
+        await supabaseRest("event_sources?on_conflict=event_id,source_id,source_observation_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates" },
+          body: JSON.stringify({
+            event_id: eventId,
+            source_id: source.id,
+            source_observation_id: observationId
+          })
+        });
+        await supabaseRest("event_observations?on_conflict=event_id,observation_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates" },
+          body: JSON.stringify({
+            event_id: eventId,
+            observation_id: observationId
+          })
+        }).catch(() => void 0);
+      } catch (error) {
+        out.errors.push(`${item.sourceKey}: ${error.message.slice(0, 200)}`);
+      }
+    }
+    const docId = await upsertSearchDocument({
+      documentType: "canonical_event",
+      eventId,
+      title: nq.normalized,
+      content: evidence.slice(0, 5).map((item) => `${item.title}. ${item.content}`).join(" ").slice(0, 4e3),
+      sourceUrl: evidence.find((item) => item.url)?.url || null
+    });
+    if (docId) {
+      out.documentsPersisted += 1;
+      out.embedded = await embedAndStoreSearchDocument(docId, nq.normalized);
+    }
+  } catch (error) {
+    out.errors.push(error.message.slice(0, 300));
+  }
+  return out;
+}
+async function searchDatabaseFirst(nq) {
+  if (!isSupabaseConfigured()) return null;
+  const lexical = await searchCanonicalEventsLexical(nq.normalized, 5);
+  const best = lexical.find((event) => isRelevantDatabaseHit(nq, {
+    title: event.title,
+    event_type: event.eventType,
+    state: event.state || null,
+    location_name: event.locationName
+  })) || null;
+  if (best) {
+    return {
+      event: {
+        id: best.id,
+        eventKey: best.eventKey,
+        title: best.title,
+        verificationStatus: best.verificationStatus,
+        verificationScore: best.verificationScore
+      },
+      citations: (best.citations || []).map((citation, index) => ({
+        citationId: citation.id || `S${index + 1}`,
+        sourceKey: "google-news-rss",
+        sourceType: citation.sourceType || "NEWS",
+        publisher: citation.publisher || null,
+        title: citation.title,
+        url: citation.url || null,
+        publishedAt: citation.publishedAt || null,
+        retrievedAt: citation.retrievedAt || (/* @__PURE__ */ new Date()).toISOString(),
+        summary: citation.summary || ""
+      }))
+    };
+  }
+  const vectorHits = (await vectorEventSearch(nq.normalized, 5, 0.55)).filter((hit) => isRelevantDatabaseHit(nq, hit));
+  if (vectorHits.length > 0) {
+    const rows = await supabaseRest(
+      `canonical_events?id=in.(${vectorHits.map((hit) => hit.event_id).join(",")})&select=id,event_key,title,verification_status,verification_score&limit=1`,
+      { method: "GET" }
+    ).catch(() => []);
+    const row = rows[0];
+    const statusText = row ? String(row.verification_status) : "";
+    if (row && PUBLIC_VERIFICATION_STATUSES2.includes(statusText)) {
+      return {
+        event: {
+          id: String(row.id),
+          eventKey: String(row.event_key || ""),
+          title: String(row.title),
+          verificationStatus: String(row.verification_status),
+          verificationScore: Number(row.verification_score || 0)
+        },
+        citations: []
+      };
+    }
+  }
+  return null;
+}
+async function researchHistoricalDisaster(query, options = {}) {
+  const { historical = true, forceResearch = false, sources, maxResultsPerSource = 6 } = options;
+  const nq = normalizeHistoricalQuery(query);
+  const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const retrieval = {
+    dbSearched: false,
+    dbMatch: false,
+    sourcesQueried: [],
+    sourcesSucceeded: [],
+    sourcesFailed: [],
+    evidenceCount: 0,
+    retrievedAt
+  };
+  if (!forceResearch) {
+    const dbHit = await searchDatabaseFirst(nq);
+    retrieval.dbSearched = true;
+    if (dbHit) {
+      retrieval.dbMatch = true;
+      return {
+        query,
+        source: "database",
+        event: dbHit.event,
+        citations: dbHit.citations,
+        evidence: [],
+        verification: null,
+        retrieval,
+        persistence: null
+      };
+    }
+  }
+  const providers = PROVIDER_REGISTRY.filter((provider2) => {
+    if (!provider2.enabled() || !provider2.supportsSearch) return false;
+    if (historical && !provider2.supportsHistorical) return false;
+    if (sources && sources.length > 0 && !sources.includes(provider2.sourceKey)) return false;
+    return true;
+  });
+  const settled = await Promise.allSettled(
+    providers.map(async (provider2) => {
+      const items = await provider2.search(nq.normalized, { historical, maxResults: maxResultsPerSource });
+      return { provider: provider2, items };
+    })
+  );
+  const evidence = [];
+  for (let i = 0; i < settled.length; i += 1) {
+    const provider2 = providers[i];
+    retrieval.sourcesQueried.push(provider2.sourceKey);
+    const outcome = settled[i];
+    if (outcome.status === "fulfilled") {
+      evidence.push(...outcome.value.items);
+      retrieval.sourcesSucceeded.push(provider2.sourceKey);
+    } else {
+      retrieval.sourcesFailed.push({
+        source: provider2.sourceKey,
+        error: outcome.reason?.message?.slice(0, 200) || "Unknown provider failure"
+      });
+    }
+  }
+  retrieval.evidenceCount = evidence.length;
+  const deduped = rankEvidence(dedupeEvidence(evidence));
+  const verification = decideVerification(deduped);
+  const citations = deduped.slice(0, 10).map((item, index) => ({
+    citationId: `S${index + 1}`,
+    sourceKey: item.sourceKey,
+    sourceType: item.sourceType,
+    publisher: item.publisher,
+    title: item.title,
+    url: item.url,
+    publishedAt: item.publishedAt,
+    retrievedAt: item.retrievedAt,
+    summary: item.content.slice(0, 300)
+  }));
+  if (deduped.length === 0) {
+    return {
+      query,
+      source: "none",
+      event: null,
+      citations: [],
+      evidence: [],
+      verification: {
+        status: "PENDING",
+        score: 0,
+        method: "NO_EVIDENCE",
+        reason: "No sufficiently reliable external evidence was available."
+      },
+      retrieval,
+      persistence: null
+    };
+  }
+  const persistence = await persistResearchResult(nq, deduped, verification);
+  return {
+    query,
+    source: "multi_source_research",
+    event: persistence.eventId ? {
+      id: persistence.eventId,
+      eventKey: persistence.eventKey,
+      title: nq.normalized,
+      verificationStatus: verification.status,
+      verificationScore: verification.score
+    } : null,
+    citations,
+    evidence: deduped,
+    verification,
+    retrieval,
+    persistence
+  };
+}
+
+// server/lib/reportRisk.ts
+var INDIA_BOUNDS2 = { latMin: 6, latMax: 37.5, lngMin: 67, lngMax: 98.5 };
+var QUARANTINE_THRESHOLD = 0.6;
+function spamPatterns(text) {
+  const factors = [];
+  const urlCount = (text.match(/https?:\/\//g) || []).length;
+  if (urlCount >= 2) factors.push("multiple_links");
+  if (/(.)\1{9,}/.test(text)) factors.push("repeated_characters");
+  const letters = text.replace(/[^A-Za-z]/g, "");
+  if (letters.length > 30 && letters === letters.toUpperCase()) factors.push("all_caps_flood");
+  if (/(.)\b\1\b(.)?\b\1\b/i.test(text) && text.split(/\s+/).length > 4 && new Set(text.toLowerCase().split(/\s+/)).size < 4) {
+    factors.push("word_flood");
+  }
+  return factors;
+}
+function scoreReportRisk(input) {
+  const factors = [];
+  let score = 0;
+  if (input.honeypot && input.honeypot.trim().length > 0) {
+    factors.push("honeypot_filled");
+    score += 0.6;
+  }
+  if (typeof input.elapsedMs === "number" && input.elapsedMs >= 0 && input.elapsedMs < 2e3) {
+    factors.push("implausible_timing");
+    score += 0.25;
+  }
+  const recent = input.userRecentReports || [];
+  const windowStart = Date.now() - 10 * 6e4;
+  const burst = recent.filter((r) => new Date(r.reportedAt).getTime() >= windowStart).length;
+  if (burst >= 5) {
+    factors.push("burst_submission");
+    score += 0.3;
+  }
+  const normalize = (t) => t.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+  const currentText = normalize(input.reportText);
+  if (currentText.length > 10 && recent.some((r) => normalize(r.reportText) === currentText)) {
+    factors.push("repeated_text");
+    score += 0.3;
+  }
+  if (input.latitude != null && input.longitude != null) {
+    const { latitude: lat, longitude: lng } = input;
+    const exactZero = lat === 0 && lng === 0;
+    const outsideIndia = lat < INDIA_BOUNDS2.latMin || lat > INDIA_BOUNDS2.latMax || lng < INDIA_BOUNDS2.lngMin || lng > INDIA_BOUNDS2.lngMax;
+    if (exactZero) {
+      factors.push("null_island_coordinates");
+      score += 0.75;
+    } else if (outsideIndia) {
+      factors.push("outside_india_bounds");
+      score += 0.75;
+    }
+  }
+  if (typeof input.accuracyMeters === "number" && input.accuracyMeters > 0 && input.accuracyMeters < 1) {
+    factors.push("impossible_accuracy");
+    score += 0.2;
+  }
+  factors.push(...spamPatterns(input.reportText));
+  score += factors.filter((f) => ["multiple_links", "repeated_characters", "all_caps_flood", "word_flood"].includes(f)).length * 0.15;
+  const riskScore = Math.min(1, Math.round(score * 100) / 100);
+  return { riskScore, riskFactors: factors, quarantine: riskScore >= QUARANTINE_THRESHOLD };
+}
+
+// server/lib/insights.ts
+var EMPTY = {
+  overview: {
+    totalEvents: 0,
+    activeEvents: 0,
+    severeOrExtreme: 0,
+    officialVerified: 0,
+    crossSourceVerified: 0,
+    provisional: 0,
+    avgSourcesPerEvent: 0,
+    last30dCount: 0,
+    prior30dCount: 0,
+    monthOverMonthPct: null
+  },
+  trend30d: [],
+  byType: [],
+  byState: [],
+  seasonal: [],
+  riskHotspots: [],
+  generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+  cacheStatus: "UNAVAILABLE"
+};
+var PUBLIC_STATUSES = "OFFICIAL_VERIFIED,CROSS_SOURCE_VERIFIED,PROVISIONALLY_VERIFIED";
+function dayBucket(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+}
+function monthOf(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? null : date.getUTCMonth() + 1;
+}
+async function computeInsights() {
+  if (!isSupabaseConfigured()) return { ...EMPTY };
+  try {
+    const select = "id,event_type,status,severity,state,started_at,verification_status,source_count";
+    const [activeRows, pastRows] = await Promise.all([
+      supabaseRest(
+        `active_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=1000`,
+        { method: "GET" }
+      ),
+      supabaseRest(
+        `past_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=1000`,
+        { method: "GET" }
+      )
+    ]);
+    const rows = [...activeRows, ...pastRows].filter(
+      (row, index, all) => all.findIndex((candidate) => candidate.id === row.id) === index
+    );
+    if (rows.length === 0) return { ...EMPTY, cacheStatus: "MISS" };
+    const now2 = Date.now();
+    const day30 = now2 - 30 * 864e5;
+    const day60 = now2 - 60 * 864e5;
+    const overview = {
+      totalEvents: rows.length,
+      activeEvents: rows.filter((r) => ["DEVELOPING", "ACTIVE", "UPDATING", "ENDING"].includes(r.status)).length,
+      severeOrExtreme: rows.filter((r) => r.severity === "Severe" || r.severity === "Extreme").length,
+      officialVerified: rows.filter((r) => r.verification_status === "OFFICIAL_VERIFIED").length,
+      crossSourceVerified: rows.filter((r) => r.verification_status === "CROSS_SOURCE_VERIFIED").length,
+      provisional: rows.filter((r) => r.verification_status === "PROVISIONALLY_VERIFIED").length,
+      avgSourcesPerEvent: Math.round(rows.reduce((sum, r) => sum + Number(r.source_count || 0), 0) / rows.length * 10) / 10,
+      last30dCount: 0,
+      prior30dCount: 0,
+      monthOverMonthPct: null
+    };
+    const trendMap = /* @__PURE__ */ new Map();
+    for (let i = 29; i >= 0; i -= 1) {
+      trendMap.set(new Date(now2 - i * 864e5).toISOString().slice(0, 10), 0);
+    }
+    const seasonalCounts = /* @__PURE__ */ new Map();
+    for (const row of rows) {
+      const started = row.started_at ? new Date(row.started_at).getTime() : null;
+      if (started != null && Number.isFinite(started)) {
+        if (started >= day30) {
+          overview.last30dCount += 1;
+          const bucket = dayBucket(row.started_at);
+          if (bucket && trendMap.has(bucket)) trendMap.set(bucket, (trendMap.get(bucket) || 0) + 1);
+        } else if (started >= day60) {
+          overview.prior30dCount += 1;
+        }
+        const month = monthOf(row.started_at);
+        if (month) seasonalCounts.set(month, (seasonalCounts.get(month) || 0) + 1);
+      }
+    }
+    if (overview.prior30dCount > 0) {
+      overview.monthOverMonthPct = Math.round((overview.last30dCount - overview.prior30dCount) / overview.prior30dCount * 100);
+    }
+    const byTypeMap = /* @__PURE__ */ new Map();
+    const byStateMap = /* @__PURE__ */ new Map();
+    for (const row of rows) {
+      const type = byTypeMap.get(row.event_type) || { eventType: row.event_type, count: 0, severeCount: 0 };
+      type.count += 1;
+      if (row.severity === "Severe" || row.severity === "Extreme") type.severeCount += 1;
+      byTypeMap.set(row.event_type, type);
+      if (row.state) {
+        const state = byStateMap.get(row.state) || { state: row.state, count: 0, severeCount: 0 };
+        state.count += 1;
+        if (row.severity === "Severe" || row.severity === "Extreme") state.severeCount += 1;
+        byStateMap.set(row.state, state);
+      }
+    }
+    const riskHotspots = [...byStateMap.values()].map((state) => {
+      const activeRows2 = rows.filter((r) => r.state === state.state && ["DEVELOPING", "ACTIVE", "UPDATING", "ENDING"].includes(r.status));
+      const activeSevere = activeRows2.filter((r) => r.severity === "Severe" || r.severity === "Extreme").length;
+      const riskScore = Math.min(100, Math.round(activeSevere * 40 + activeRows2.length * 15));
+      return { state: state.state, activeSevere, activeTotal: activeRows2.length, riskScore };
+    }).filter((h) => h.activeTotal > 0).sort((a, b) => b.riskScore - a.riskScore).slice(0, 8);
+    return {
+      overview,
+      trend30d: [...trendMap.entries()].map(([bucket, count]) => ({ bucket, count })),
+      byType: [...byTypeMap.values()].sort((a, b) => b.count - a.count),
+      byState: [...byStateMap.values()].sort((a, b) => b.count - a.count).slice(0, 12),
+      seasonal: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((month) => ({ month, count: seasonalCounts.get(month) || 0 })),
+      riskHotspots,
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      cacheStatus: "MISS"
+    };
+  } catch (error) {
+    console.warn("[insights] computation failed (fail-soft):", error.message);
+    return { ...EMPTY };
+  }
+}
+
+// server/ingestion/sourceAdapters.ts
+function isMostlyEnglishText(text) {
+  const letters = [...text].filter((char) => /\p{L}/u.test(char));
+  if (letters.length < 12) return true;
+  const latinLetters = letters.filter((char) => /\p{Script=Latin}/u.test(char));
+  return latinLetters.length / letters.length >= 0.85;
+}
+var SachetCapAdapter = class {
+  constructor() {
+    this.sourceKey = "sachet-cap";
+    this.type = "OFFICIAL";
+  }
+  async fetchRecent() {
+    if (process.env.SOURCE_SACHET_ENABLED === "false") return [];
+    const result = await getSachetAlerts();
+    return result.alerts.filter((alert) => isMostlyEnglishText([
+      alert.headline,
+      alert.event,
+      alert.description,
+      alert.instruction,
+      alert.areaDesc
+    ].filter(Boolean).join(" "))).map((alert) => ({
+      sourceKey: this.sourceKey,
+      sourceType: this.type,
+      externalId: alert.identifier,
+      title: alert.headline || alert.event,
+      rawContent: [alert.description, alert.instruction, alert.areaDesc].filter(Boolean).join("\n\n"),
+      rawPayload: alert,
+      sourceUrl: alert.webUrl || alert.officialPortalUrl,
+      publisher: alert.sourceAgency || alert.sender || "SACHET/CAP",
+      publishedAt: alert.sent || alert.effective,
+      retrievedAt: result.lastUpdated,
+      locationText: alert.areaDesc,
+      eventCategory: alert.category,
+      instruction: alert.instruction,
+      metadata: { etag: result.etag, cacheStatus: result.cacheStatus }
+    }));
+  }
+  async healthCheck() {
+    if (process.env.SOURCE_SACHET_ENABLED === "false") {
+      return { sourceKey: this.sourceKey, status: "DISABLED", checkedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    }
+    return { sourceKey: this.sourceKey, status: "OK", checkedAt: (/* @__PURE__ */ new Date()).toISOString() };
+  }
+};
+var GoogleNewsAdapter = class {
+  constructor(sourceKey = "google-news-rss", query = "India disaster weather alert") {
+    this.query = query;
+    this.type = "NEWS";
+    this.sourceKey = sourceKey;
+  }
+  async fetchRecent() {
+    if (process.env.SOURCE_GOOGLE_NEWS_ENABLED === "false") return [];
+    const articles = await searchGoogleNews(this.query, { isCurrentNews: true, windowHours: 72, maxResults: 20 });
+    const retrievedAt = (/* @__PURE__ */ new Date()).toISOString();
+    return articles.map((article) => ({
+      sourceKey: this.sourceKey,
+      sourceType: this.type,
+      externalId: article.id,
+      title: article.title,
+      rawContent: article.summary,
+      rawPayload: article,
+      sourceUrl: article.url,
+      publisher: article.publisher,
+      publishedAt: article.publishedAt,
+      retrievedAt,
+      eventCategory: void 0,
+      metadata: { query: article.query || this.query, recencyVerified: article.recencyVerified }
+    }));
+  }
+  async healthCheck() {
+    if (process.env.SOURCE_GOOGLE_NEWS_ENABLED === "false") {
+      return { sourceKey: this.sourceKey, status: "DISABLED", checkedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    }
+    return { sourceKey: this.sourceKey, status: "OK", checkedAt: (/* @__PURE__ */ new Date()).toISOString() };
+  }
+};
+function getConfiguredSourceAdapters() {
+  return [
+    new SachetCapAdapter(),
+    new GoogleNewsAdapter("google-news-rss", "India disaster weather alert"),
+    new GoogleNewsAdapter("national-news", "site:thehindu.com OR site:indianexpress.com OR site:hindustantimes.com India flood cyclone earthquake landslide weather alert"),
+    new GoogleNewsAdapter("regional-news", "India state regional news flood cyclone heavy rain landslide alert")
+  ];
+}
+
+// server/lib/geocoding.ts
+var GEOCODE_CACHE_TTL = 86400;
+var INDIAN_STATE_CENTROIDS = {
+  "andhra pradesh": { lat: 15.9129, lng: 79.74 },
+  "arunachal pradesh": { lat: 28.218, lng: 97.133 },
+  "assam": { lat: 26.2006, lng: 92.9376 },
+  "bihar": { lat: 25.0961, lng: 85.3131 },
+  "chhattisgarh": { lat: 21.2787, lng: 81.8661 },
+  "goa": { lat: 15.2993, lng: 74.124 },
+  "gujarat": { lat: 22.2587, lng: 71.1924 },
+  "haryana": { lat: 29.0588, lng: 76.0856 },
+  "himachal pradesh": { lat: 31.1048, lng: 77.1734 },
+  "jharkhand": { lat: 23.6102, lng: 85.2799 },
+  "karnataka": { lat: 15.3173, lng: 75.7139 },
+  "kerala": { lat: 10.8505, lng: 76.2711 },
+  "madhya pradesh": { lat: 22.9734, lng: 78.6569 },
+  "maharashtra": { lat: 19.7515, lng: 75.7139 },
+  "manipur": { lat: 24.6637, lng: 93.9063 },
+  "meghalaya": { lat: 25.467, lng: 91.3662 },
+  "mizoram": { lat: 23.1643, lng: 92.9376 },
+  "nagaland": { lat: 26.1584, lng: 94.5624 },
+  "odisha": { lat: 20.9517, lng: 85.0985 },
+  "punjab": { lat: 31.1471, lng: 75.3412 },
+  "rajasthan": { lat: 27.0238, lng: 74.2179 },
+  "sikkim": { lat: 27.533, lng: 88.5122 },
+  "tamil nadu": { lat: 11.1271, lng: 78.6569 },
+  "telangana": { lat: 18.1124, lng: 79.0193 },
+  "tripura": { lat: 23.9408, lng: 91.9882 },
+  "uttar pradesh": { lat: 26.8467, lng: 80.9462 },
+  "uttarakhand": { lat: 30.0668, lng: 79.0193 },
+  "west bengal": { lat: 22.9868, lng: 87.855 },
+  "delhi": { lat: 28.7041, lng: 77.1025 },
+  "jammu and kashmir": { lat: 33.7782, lng: 76.5762 },
+  "ladakh": { lat: 34.1526, lng: 77.5771 }
+};
+function extractLocationsFromText(text) {
+  const lower = text.toLowerCase();
+  let state;
+  let city;
+  let district;
+  for (const [stateName] of Object.entries(INDIAN_STATE_CENTROIDS)) {
+    if (lower.includes(stateName)) {
+      state = stateName.replace(/\b\w/g, (c) => c.toUpperCase());
+      break;
+    }
+  }
+  const cityPatterns = [
+    /(?:in|near|from|at|around)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/g,
+    /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:district|city|town|village)/gi
+  ];
+  for (const pattern of cityPatterns) {
+    const matches = text.matchAll(pattern);
+    for (const match of matches) {
+      const candidate = match[1] || match[0];
+      if (candidate.length >= 3 && candidate.length <= 40) {
+        city = candidate.trim();
+        break;
+      }
+    }
+    if (city) break;
+  }
+  const districtMatch = text.match(/(\w+(?:\s+\w+)?)\s+district/i);
+  if (districtMatch) {
+    district = districtMatch[1].trim();
+  }
+  return { city, state, district };
+}
+async function geocodeLocation(locationText) {
+  const cacheKey = `geo:${locationText.toLowerCase().trim()}`;
+  const cached = cache.get("geocode", cacheKey);
+  if (cached) return cached;
+  const { city, state, district } = extractLocationsFromText(locationText);
+  try {
+    const query = encodeURIComponent(locationText);
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${query}`;
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "AapdaDrishti/1.0 (disaster-intelligence)",
+        Accept: "application/json"
+      }
+    });
+    if (response.ok) {
+      const results = await response.json();
+      if (Array.isArray(results) && results.length > 0) {
+        const item = results[0];
+        const lat = parseFloat(item.lat);
+        const lng = parseFloat(item.lon);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+          const result = {
+            lat,
+            lng,
+            confidence: 0.85,
+            resolvedName: item.display_name || locationText,
+            city: city || item.address?.city || item.address?.town || void 0,
+            district: district || item.address?.county || item.address?.district || void 0,
+            state: state || item.address?.state || void 0,
+            country: item.address?.country || "India"
+          };
+          cache.set("geocode", cacheKey, result, GEOCODE_CACHE_TTL);
+          return result;
+        }
+      }
+    }
+  } catch {
+  }
+  if (state) {
+    const stateKey = state.toLowerCase();
+    const centroid = INDIAN_STATE_CENTROIDS[stateKey];
+    if (centroid) {
+      const result = {
+        lat: centroid.lat,
+        lng: centroid.lng,
+        confidence: 0.4,
+        resolvedName: `${state}, India (approximate centroid)`,
+        state,
+        country: "India"
+      };
+      cache.set("geocode", cacheKey, result, GEOCODE_CACHE_TTL);
+      return result;
+    }
+  }
+  return null;
+}
+
+// server/lib/correlation.ts
+var CORRELATION_MATCH_THRESHOLD = 0.62;
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function temporalOverlapDays(candidate, observedAt) {
+  const ref = new Date(observedAt).getTime();
+  const anchor = new Date(candidate.last_observed_at || candidate.started_at || observedAt).getTime();
+  if (!Number.isFinite(ref) || !Number.isFinite(anchor)) return Number.POSITIVE_INFINITY;
+  return Math.abs(ref - anchor) / 864e5;
+}
+function correlationScore(candidate, input) {
+  let score = 0;
+  if (candidate.event_type && input.eventType && candidate.event_type === input.eventType) score += 0.3;
+  if (candidate.state && input.state) {
+    const a = candidate.state.toLowerCase().trim();
+    const b = input.state.toLowerCase().trim();
+    if (a && b && (a === b || a.includes(b) || b.includes(a))) score += 0.2;
+  }
+  if (candidate.district && input.district) {
+    const a = candidate.district.toLowerCase().trim();
+    const b = input.district.toLowerCase().trim();
+    if (a && b && (a === b || a.includes(b) || b.includes(a))) score += 0.1;
+  }
+  if (candidate.latitude != null && candidate.longitude != null && input.lat != null && input.lng != null) {
+    const km = haversineKm(candidate.latitude, candidate.longitude, input.lat, input.lng);
+    const geo = Math.max(0, 1 - km / 300);
+    score += 0.25 * geo;
+  }
+  const days = temporalOverlapDays(candidate, input.observedAt);
+  if (Number.isFinite(days)) {
+    const temporal = Math.max(0, 1 - days / 14);
+    score += 0.1 * temporal;
+  }
+  score += 0.05 * titleSimilarity(candidate.title || "", input.title || "");
+  return Math.min(1, Math.round(score * 1e3) / 1e3);
+}
+function findBestCorrelation(candidates, input) {
+  let best = null;
+  for (const candidate of candidates) {
+    const score = correlationScore(candidate, input);
+    if (score >= CORRELATION_MATCH_THRESHOLD && (!best || score > best.score)) {
+      best = { id: candidate.id, score };
+    }
+  }
+  return best;
+}
+
+// server/jobs/jobRunner.ts
+async function startJobRun(jobType) {
+  try {
+    const rows = await supabaseRest("job_runs", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        job_type: jobType,
+        status: "RUNNING",
+        started_at: (/* @__PURE__ */ new Date()).toISOString()
+      })
+    });
+    return rows[0]?.id || null;
+  } catch (err) {
+    console.warn(`Failed to start job run for ${jobType}:`, err.message);
+    return null;
+  }
+}
+async function finishJobRun(runId, result, metadata) {
+  try {
+    await supabaseRest(`job_runs?id=eq.${runId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: result.status,
+        finished_at: (/* @__PURE__ */ new Date()).toISOString(),
+        records_processed: result.recordsProcessed,
+        records_created: result.recordsCreated,
+        records_updated: result.recordsUpdated,
+        records_rejected: result.recordsRejected,
+        error_message: result.errorMessage || null,
+        ...metadata ? { metadata } : {}
+      })
+    });
+  } catch (err) {
+    console.warn(`Failed to finish job run ${runId}:`, err.message);
+  }
+}
+async function recordSourceHealth(sourceKey, params) {
+  try {
+    const definitions = await supabaseRest(
+      `source_definitions?source_key=eq.${encodeURIComponent(sourceKey)}&select=id&limit=1`,
+      { method: "GET" }
+    );
+    const sourceId = definitions[0]?.id;
+    if (!sourceId) return;
+    const payload = {
+      source_id: sourceId,
+      last_run: (/* @__PURE__ */ new Date()).toISOString(),
+      status: params.status
+    };
+    if (params.lastSuccessAt) payload.last_success = params.lastSuccessAt;
+    if (params.lastFailureAt) payload.last_failure = params.lastFailureAt;
+    if (params.latencyMs !== void 0) payload.latency_ms = Math.round(params.latencyMs);
+    if (params.recordsReceived !== void 0) payload.records_received = params.recordsReceived;
+    if (params.recordsAccepted !== void 0) payload.records_accepted = params.recordsAccepted;
+    if (params.recordsRejected !== void 0) payload.records_rejected = params.recordsRejected;
+    if (params.errorMessage) payload.message = params.errorMessage.slice(0, 1e3);
+    await supabaseRest("source_health?on_conflict=source_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify(payload)
+    });
+    await supabaseRest(`source_definitions?id=eq.${sourceId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        health_status: params.status,
+        ...params.lastSuccessAt ? { last_success_at: params.lastSuccessAt } : {},
+        ...params.lastFailureAt ? { last_failure_at: params.lastFailureAt } : {}
+      })
+    }).catch(() => void 0);
+  } catch (err) {
+    console.warn(`Failed to record source health for ${sourceKey}:`, err.message);
+  }
+}
+
+// server/jobs/ingestionJob.ts
+function inferEventType(text) {
+  const lower = text.toLowerCase();
+  if (lower.includes("cyclon") || lower.includes("typhoon") || lower.includes("depression")) return "Cyclone";
+  if (lower.includes("urban flood") || lower.includes("waterlogging")) return "Urban Flood";
+  if (lower.includes("flood") || lower.includes("inundat")) return "Flood";
+  if (lower.includes("earthquake") || lower.includes("quake") || lower.includes("seismic")) return "Earthquake";
+  if (lower.includes("landslide") || lower.includes("mudslide") || lower.includes("rockfall")) return "Landslide";
+  if (lower.includes("heat wave") || lower.includes("heatwave")) return "Heat Wave";
+  if (lower.includes("cold wave") || lower.includes("coldwave") || lower.includes("frost")) return "Cold Wave";
+  if (lower.includes("thunderstorm") || lower.includes("squall")) return "Thunderstorm";
+  if (lower.includes("lightning") || lower.includes("thunderbolt")) return "Lightning";
+  if (lower.includes("heavy rain") || lower.includes("torrential") || lower.includes("downpour")) return "Heavy Rain";
+  if (lower.includes("forest fire") || lower.includes("wildfire")) return "Forest Fire";
+  if (lower.includes("drought")) return "Drought";
+  if (lower.includes("avalanche")) return "Avalanche";
+  if (lower.includes("tsunami")) return "Tsunami";
+  if (lower.includes("air quality") || lower.includes("pollution") || lower.includes("smog")) return "Air Pollution";
+  if (lower.includes("storm") || lower.includes("gale")) return "Storm";
+  return "General Alert";
+}
+function inferSeverity(text, sourceType) {
+  const lower = text.toLowerCase();
+  if (lower.includes("extreme") || lower.includes("catastrophic") || lower.includes("super cyclone")) return "Extreme";
+  if (lower.includes("severe") || lower.includes("dangerous") || lower.includes("critical") || lower.includes("red alert")) return "Severe";
+  if (lower.includes("moderate") || lower.includes("orange alert") || lower.includes("warning")) return "Moderate";
+  if (lower.includes("minor") || lower.includes("advisory") || lower.includes("yellow alert")) return "Minor";
+  if (sourceType === "OFFICIAL") return "Moderate";
+  return "Unknown";
+}
+function buildEventKey(eventType, location, dateStr, externalId) {
+  const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const locPart = normalize(location || "india");
+  const extPart = externalId ? `-${normalize(externalId).slice(0, 24)}` : "";
+  return `${normalize(eventType)}-${locPart}${extPart}-${dateStr}`.slice(0, 120);
+}
+async function normalizeObservation(raw, source) {
+  const title = raw.title || "Untitled";
+  const description = raw.rawContent || "";
+  const locationText = raw.locationText || description.slice(0, 400);
+  const { city, district, state } = extractLocationsFromText(locationText);
+  const eventType = raw.eventCategory && raw.eventCategory !== "Met" && raw.eventCategory !== "Safety" ? raw.eventCategory : inferEventType(`${title} ${description}`);
+  const severity = inferSeverity(`${title} ${description}`, source.sourceType);
+  const hash = contentHash(`${title}
+${description}`);
+  let lat;
+  let lng;
+  if (raw.metadata && typeof raw.metadata === "object") {
+    const md = raw.metadata;
+    if (typeof md.lat === "number" && typeof md.lng === "number") {
+      lat = md.lat;
+      lng = md.lng;
+    }
+  }
+  if (lat === void 0 || lng === void 0) {
+    const geocoded = await geocodeLocation(locationText);
+    if (geocoded) {
+      lat = geocoded.lat;
+      lng = geocoded.lng;
+    }
+  }
+  return {
+    rawPayloadJson: raw.rawPayload,
+    sourceKey: raw.sourceKey,
+    sourceId: source.id,
+    sourceType: source.sourceType,
+    trustWeight: source.trustWeight,
+    externalId: raw.externalId,
+    title,
+    description,
+    sourceUrl: raw.sourceUrl || "",
+    publisher: raw.publisher || raw.sourceKey,
+    publishedAt: raw.publishedAt || (/* @__PURE__ */ new Date()).toISOString(),
+    retrievedAt: raw.retrievedAt,
+    locationText,
+    eventType,
+    severity,
+    instruction: raw.instruction || null,
+    contentHash: hash,
+    lat,
+    lng,
+    city,
+    district,
+    state
+  };
+}
+async function isDuplicateObservation(obs) {
+  const bySourceHash = await supabaseRest(
+    `source_observations?and=(source_id.eq.${obs.sourceId},content_hash.eq.${obs.contentHash})&select=id&limit=1`,
+    { method: "GET" }
+  ).catch(() => []);
+  if (bySourceHash.length > 0) return true;
+  if (obs.externalId) {
+    const byExternal = await supabaseRest(
+      `source_observations?and=(source_id.eq.${obs.sourceId},external_id.eq.${encodeURIComponent(obs.externalId)})&select=id&limit=1`,
+      { method: "GET" }
+    ).catch(() => []);
+    if (byExternal.length > 0) return true;
+  }
+  return false;
+}
+async function loadCorrelationCandidates() {
+  return supabaseRest(
+    `active_canonical_events?select=id,title,event_type,state,district,latitude,longitude,last_observed_at,started_at&limit=100`,
+    { method: "GET" }
+  ).catch(() => []);
+}
+async function storeObservation(obs) {
+  const geometryWkt = obs.lat !== void 0 && obs.lng !== void 0 ? `SRID=4326;POINT(${obs.lng} ${obs.lat})` : null;
+  try {
+    const rows = await supabaseRest(
+      "source_observations?on_conflict=source_id,content_hash",
+      {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          source_id: obs.sourceId,
+          external_id: obs.externalId || null,
+          title: obs.title.slice(0, 500),
+          raw_content: obs.description.slice(0, 8e3),
+          raw_payload: obs.rawPayloadJson ?? {},
+          source_url: obs.sourceUrl.slice(0, 2e3) || null,
+          publisher: obs.publisher.slice(0, 200),
+          published_at: obs.publishedAt,
+          retrieved_at: obs.retrievedAt,
+          location_text: obs.locationText.slice(0, 500) || null,
+          geometry: geometryWkt,
+          event_category: obs.eventType,
+          content_hash: obs.contentHash
+        })
+      }
+    );
+    if (rows?.[0]?.id) return rows[0].id;
+    const existing = await supabaseRest(
+      `source_observations?and=(source_id.eq.${obs.sourceId},content_hash.eq.${obs.contentHash})&select=id&limit=1`,
+      { method: "GET" }
+    ).catch(() => []);
+    return existing[0]?.id || null;
+  } catch (err) {
+    console.warn("Failed to store observation:", err.message);
+    return null;
+  }
+}
+async function linkEventToObservation(eventId, observationId, sourceId, matchScore, relationship, citationId) {
+  await supabaseRest("event_observations?on_conflict=event_id,observation_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates" },
+    body: JSON.stringify({ event_id: eventId, observation_id: observationId, match_score: matchScore, relationship })
+  }).catch((err) => console.warn("event_observations link failed:", err.message));
+  await supabaseRest("event_sources?on_conflict=event_id,source_id,source_observation_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates" },
+    body: JSON.stringify({ event_id: eventId, source_id: sourceId, source_observation_id: observationId, citation_id: citationId })
+  }).catch((err) => console.warn("event_sources link failed:", err.message));
+}
+async function createCanonicalEvent(obs, observationId) {
+  const now2 = (/* @__PURE__ */ new Date()).toISOString();
+  const dateStr = new Date(obs.publishedAt).toISOString().split("T")[0] || now2.split("T")[0];
+  const eventKey = buildEventKey(obs.eventType, obs.district || obs.state || obs.city || "india", dateStr, obs.externalId);
+  const geometryWkt = obs.lat !== void 0 && obs.lng !== void 0 ? `SRID=4326;POINT(${obs.lng} ${obs.lat})` : null;
+  const verification = verificationFromSignals([
+    { source: { source_type: obs.sourceType, trust_weight: obs.trustWeight }, observationId, publishedAt: obs.publishedAt }
+  ]);
+  try {
+    const rows = await supabaseRest(
+      "canonical_events?on_conflict=event_key",
+      {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          event_key: eventKey,
+          title: obs.title.slice(0, 500),
+          event_type: obs.eventType,
+          status: "DEVELOPING",
+          severity: obs.severity,
+          urgency: obs.sourceType === "OFFICIAL" ? "Immediate" : "Expected",
+          certainty: "Observed",
+          description: obs.description.slice(0, 5e3) || obs.title.slice(0, 500),
+          instruction: obs.instruction,
+          location_name: [obs.city, obs.district, obs.state].filter(Boolean).join(", ").slice(0, 500) || obs.locationText.slice(0, 500) || "India",
+          city: obs.city || null,
+          district: obs.district || null,
+          state: obs.state || null,
+          country: "India",
+          geometry: geometryWkt,
+          centroid: geometryWkt,
+          started_at: obs.publishedAt,
+          last_observed_at: now2,
+          last_verified_at: now2,
+          present_until: new Date(Date.now() + 36 * 3600 * 1e3).toISOString(),
+          verification_status: verification.status,
+          verification_score: verification.score,
+          verification_method: "SOURCE_WEIGHTED",
+          verification_reason: `Initial observation from ${obs.publisher} (${obs.sourceType}).`,
+          location_confidence: obs.lat !== void 0 ? 0.8 : 0.4
+        })
+      }
+    );
+    let eventId = rows?.[0]?.id;
+    if (!eventId) {
+      const existing = await supabaseRest(
+        `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+        { method: "GET" }
+      ).catch(() => []);
+      eventId = existing[0]?.id;
+    }
+    if (!eventId) return null;
+    await linkEventToObservation(eventId, observationId, obs.sourceId, 1, "CREATE_NEW", `S1-${observationId.slice(0, 8)}`);
+    return eventId;
+  } catch (err) {
+    console.warn("Failed to upsert canonical event:", err.message);
+    return null;
+  }
+}
+async function attachToEvent(obs, observationId, eventId, matchScore) {
+  const now2 = (/* @__PURE__ */ new Date()).toISOString();
+  await supabaseRest(`canonical_events?id=eq.${eventId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      last_observed_at: now2,
+      status: "UPDATING"
+    })
+  }).catch(() => void 0);
+  await linkEventToObservation(eventId, observationId, obs.sourceId, matchScore, "CORRELATED_UPDATE", `S-${observationId.slice(0, 8)}`);
+}
+async function runIngestionJob() {
+  const result = {
+    jobType: "ingest",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  if (!isSupabaseConfigured()) {
+    result.status = "FAILED";
+    result.errorMessage = "Supabase is not configured";
+    return result;
+  }
+  const runId = await startJobRun("ingest");
+  const adapters = getConfiguredSourceAdapters();
+  const correlationCandidates = await loadCorrelationCandidates();
+  for (const adapter of adapters) {
+    const startedAt = Date.now();
+    let recordsReceived = 0;
+    let recordsAccepted = 0;
+    let recordsRejected = 0;
+    let errorMessage;
+    try {
+      const sourceDef = await resolveSource(adapter.sourceKey);
+      const rawObservations = await adapter.fetchRaw();
+      recordsReceived = rawObservations.length;
+      for (const raw of rawObservations) {
+        result.recordsProcessed++;
+        const obs = await normalizeObservation(raw, {
+          id: sourceDef.id,
+          sourceType: sourceDef.source_type,
+          trustWeight: sourceDef.trust_weight
+        });
+        if (await isDuplicateObservation(obs)) {
+          recordsRejected++;
+          result.recordsRejected++;
+          continue;
+        }
+        const observationId = await storeObservation(obs);
+        if (!observationId) {
+          recordsRejected++;
+          result.recordsRejected++;
+          continue;
+        }
+        recordsAccepted++;
+        const bestMatch = findBestCorrelation(
+          {
+            title: obs.title,
+            eventType: obs.eventType,
+            state: obs.state,
+            district: obs.district,
+            lat: obs.lat,
+            lng: obs.lng,
+            publishedAt: obs.publishedAt
+          },
+          correlationCandidates
+        );
+        if (bestMatch && bestMatch.score >= 0.7) {
+          await attachToEvent(obs, observationId, bestMatch.candidate.id, bestMatch.score);
+          result.recordsUpdated++;
+        } else {
+          const newEventId = await createCanonicalEvent(obs, observationId);
+          if (newEventId) {
+            result.recordsCreated++;
+            correlationCandidates.push({
+              id: newEventId,
+              title: obs.title,
+              event_type: obs.eventType,
+              state: obs.state,
+              district: obs.district,
+              latitude: obs.lat,
+              longitude: obs.lng,
+              last_observed_at: (/* @__PURE__ */ new Date()).toISOString(),
+              started_at: obs.publishedAt
+            });
+            const docId = await upsertSearchDocument({
+              documentType: "canonical_event",
+              eventId: newEventId,
+              title: obs.title,
+              content: `${obs.title}
+
+${obs.description}`,
+              sourceUrl: obs.sourceUrl || null
+            });
+            if (docId) {
+              await embedAndStoreSearchDocument(docId, `${obs.title} ${obs.description}`);
+            }
+            await embedAndStoreEvent(newEventId, `${obs.title} ${obs.description}`);
+          }
+        }
+        await embedAndStoreSourceObservation(observationId, `${obs.title} ${obs.description}`);
+      }
+      await recordSourceHealth(sourceDef.id, {
+        latencyMs: Date.now() - startedAt,
+        recordsReceived,
+        recordsAccepted,
+        recordsRejected,
+        status: recordsAccepted > 0 || recordsReceived === 0 ? "HEALTHY" : "DEGRADED"
+      });
+    } catch (err) {
+      errorMessage = err.message;
+      try {
+        const sourceDef = await resolveSource(adapter.sourceKey);
+        await recordSourceHealth(sourceDef.id, {
+          latencyMs: Date.now() - startedAt,
+          recordsReceived,
+          recordsAccepted,
+          recordsRejected,
+          status: "UNHEALTHY",
+          message: errorMessage
+        });
+      } catch {
+      }
+    }
+  }
+  if (runId) {
+    await finishJobRun(runId, result);
+  }
+  return result;
+}
+
+// server/jobs/reconciliationJob.ts
+async function runReconciliationJob() {
+  const runId = await startJobRun("reconciliation");
+  const result = {
+    jobType: "reconciliation",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  if (!isSupabaseConfigured()) {
+    result.status = "FAILED";
+    result.errorMessage = "Supabase is not configured";
+    if (runId) await finishJobRun(runId, result);
+    return result;
+  }
+  try {
+    const events = await supabaseRest(
+      "canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING)&select=id,severity,verification_status,verification_score&limit=200",
+      { method: "GET" }
+    );
+    for (const event of events) {
+      result.recordsProcessed++;
+      const links = await supabaseRest(
+        `event_sources?event_id=eq.${event.id}&select=source_id`,
+        { method: "GET" }
+      ).catch(() => []);
+      if (links.length === 0) continue;
+      const definitions = await supabaseRest(
+        `source_definitions?id=in.(${links.map((l) => l.source_id).join(",")})&select=source_type,trust_weight`,
+        { method: "GET" }
+      ).catch(() => []);
+      if (definitions.length === 0) continue;
+      const verification = verificationFromSignals(
+        definitions.map((d) => ({ source: { source_type: d.source_type, trust_weight: Number(d.trust_weight) } }))
+      );
+      const severityClaims = await supabaseRest(
+        `event_observations?event_id=eq.${event.id}&select=observation_id`,
+        { method: "GET" }
+      ).catch(() => []);
+      const observationIds = severityClaims.map((row) => row.observation_id);
+      let resolvedSeverity = null;
+      if (observationIds.length) {
+        const observations = await supabaseRest(
+          `source_observations?id=in.(${observationIds.filter(Boolean).join(",")})&select=event_category,raw_content`,
+          { method: "GET" }
+        ).catch(() => []);
+        const severities = observations.map((o) => /extreme|catastrophic/i.test(o.raw_content || "") ? "Extreme" : /severe|red alert/i.test(o.raw_content || "") ? "Severe" : /moderate|orange alert|warning/i.test(o.raw_content || "") ? "Moderate" : /minor|advisory|yellow/i.test(o.raw_content || "") ? "Minor" : null).filter((s) => typeof s === "string");
+        if (severities.length) {
+          resolvedSeverity = severities.reduce((best, s) => severityValue(s) > severityValue(best) ? s : best, "Unknown");
+        }
+      }
+      const now2 = (/* @__PURE__ */ new Date()).toISOString();
+      const patch = {
+        verification_status: verification.status,
+        verification_score: verification.score,
+        last_verified_at: now2
+      };
+      if (resolvedSeverity && resolvedSeverity !== event.severity) patch.severity = resolvedSeverity;
+      const updated = await supabaseRest(`canonical_events?id=eq.${event.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      }).catch(() => null);
+      if (updated === null) {
+        result.recordsRejected++;
+      } else {
+        result.recordsUpdated++;
+      }
+    }
+  } catch (err) {
+    result.status = "FAILED";
+    result.errorMessage = err.message;
+  }
+  if (runId) await finishJobRun(runId, result);
+  return result;
+}
+
+// server/jobs/lifecycleJob.ts
+var HOUR_MS = 36e5;
+async function persistTransition(eventId, from, to, reason) {
+  await supabaseRest("event_updates", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: eventId,
+      status: to,
+      description: `Lifecycle: ${from} -> ${to}. ${reason}`,
+      observed_at: (/* @__PURE__ */ new Date()).toISOString()
+    })
+  }).catch((err) => console.warn("event_updates persist failed:", err.message));
+}
+async function runLifecycleJob() {
+  const runId = await startJobRun("lifecycle");
+  const result = {
+    jobType: "lifecycle",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  if (!isSupabaseConfigured()) {
+    result.status = "FAILED";
+    result.errorMessage = "Supabase is not configured";
+    if (runId) await finishJobRun(runId, result);
+    return result;
+  }
+  const now2 = Date.now();
+  const nowIso = new Date(now2).toISOString();
+  try {
+    const developing = await supabaseRest(
+      "canonical_events?status=eq.DEVELOPING&select=id,verification_status,last_observed_at&limit=200",
+      { method: "GET" }
+    ).catch(() => []);
+    for (const event of developing) {
+      result.recordsProcessed++;
+      const verified = event.verification_status === "OFFICIAL_VERIFIED" || event.verification_status === "CROSS_SOURCE_VERIFIED";
+      const staleMs = now2 - new Date(event.last_observed_at || nowIso).getTime();
+      if (verified || staleMs > 6 * HOUR_MS) {
+        const updated = await supabaseRest(`canonical_events?id=eq.${event.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "ACTIVE" })
+        }).catch(() => null);
+        if (updated !== null) {
+          result.recordsUpdated++;
+          await persistTransition(event.id, "DEVELOPING", "ACTIVE", verified ? "Verification reached official/cross-source threshold." : "Observation window matured without contradiction.");
+        } else {
+          result.recordsRejected++;
+        }
+      }
+    }
+    const active = await supabaseRest(
+      "canonical_events?status=eq.ACTIVE&select=id,last_observed_at,present_until,verification_status&limit=200",
+      { method: "GET" }
+    ).catch(() => []);
+    for (const event of active) {
+      result.recordsProcessed++;
+      const lastObserved = new Date(event.last_observed_at || 0).getTime();
+      const staleFor = now2 - lastObserved;
+      const pastPresentUntil = event.present_until ? new Date(event.present_until).getTime() < now2 : false;
+      if (staleFor > 48 * HOUR_MS || pastPresentUntil && event.verification_status !== "OFFICIAL_VERIFIED") {
+        const updated = await supabaseRest(`canonical_events?id=eq.${event.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "ENDING" })
+        }).catch(() => null);
+        if (updated !== null) {
+          result.recordsUpdated++;
+          await persistTransition(event.id, "ACTIVE", "ENDING", pastPresentUntil ? "Present window elapsed." : "No fresh observations for 48 hours.");
+        } else {
+          result.recordsRejected++;
+        }
+      }
+    }
+    const ending = await supabaseRest(
+      "canonical_events?status=eq.ENDING&select=id,last_observed_at&limit=200",
+      { method: "GET" }
+    ).catch(() => []);
+    for (const event of ending) {
+      result.recordsProcessed++;
+      const staleFor = now2 - new Date(event.last_observed_at || 0).getTime();
+      if (staleFor > 72 * HOUR_MS) {
+        const updated = await supabaseRest(`canonical_events?id=eq.${event.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "ENDED", ended_at: nowIso })
+        }).catch(() => null);
+        if (updated !== null) {
+          result.recordsUpdated++;
+          await persistTransition(event.id, "ENDING", "ENDED", "No further observations after 72 hours.");
+        } else {
+          result.recordsRejected++;
+        }
+      }
+    }
+    const ended = await supabaseRest(
+      "canonical_events?status=eq.ENDED&select=id,ended_at&limit=100",
+      { method: "GET" }
+    ).catch(() => []);
+    for (const event of ended) {
+      result.recordsProcessed++;
+      const endedAt = new Date(event.ended_at || nowIso).getTime();
+      if (now2 - endedAt > 30 * 24 * HOUR_MS) {
+        const updated = await supabaseRest(`canonical_events?id=eq.${event.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "ARCHIVED", archived_at: nowIso })
+        }).catch(() => null);
+        if (updated !== null) {
+          result.recordsUpdated++;
+          await persistTransition(event.id, "ENDED", "ARCHIVED", "Moved to the historical archive after 30 days.");
+        } else {
+          result.recordsRejected++;
+        }
+      }
+    }
+  } catch (err) {
+    result.status = "FAILED";
+    result.errorMessage = err.message;
+  }
+  if (runId) await finishJobRun(runId, result);
+  return result;
+}
+
+// server/jobs/embeddingJob.ts
+var BATCH_SIZE = 8;
+var MAX_RETRIES = 2;
+function needsEmbedding(row, provider2, model, dimensions) {
+  if (!row) return true;
+  return row.embedding_provider !== provider2 || row.embedding_model !== model || Number(row.embedding_dimensions) !== dimensions;
+}
+async function generateWithRetry(text) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const embedding = await generateEmbedding(text);
+    if (embedding) return embedding;
+    if (attempt < MAX_RETRIES) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+  }
+  return null;
+}
+async function runEmbeddingJob() {
+  const runId = await startJobRun("embedding");
+  const result = {
+    jobType: "embedding",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  if (!isSupabaseConfigured()) {
+    result.status = "FAILED";
+    result.errorMessage = "Supabase is not configured";
+    if (runId) await finishJobRun(runId, result);
+    return result;
+  }
+  if (!isEmbeddingAvailable()) {
+    result.status = "FAILED";
+    result.errorMessage = "GEMINI_API_KEY is not configured; embeddings are unavailable";
+    if (runId) await finishJobRun(runId, result);
+    return result;
+  }
+  const provider2 = getEmbeddingProvider();
+  try {
+    const events = await supabaseRest(
+      "canonical_events?select=id,title,description,event_type,updated_at&order=updated_at.desc&limit=300",
+      { method: "GET" }
+    );
+    const existingEventEmbeddings = await supabaseRest(
+      "event_embeddings?select=event_id,embedding_provider,embedding_model,embedding_dimensions",
+      { method: "GET" }
+    ).catch(() => []);
+    const eventMap = new Map(existingEventEmbeddings.map((row) => [row.event_id, row]));
+    for (let i = 0; i < events.length; i += BATCH_SIZE) {
+      const batch = events.slice(i, i + BATCH_SIZE);
+      for (const event of batch) {
+        result.recordsProcessed++;
+        if (!needsEmbedding(eventMap.get(event.id), provider2.providerName, provider2.modelName, provider2.dimensions)) continue;
+        const text = `${event.title}. ${event.description || ""}. Type: ${event.event_type}`.trim();
+        const embedding = await generateWithRetry(text);
+        if (!embedding) {
+          result.recordsRejected++;
+          continue;
+        }
+        try {
+          await supabaseRest("event_embeddings?on_conflict=event_id", {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+            body: JSON.stringify({
+              event_id: event.id,
+              embedding: JSON.stringify(embedding),
+              content_text: text.slice(0, 5e3),
+              embedding_provider: provider2.providerName,
+              embedding_model: provider2.modelName,
+              embedding_dimensions: provider2.dimensions
+            })
+          });
+          result.recordsCreated++;
+        } catch {
+          result.recordsRejected++;
+        }
+      }
+    }
+    const observations = await supabaseRest(
+      "source_observations?select=id,title,raw_content&order=retrieved_at.desc&limit=300",
+      { method: "GET" }
+    ).catch(() => []);
+    const existingObservationEmbeddings = await supabaseRest(
+      "source_embeddings?select=observation_id,embedding_provider,embedding_model,embedding_dimensions",
+      { method: "GET" }
+    ).catch(() => []);
+    const observationMap = new Map(existingObservationEmbeddings.map((row) => [row.observation_id, row]));
+    for (let i = 0; i < observations.length; i += BATCH_SIZE) {
+      const batch = observations.slice(i, i + BATCH_SIZE);
+      for (const observation of batch) {
+        result.recordsProcessed++;
+        if (!needsEmbedding(observationMap.get(observation.id), provider2.providerName, provider2.modelName, provider2.dimensions)) continue;
+        const text = `${observation.title}. ${observation.raw_content || ""}`.trim();
+        const embedding = await generateWithRetry(text);
+        if (!embedding) {
+          result.recordsRejected++;
+          continue;
+        }
+        try {
+          await supabaseRest("source_embeddings?on_conflict=observation_id", {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+            body: JSON.stringify({
+              observation_id: observation.id,
+              embedding: JSON.stringify(embedding),
+              content_text: text.slice(0, 5e3),
+              embedding_provider: provider2.providerName,
+              embedding_model: provider2.modelName,
+              embedding_dimensions: provider2.dimensions
+            })
+          });
+          result.recordsCreated++;
+        } catch {
+          result.recordsRejected++;
+        }
+      }
+    }
+    const documents = await supabaseRest(
+      "search_documents?select=id,title,content,embedding_provider,embedding_model,embedding_dimensions&order=updated_at.desc&limit=300",
+      { method: "GET" }
+    ).catch(() => []);
+    for (let i = 0; i < documents.length; i += BATCH_SIZE) {
+      const batch = documents.slice(i, i + BATCH_SIZE);
+      for (const doc of batch) {
+        result.recordsProcessed++;
+        if (!needsEmbedding(doc, provider2.providerName, provider2.modelName, provider2.dimensions)) continue;
+        const text = `${doc.title}. ${doc.content}`.trim();
+        const embedding = await generateWithRetry(text);
+        if (!embedding) {
+          result.recordsRejected++;
+          continue;
+        }
+        try {
+          await supabaseRest(`search_documents?id=eq.${doc.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              embedding: JSON.stringify(embedding),
+              embedding_provider: provider2.providerName,
+              embedding_model: provider2.modelName,
+              embedding_dimensions: provider2.dimensions
+            })
+          });
+          result.recordsUpdated++;
+        } catch {
+          result.recordsRejected++;
+        }
+      }
+    }
+    if (result.recordsRejected > 0 && result.recordsCreated + result.recordsUpdated === 0) {
+      result.status = "FAILED";
+      result.errorMessage = "All embedding writes failed";
+    } else if (result.recordsRejected > 0) {
+      result.status = "PARTIAL";
+    }
+  } catch (err) {
+    result.status = "FAILED";
+    result.errorMessage = err.message;
+  }
+  if (runId) await finishJobRun(runId, result);
+  return result;
+}
+
+// server/jobs/citizenVerificationJob.ts
+var REPORT_RADIUS_KM = 25;
+async function runCitizenVerificationJob() {
+  const runId = await startJobRun("citizen_verification");
+  const result = {
+    jobType: "citizen_verification",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  if (!isSupabaseConfigured()) {
+    result.status = "FAILED";
+    result.errorMessage = "Supabase is not configured";
+    if (runId) await finishJobRun(runId, result);
+    return result;
+  }
+  try {
+    const pendingReports = await supabaseRest(
+      "citizen_reports?status=in.(PENDING,VERIFYING)&select=id,user_id,report_text,reported_category,geometry,reported_at,risk_score,risk_factors&order=reported_at.asc&limit=50",
+      { method: "GET" }
+    );
+    for (const report of pendingReports) {
+      result.recordsProcessed++;
+      const riskScore = Number(report.risk_score || 0);
+      if (riskScore >= 0.6) {
+        const factors = report.risk_factors || [];
+        await supabaseRest(`citizen_reports?id=eq.${report.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            status: "REJECTED",
+            verification_score: 0,
+            verification_reason: `Quarantined by anti-abuse pipeline (risk ${riskScore}): ${factors.join(", ") || "heuristics"}`.slice(0, 500)
+          })
+        });
+        result.recordsRejected++;
+        continue;
+      }
+      const coords = report.geometry?.coordinates;
+      const lat = coords ? coords[1] : null;
+      const lng = coords ? coords[0] : null;
+      let nearbyVerifiedCount = 0;
+      let linkedEventId = null;
+      if (lat != null && lng != null) {
+        const nearby = await nearbyEvents(lat, lng, REPORT_RADIUS_KM);
+        nearbyVerifiedCount = nearby.length;
+        if (nearby.length > 0) {
+          const matching = nearby.find(
+            (hit) => report.reported_category && hit.event_type === report.reported_category
+          );
+          linkedEventId = (matching || nearby[0]).event_id;
+        }
+      }
+      let duplicateCount = 0;
+      if (lat != null && lng != null) {
+        const geometryWkt = `SRID=4326;POINT(${lng} ${lat})`;
+        const duplicates = await supabaseRest(
+          `citizen_reports?geometry=eq.${encodeURIComponent(geometryWkt)}&select=id&limit=50`,
+          { method: "GET" }
+        ).catch(() => []);
+        const nearbyReports = await supabaseRest(
+          "citizen_reports?reported_at=gte." + encodeURIComponent(new Date(new Date(report.reported_at).getTime() - 24 * 3600 * 1e3).toISOString()) + "&select=id,geometry&limit=200",
+          { method: "GET" }
+        ).catch(() => []);
+        const seen = new Set(duplicates.map((d) => d.id));
+        for (const other of nearbyReports) {
+          if (other.id === report.id || seen.has(other.id)) continue;
+          const otherCoords = other.geometry?.coordinates;
+          if (!otherCoords) continue;
+          const dLat = (otherCoords[1] - lat) * 111.32;
+          const dLng = (otherCoords[0] - lng) * 111.32 * Math.cos(lat * Math.PI / 180);
+          if (Math.sqrt(dLat * dLat + dLng * dLng) <= 2) {
+            seen.add(other.id);
+            duplicateCount++;
+          }
+        }
+        duplicateCount += duplicates.filter((d) => d.id !== report.id).length;
+      }
+      const decision = citizenReportVerification({
+        reportText: report.report_text,
+        category: report.reported_category,
+        coords: lat != null && lng != null ? [lat, lng] : null,
+        nearbyVerifiedEventCount: nearbyVerifiedCount,
+        duplicateReportCount: duplicateCount
+      });
+      const now2 = (/* @__PURE__ */ new Date()).toISOString();
+      if (decision.status === "VERIFIED" && linkedEventId) {
+        await supabaseRest(`citizen_reports?id=eq.${report.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            status: "VERIFIED",
+            verification_score: decision.score,
+            verification_reason: decision.reason,
+            linked_event_id: linkedEventId,
+            updated_at: now2
+          })
+        }).catch((err) => console.warn("report update failed:", err.message));
+        result.recordsUpdated++;
+        continue;
+      }
+      if (decision.status === "DUPLICATE") {
+        await supabaseRest(`citizen_reports?id=eq.${report.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            status: "DUPLICATE",
+            verification_score: decision.score,
+            verification_reason: decision.reason,
+            linked_event_id: linkedEventId,
+            updated_at: now2
+          })
+        }).catch((err) => console.warn("report update failed:", err.message));
+        result.recordsRejected++;
+        continue;
+      }
+      if (decision.status === "VERIFIED" && !linkedEventId && lat != null && lng != null) {
+        const geometryWkt = `SRID=4326;POINT(${lng} ${lat})`;
+        const eventType = report.reported_category || "General Alert";
+        const dateStr = new Date(report.reported_at).toISOString().split("T")[0];
+        try {
+          const rows = await supabaseRest("canonical_events", {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+            body: JSON.stringify({
+              event_key: `citizen-${eventType.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${dateStr}`,
+              title: `Citizen-reported ${eventType}`,
+              event_type: eventType,
+              status: "DEVELOPING",
+              severity: "Unknown",
+              urgency: "Expected",
+              certainty: "Observed",
+              description: report.report_text.slice(0, 5e3),
+              location_name: "Citizen reported location",
+              country: "India",
+              geometry: geometryWkt,
+              centroid: geometryWkt,
+              started_at: report.reported_at,
+              last_observed_at: now2,
+              last_verified_at: now2,
+              present_until: new Date(Date.now() + 24 * 3600 * 1e3).toISOString(),
+              verification_status: "PENDING",
+              verification_score: decision.score,
+              verification_method: "CITIZEN_REPORT",
+              verification_reason: decision.reason,
+              location_confidence: 0.6
+            })
+          });
+          if (rows[0]?.id) {
+            linkedEventId = rows[0].id;
+            result.recordsCreated++;
+          }
+        } catch (err) {
+          console.warn("citizen canonical event creation failed:", err.message);
+        }
+      }
+      await supabaseRest(`citizen_reports?id=eq.${report.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          status: decision.status,
+          verification_score: decision.score,
+          verification_reason: decision.reason,
+          linked_event_id: linkedEventId,
+          updated_at: now2
+        })
+      }).catch((err) => console.warn("report update failed:", err.message));
+      if (decision.status === "VERIFIED") result.recordsUpdated++;
+      else result.recordsRejected++;
+    }
+  } catch (err) {
+    result.status = "FAILED";
+    result.errorMessage = err.message;
+  }
+  if (runId) await finishJobRun(runId, result);
+  return result;
+}
+
+// server/providers/notifications.ts
+var ResendEmailProvider = class {
+  constructor(apiKey, from) {
+    this.apiKey = apiKey;
+    this.from = from;
+  }
+  async send(params) {
+    try {
+      const response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          from: this.from,
+          to: params.to,
+          subject: params.subject,
+          html: params.html
+        })
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        return { success: false, error: `Resend HTTP ${response.status}: ${text.slice(0, 300)}` };
+      }
+      const data = await response.json();
+      return { success: true, messageId: data.id };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+};
+var TwilioSmsProvider = class {
+  constructor(accountSid, authToken, fromNumber) {
+    this.accountSid = accountSid;
+    this.authToken = authToken;
+    this.fromNumber = fromNumber;
+  }
+  async send(params) {
+    try {
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${this.accountSid}/Messages.json`;
+      const body = new URLSearchParams({
+        To: params.to,
+        From: this.fromNumber,
+        Body: params.body
+      });
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${this.accountSid}:${this.authToken}`).toString("base64")}`,
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        return { success: false, error: `Twilio HTTP ${response.status}: ${text.slice(0, 300)}` };
+      }
+      const data = await response.json();
+      return { success: true, messageId: data.sid };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+};
+var Fast2SmsProvider = class {
+  constructor(apiKey) {
+    this.apiKey = apiKey;
+  }
+  async send(params) {
+    try {
+      const response = await fetch("https://www.fast2sms.com/dev/bulkV2", {
+        method: "POST",
+        headers: { authorization: this.apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          route: "q",
+          // quick transactional route (free credits work here)
+          message: params.body,
+          language: "english",
+          flash: 0,
+          numbers: params.to.replace(/^\+91/, "").replace(/\D/g, "")
+        })
+      });
+      const text = await response.text();
+      let data = {};
+      try {
+        data = JSON.parse(text);
+      } catch {
+      }
+      if (!response.ok || data.return === false) {
+        return { success: false, error: `Fast2SMS HTTP ${response.status}: ${text.slice(0, 300)}` };
+      }
+      return { success: true, messageId: String(data.message || "fast2sms") };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+};
+var Msg91Provider = class {
+  constructor(authKey, senderId) {
+    this.authKey = authKey;
+    this.senderId = senderId;
+  }
+  async send(params) {
+    try {
+      const response = await fetch("https://api.msg91.com/api/v5/flow/", {
+        method: "POST",
+        headers: { authkey: this.authKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sender: this.senderId || "AAPDAS",
+          mobiles: `91${params.to.replace(/^\+91/, "").replace(/\D/g, "")}`,
+          MESSAGE: params.body
+        })
+      });
+      const text = await response.text();
+      let data = {};
+      try {
+        data = JSON.parse(text);
+      } catch {
+      }
+      if (!response.ok || data.type === "error") {
+        return { success: false, error: `MSG91 HTTP ${response.status}: ${text.slice(0, 300)}` };
+      }
+      return { success: true, messageId: data.message || "msg91" };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+};
+var DevSmsProvider = class {
+  async send(params) {
+    console.log(`[DEV SMS MODE] to=${params.to} body=${params.body.slice(0, 300)}`);
+    return { success: true, messageId: "dev-mode" };
+  }
+};
+var emailProvider = null;
+var smsProvider = null;
+function getEmailProvider() {
+  if (emailProvider) return emailProvider;
+  const providerType = process.env.EMAIL_PROVIDER?.trim().toLowerCase();
+  const apiKey = process.env.EMAIL_API_KEY?.trim();
+  const from = process.env.EMAIL_FROM?.trim();
+  if (providerType === "resend" && apiKey && from) {
+    emailProvider = new ResendEmailProvider(apiKey, from);
+    return emailProvider;
+  }
+  return null;
+}
+function getSmsProvider() {
+  if (smsProvider) return smsProvider;
+  const providerType = process.env.SMS_PROVIDER?.trim().toLowerCase();
+  const authToken = process.env.SMS_API_KEY?.trim();
+  const accountSid = process.env.SMS_ACCOUNT_SID?.trim();
+  const devMode = process.env.DEV_OTP_MODE === "true";
+  switch (providerType) {
+    case "twilio":
+      if (authToken && accountSid) {
+        smsProvider = new TwilioSmsProvider(accountSid, authToken, process.env.SMS_FROM_NUMBER?.trim() || "");
+      }
+      break;
+    case "fast2sms":
+      if (authToken) {
+        smsProvider = new Fast2SmsProvider(authToken);
+      }
+      break;
+    case "msg91":
+      if (authToken) {
+        smsProvider = new Msg91Provider(authToken, process.env.SMS_SENDER_ID?.trim() || "AAPDAS");
+      }
+      break;
+    case "dev":
+      smsProvider = new DevSmsProvider();
+      break;
+    default:
+      if (devMode) smsProvider = new DevSmsProvider();
+      break;
+  }
+  return smsProvider;
+}
+function isEmailConfigured() {
+  return getEmailProvider() !== null;
+}
+function isSmsConfigured() {
+  return getSmsProvider() !== null;
+}
+async function sendNotificationEmail(params) {
+  const provider2 = getEmailProvider();
+  if (!provider2) return { success: false, error: "Email provider is not configured" };
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+      <h2 style="color: #0F1B29;">Aapda Drishti Alert</h2>
+      <div style="background: ${params.severity === "Extreme" ? "#FEE2E2" : "#FEF3C7"}; padding: 16px; border-radius: 8px; margin: 16px 0;">
+        <strong style="color: #0F1B29;">${params.eventType}</strong>
+        <span style="color: #747F8D;"> - ${params.severity}</span>
+        <p style="color: #46515E; margin: 8px 0 0;">${params.location}</p>
+      </div>
+      <p style="color: #46515E;">${params.description}</p>
+      ${params.sourceUrls.length ? `<p style="color: #747F8D; font-size: 14px;">${params.sourceUrls.map((url) => `<a href="${url}">Source</a>`).join(" | ")}</p>` : ""}
+      <hr style="border: none; border-top: 1px solid #DDDDDD; margin: 16px 0;">
+      <p style="color: #747F8D; font-size: 12px;">You received this because you have alerts enabled for your area. <a href="${params.platformUrl}">Manage settings</a></p>
+    </div>`;
+  return provider2.send({
+    to: params.to,
+    subject: `[Aapda Drishti] ${params.severity} ${params.eventType} - ${params.location}`,
+    html
+  });
+}
+async function sendNotificationSms(params) {
+  const provider2 = getSmsProvider();
+  if (!provider2) return { success: false, error: "SMS provider is not configured" };
+  const body = `Aapda Drishti: ${params.severity} ${params.eventType} reported near ${params.location}. Check the platform for verified details.`;
+  return provider2.send({ to: params.to, body });
+}
+async function recordNotification(params) {
+  try {
+    const existing = await supabaseRest(
+      `notifications?dedupe_key=eq.${encodeURIComponent(params.dedupeKey)}&select=id,status&limit=1`,
+      { method: "GET" }
+    );
+    if (existing[0]) {
+      if (existing[0].status === "FAILED" && params.send) {
+        await supabaseRest(`notifications?id=eq.${existing[0].id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "SENDING" })
+        });
+        try {
+          await params.send();
+          await supabaseRest(`notifications?id=eq.${existing[0].id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ status: "SENT", sent_at: (/* @__PURE__ */ new Date()).toISOString(), error_message: null })
+          });
+          return "created";
+        } catch (err) {
+          await supabaseRest(`notifications?id=eq.${existing[0].id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ status: "FAILED", error_message: err.message.slice(0, 500) })
+          });
+          return "failed";
+        }
+      }
+      await supabaseRest(`notifications?id=eq.${existing[0].id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: "DEDUPLICATED" })
+      }).catch(() => void 0);
+      return "deduplicated";
+    }
+    const rows = await supabaseRest("notifications?on_conflict=dedupe_key", {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+      body: JSON.stringify({
+        user_id: params.userId,
+        event_id: params.eventId,
+        channel: params.channel,
+        status: params.send ? "QUEUED" : "SENT",
+        reason: params.reason.slice(0, 500),
+        dedupe_key: params.dedupeKey,
+        sent_at: params.send ? null : (/* @__PURE__ */ new Date()).toISOString()
+      })
+    });
+    const rowId = rows[0]?.id;
+    if (!rowId) {
+      const raced = await supabaseRest(
+        `notifications?dedupe_key=eq.${encodeURIComponent(params.dedupeKey)}&select=id,status&limit=1`,
+        { method: "GET" }
+      );
+      return raced[0] ? "deduplicated" : "failed";
+    }
+    if (params.send && rowId) {
+      await supabaseRest(`notifications?id=eq.${rowId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status: "SENDING" })
+      }).catch(() => void 0);
+      try {
+        await params.send();
+        await supabaseRest(`notifications?id=eq.${rowId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "SENT", sent_at: (/* @__PURE__ */ new Date()).toISOString() })
+        });
+        return "created";
+      } catch (err) {
+        await supabaseRest(`notifications?id=eq.${rowId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "FAILED", error_message: err.message.slice(0, 500) })
+        });
+        return "failed";
+      }
+    }
+    return "created";
+  } catch (err) {
+    console.warn("recordNotification failed:", err.message);
+    return "failed";
+  }
+}
+
+// server/jobs/notificationJob.ts
+async function runNotificationJob() {
+  const runId = await startJobRun("notification");
+  const result = {
+    jobType: "notification",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  if (!isSupabaseConfigured()) {
+    result.status = "FAILED";
+    result.errorMessage = "Supabase is not configured";
+    if (runId) await finishJobRun(runId, result);
+    return result;
+  }
+  try {
+    const events = await supabaseRest(
+      `canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING)&verification_status=in.(${PUBLIC_VERIFICATION_STATUSES2.join(",")})&select=id,title,event_type,severity,location_name,description&limit=50`,
+      { method: "GET" }
+    );
+    const subscriptions = await supabaseRest(
+      "subscriptions?select=user_id,nearby_radius_km,severity_threshold,email_enabled,sms_enabled,push_enabled&limit=1000",
+      { method: "GET" }
+    ).catch(() => []);
+    const profiles = await supabaseRest(
+      "profiles?select=id,email,name&limit=500",
+      { method: "GET" }
+    ).catch(() => []);
+    const profileMap = new Map(profiles.map((p) => [p.id, p]));
+    const phoneRows = await supabaseRest(
+      "phone_numbers?verified=eq.true&select=user_id,phone_number,verified&limit=500",
+      { method: "GET" }
+    ).catch(() => []);
+    const phoneMap = /* @__PURE__ */ new Map();
+    for (const row of phoneRows) {
+      if (!phoneMap.has(row.user_id)) phoneMap.set(row.user_id, row.phone_number);
+    }
+    for (const event of events) {
+      if (severityValue(event.severity) < severityValue("Moderate")) continue;
+      result.recordsProcessed++;
+      for (const sub of subscriptions) {
+        const radiusKm = Math.max(1, Math.min(Number(sub.nearby_radius_km) || 50, 500));
+        const userLocations = await supabaseRest(
+          "rpc/user_locations_geo",
+          {
+            method: "POST",
+            body: JSON.stringify({ p_user_id: sub.user_id }),
+            headers: { select: "id,latitude,longitude" }
+          }
+        ).catch(() => []);
+        for (const loc of userLocations) {
+          if (loc.latitude == null || loc.longitude == null) continue;
+          const nearby = await nearbyEvents(loc.latitude, loc.longitude, radiusKm);
+          const hit = nearby.find((n) => n.event_id === event.id);
+          if (!hit) continue;
+          if (severityValue(event.severity) < severityValue(sub.severity_threshold)) continue;
+          const distanceKm = Math.round(hit.distance_meters / 100) / 10;
+          const location = hit.location_name || "your area";
+          const reason = `${event.event_type} (${event.severity}) ${distanceKm} km from ${loc.id ? "a saved location" : "you"} near ${location}`;
+          const inAppKey = `${sub.user_id}:${event.id}:IN_APP:v1`;
+          const inApp = await recordNotification({
+            userId: sub.user_id,
+            eventId: event.id,
+            channel: "IN_APP",
+            reason,
+            dedupeKey: inAppKey
+          });
+          if (inApp === "created") result.recordsCreated++;
+          else if (inApp === "failed") result.recordsRejected++;
+          if (sub.email_enabled && isEmailConfigured()) {
+            const email = profileMap.get(sub.user_id)?.email || "";
+            if (email) {
+              const emailKey = `${sub.user_id}:${event.id}:EMAIL:v1`;
+              const outcome = await recordNotification({
+                userId: sub.user_id,
+                eventId: event.id,
+                channel: "EMAIL",
+                reason,
+                dedupeKey: emailKey,
+                send: async () => {
+                  const sent = await sendNotificationEmail({
+                    to: email,
+                    eventType: event.event_type,
+                    severity: event.severity,
+                    location,
+                    description: event.description || event.title,
+                    sourceSummary: "",
+                    sourceUrls: [],
+                    platformUrl: process.env.FRONTEND_URL || "http://localhost:5173"
+                  });
+                  if (!sent.success) throw new Error(sent.error || "Email provider failed");
+                }
+              });
+              if (outcome === "created") result.recordsCreated++;
+              else if (outcome === "failed") result.recordsRejected++;
+            }
+          }
+          if (sub.sms_enabled && isSmsConfigured()) {
+            const phone = phoneMap.get(sub.user_id);
+            if (phone) {
+              const smsKey = `${sub.user_id}:${event.id}:SMS:v1`;
+              const outcome = await recordNotification({
+                userId: sub.user_id,
+                eventId: event.id,
+                channel: "SMS",
+                reason,
+                dedupeKey: smsKey,
+                send: async () => {
+                  const sent = await sendNotificationSms({
+                    to: phone,
+                    eventType: event.event_type,
+                    severity: event.severity,
+                    location
+                  });
+                  if (!sent.success) throw new Error(sent.error || "SMS provider failed");
+                }
+              });
+              if (outcome === "created") result.recordsCreated++;
+              else if (outcome === "failed") result.recordsRejected++;
+            }
+          }
+          if (sub.push_enabled) {
+            const realtimeKey = `${sub.user_id}:${event.id}:IN_APP_RT:v1`;
+            const outcome = await recordNotification({
+              userId: sub.user_id,
+              eventId: event.id,
+              channel: "IN_APP",
+              reason: `${reason} (realtime)`,
+              dedupeKey: realtimeKey
+            });
+            if (outcome === "created") result.recordsCreated++;
+            else if (outcome === "failed") result.recordsRejected++;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    result.status = "FAILED";
+    result.errorMessage = err.message;
+  }
+  if (runId) await finishJobRun(runId, result);
+  return result;
+}
+
+// server/data/historicalDisasters.ts
+var now = (/* @__PURE__ */ new Date()).toISOString();
+var HISTORICAL_DISASTERS_CATALOG = [
+  {
+    id: "seed-1999-odisha-cyclone",
+    eventName: "1999 Odisha Super Cyclone",
+    disasterType: "Cyclone",
+    location: "Paradip, Jagatsinghpur and Coastal Odisha",
+    state: "Odisha",
+    country: "India",
+    eventDate: "1999-10-29T00:00:00.000Z",
+    dateRange: "29 October - 1 November 1999",
+    reportedCasualties: "9,887 official fatalities confirmed by Govt of Odisha; over 10,000 estimated, with 2,507 injured [S1][S2][S4].",
+    reportedDamage: "1.65 million houses destroyed or severely damaged, 2.5 million livestock perished, and 1.8 million hectares of standing crops inundated [S1][S3].",
+    sources: [
+      { id: "S1", title: "Report on Cyclonic Disturbances Over North Indian Ocean During 1999", publisher: "India Meteorological Department (IMD)", publishedAt: "1999-11-15", url: "https://mausam.imd.gov.in", summary: "Category 5 equivalent super cyclonic storm 05B struck Paradip with central pressure of 912 hPa and sustained wind speeds of 260 km/h (gusting to 300 km/h), generating a catastrophic storm surge of 6-7 meters that travelled 35 km inland." },
+      { id: "S2", title: "Super Cyclone 1999: Two Decades of Resilience", publisher: "Odisha State Disaster Management Authority (OSDMA)", publishedAt: "2019-10-29", url: "https://www.osdma.org", summary: "Official state casualty census documented 9,887 human deaths, with Ersama block in Jagatsinghpur accounting for over 8,000 fatalities. 12 districts and 12.9 million people were directly impacted." },
+      { id: "S3", title: "Damage and Needs Assessment: Orissa Super Cyclone 1999", publisher: "World Bank & Asian Development Bank", publishedAt: "1999-12-05", url: "https://www.worldbank.org", summary: "Direct economic damage was estimated at $4.5 billion (\u20B920,000+ crore). Over 1.65 million houses, 20,000 km of roads, and electrical grids across 14,000 villages were completely flattened." },
+      { id: "S4", title: "Deadliest Tropical Cyclone in Modern Indian History", publisher: "BBC News South Asia", publishedAt: "1999-10-31", url: "https://www.bbc.com/news", summary: "International relief agencies deployed emergency food drops as entire coastal communities remained submerged for over two weeks following record precipitation and tidal inundation." },
+      { id: "S5", title: "The Making of a Resilient State: Post-1999 Cyclone Reforms", publisher: "The Hindu", publishedAt: "2019-10-29", url: "https://www.thehindu.com", summary: "The 1999 catastrophe catalysed the creation of the Odisha State Disaster Management Authority (OSDMA), India\u2019s first dedicated disaster management agency, and modern coastal shelter networks." }
+    ],
+    timeline: [
+      { date: "25 October 1999", event: "Tropical Depression Forms", description: "Depression formed in the Gulf of Thailand, crossed the Malay Peninsula, and intensified rapidly in the Andaman Sea [S1].", citations: ["S1"] },
+      { date: "28 October 1999", event: "Upgraded to Super Cyclonic Storm", description: "IMD upgraded system to Super Cyclonic Storm 05B as core pressure plummeted to 912 hPa [S1].", citations: ["S1"] },
+      { date: "29 October 1999", event: "Landfall at Paradip", description: "Eye crossed coastal Odisha near Paradip between 10:30 AM and 12:00 PM IST with 260 km/h sustained winds and 6-7m storm surge [S1][S2].", citations: ["S1", "S2"] },
+      { date: "30 October 1999", event: "Stationary Torrential Downpour", description: "Cyclone stalled over coastal Odisha for over 30 hours, dropping 800-1000 mm of rain and causing extreme inland deluge [S1].", citations: ["S1"] },
+      { date: "1 November 1999", event: "National & International Mobilization", description: "Indian Armed Forces initiated Operation Sahayata, dropping 1,200 tonnes of relief material into marooned districts [S2][S4].", citations: ["S2", "S4"] }
+    ],
+    whatHappened: "On 29 October 1999, Super Cyclonic Storm 05B struck the coast of Odisha near Paradip as one of the most violent tropical cyclones ever recorded in the North Indian Ocean [S1]. Sustained winds of 260 km/h and a 6-7 meter storm surge drove seawater up to 35 kilometers inland, submerging hundreds of coastal villages and destroying municipal infrastructure across 12 districts [S1][S2][S3]. The storm stalled over the state for 36 hours, precipitating catastrophic inland flash floods [S1].",
+    affectedAreas: "12 coastal and interior districts: Jagatsinghpur (worst hit, especially Ersama block), Kendrapara, Cuttack, Puri, Bhadrak, Balasore, Jajpur, Khordha, Nayagarh, Dhenkanal, Mayurbhanj, and Keonjhar [S2].",
+    humanImpact: "9,887 official fatalities with unofficial estimates exceeding 10,000; over 2,500 severely injured, 12.9 million people affected, and 3.5 million children rendered homeless [S2][S4].",
+    infrastructureDamage: "1,650,000 houses destroyed, 14,000 schools demolished, entire power transmission grid flattened across coastal districts, and Paradip Port heavily damaged [S3].",
+    economicImpact: "Direct economic losses estimated at \u20B920,000+ crore ($4.5 billion USD in 1999 terms), including 1.8 million hectares of paddy crops ruined by salinity [S3].",
+    governmentResponse: "Govt of India launched tri-service military relief Operation Sahayata. The tragedy led to the landmark enactment of the Disaster Management Act of 2005 and founding of the National Disaster Management Authority (NDMA) [S2][S5].",
+    rescueRelief: "Indian Armed Forces, NDRF predecessor battalions, and the Red Cross carried out airborne food drops, water purification deployment, and massive cholera vaccination drives across 14,000 affected villages [S2][S4].",
+    recovery: "Construction of 800+ multi-purpose cyclone shelters, coastal green shelterbelts, and early warning dissemination networks that transformed Odisha into a global leader in cyclone preparedness [S5].",
+    sourceAssessment: "High-confidence historical record synthesized from official IMD meteorological annals, OSDMA census registries, World Bank damage assessments, and contemporary international reports.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 1999,
+    numericCasualties: 9887,
+    economicLossInrCr: 2e4,
+    decade: "1990s"
+  },
+  {
+    id: "seed-2001-gujarat-earthquake",
+    eventName: "2001 Gujarat (Bhuj) Earthquake",
+    disasterType: "Earthquake",
+    location: "Bhuj, Kutch, Ahmedabad and Saurashtra",
+    state: "Gujarat",
+    country: "India",
+    eventDate: "2001-01-26T00:00:00.000Z",
+    dateRange: "26 January 2001 (08:46 IST)",
+    reportedCasualties: "20,085 fatalities confirmed by Gujarat State Disaster Management Authority; 166,800 people injured [S1][S2][S3].",
+    reportedDamage: "340,000 buildings completely destroyed and 840,000 damaged across 21 districts; over 20,000 cattle killed [S1][S3][S4].",
+    sources: [
+      { id: "S1", title: "Preliminary Earthquake Report: Bhuj, Gujarat (Mw 7.7)", publisher: "United States Geological Survey (USGS)", publishedAt: "2001-01-26", url: "https://earthquake.usgs.gov", summary: "Intraplate thrust earthquake with moment magnitude Mw 7.7 occurred at 08:46:42 IST at a depth of 16 km along the South Wagad Fault in the Kutch basin." },
+      { id: "S2", title: "Gujarat Earthquake 2001: Memorial Assessment and Reconstruction", publisher: "Gujarat State Disaster Management Authority (GSDMA)", publishedAt: "2003-01-26", url: "https://gsdma.org", summary: "Official death toll stood at 20,085 with 166,800 injured. Over 1.2 million structures suffered partial or total collapse across Kutch, Ahmedabad, Rajkot, and Jamnagar districts." },
+      { id: "S3", title: "Post-Earthquake Reconstruction and Recovery in Gujarat", publisher: "World Bank Assessment", publishedAt: "2001-03-14", url: "https://www.worldbank.org", summary: "Estimated total economic damage exceeded $4.8 billion (\u20B921,300 crore), impacting 15.9 million people (one-third of Gujarat\u2019s population at the time)." },
+      { id: "S4", title: "Republic Day Tragedy in Gujarat", publisher: "The Indian Express", publishedAt: "2001-01-27", url: "https://indianexpress.com", summary: "Tremors shook Gujarat during 52nd Republic Day celebrations, collapsing multi-story residential complexes in Ahmedabad and reducing old towns of Bhuj, Anjar, and Bachau to rubble." },
+      { id: "S5", title: "Seismic Hazard and Building Code Overhaul post-Bhuj", publisher: "National Institute of Disaster Management (NIDM)", publishedAt: "2002-05-10", url: "https://nidm.gov.in", summary: "The Bhuj disaster prompted sweeping revisions to Bureau of Indian Standards (BIS) seismic zone maps and institutionalized Gujarat State Disaster Management Act." }
+    ],
+    timeline: [
+      { date: "26 January 2001", event: "Mw 7.7 Intraplate Earthquake", description: "At 08:46 IST on Republic Day, a violent Mw 7.7 quake struck with epicenter 9 km SW of Chobari in Kutch [S1].", citations: ["S1"] },
+      { date: "26 January 2001", event: "Mass Urban Collapse", description: "Historic centers of Bhuj, Anjar, Bhachau, and Rapar suffered near total devastation; 80 multistory towers collapsed in Ahmedabad 300 km away [S2][S4].", citations: ["S2", "S4"] },
+      { date: "27 January 2001", event: "Tri-Service Rescue Mobilization", description: "Indian Army launched Operation Sahayata, deploying 35 infantry battalions, field surgical teams, and bridging equipment [S2][S4].", citations: ["S2", "S4"] },
+      { date: "8 February 2001", event: "Creation of GSDMA", description: "Government of Gujarat established the Gujarat State Disaster Management Authority to execute comprehensive reconstruction [S2][S5].", citations: ["S2", "S5"] }
+    ],
+    whatHappened: "On the morning of 26 January 2001 (52nd Republic Day), a catastrophic Mw 7.7 earthquake struck Gujarat with an epicenter near Bhuj in the Kutch district [S1]. Tremors lasted for more than two minutes, leveling 90% of the structures in Bhuj, Anjar, and Bhachau, and collapsing numerous high-rise apartment complexes in Ahmedabad 300 kilometers away [S1][S2][S4]. Over 20,000 people lost their lives and 166,000 were injured [S2][S3].",
+    affectedAreas: "21 of Gujarat\u2019s 25 districts; most severe in Kutch (Bhuj, Anjar, Bhachau, Gandhidham, Rapar), Ahmedabad, Rajkot, Jamnagar, and Surendranagar [S2].",
+    humanImpact: "20,085 confirmed deaths, 166,800 injuries, 600,000 homeless, and over 15.9 million people directly impacted [S2][S3].",
+    infrastructureDamage: "340,000 houses destroyed, 840,000 damaged, 45 hospitals leveled, 1,200 schools collapsed, and major port facilities at Kandla severely disrupted [S2][S3].",
+    economicImpact: "Direct losses of \u20B921,300 crore ($4.8 billion USD in 2001), including heavy losses to small-scale handicrafts, salt production, and industrial units in Kutch [S3].",
+    governmentResponse: "Govt of Gujarat constituted GSDMA; Indian Armed Forces deployed 35 battalions; international urban search and rescue teams from 38 nations assisted in recovery [S2][S4].",
+    rescueRelief: "Setting up of 30,000-bed field hospitals, delivery of 110,000 tents, supply of 300,000 blankets, and immediate cash doles to affected families [S2][S4].",
+    recovery: "World-renowned owner-driven reconstruction of 1.2 million houses using seismic-resistant masonry; transformation of Bhuj into an earthquake-resilient industrial hub [S3][S5].",
+    sourceAssessment: "High-confidence record verified by USGS seismological datasets, GSDMA post-disaster audits, World Bank economic assessments, and NIDM archives.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 2001,
+    numericCasualties: 20085,
+    economicLossInrCr: 21300,
+    decade: "2000s"
+  },
+  {
+    id: "seed-2004-tsunami",
+    eventName: "2004 Indian Ocean Tsunami",
+    disasterType: "Tsunami",
+    location: "Tamil Nadu Coast, Andaman and Nicobar Islands, Kerala and Andhra Pradesh",
+    state: "Tamil Nadu",
+    country: "India",
+    eventDate: "2004-12-26T00:00:00.000Z",
+    dateRange: "26 December 2004 (06:28 - 09:30 IST)",
+    reportedCasualties: "12,405 deaths in India (including 10,749 in mainland and 1,656 in Andaman & Nicobar); 5,640 missing [S1][S2][S4].",
+    reportedDamage: "Over 235,000 coastal dwelling units destroyed or damaged, 83,788 fishing boats smashed or lost, and 35,000 hectares of farmland salinized [S2][S3].",
+    sources: [
+      { id: "S1", title: "Magnitude 9.1 Northern Sumatra Undersea Earthquake and Indian Ocean Tsunami", publisher: "USGS & NOAA", publishedAt: "2004-12-26", url: "https://earthquake.usgs.gov", summary: "A Mw 9.1 megathrust earthquake ruptured 1,300 km along the Sunda Trench, displacing hundreds of cubic kilometers of ocean water and generating trans-oceanic tsunami waves exceeding 10 meters." },
+      { id: "S2", title: "Tsunami 2004: A Report to the Nation on Relief and Rehabilitation", publisher: "Ministry of Home Affairs (MHA), Government of India", publishedAt: "2005-06-01", url: "https://www.mha.gov.in", summary: "Comprehensive government tally recorded 12,405 deaths and 5,640 missing persons across Tamil Nadu, Andaman & Nicobar Islands, Kerala, Andhra Pradesh, and Puducherry." },
+      { id: "S3", title: "India Post-Tsunami Recovery Program (Emergency Tsunami Reconstruction Project)", publisher: "World Bank, ADB & UNDP Joint Mission", publishedAt: "2005-02-15", url: "https://www.worldbank.org", summary: "Estimated total damages and losses in India reached $1.02 billion (\u20B94,500 crore), primarily striking the artisanal fisheries economy and coastal tourism." },
+      { id: "S4", title: "Boxing Day Tsunami Devastates Coastal India", publisher: "The Hindu", publishedAt: "2004-12-27", url: "https://www.thehindu.com", summary: "Tsunami surges up to 10 meters high slammed Nagapattinam, Cuddalore, Kanyakumari, and Chennai\u2019s Marina Beach without prior warning on Boxing Day morning." },
+      { id: "S5", title: "Establishment of the Indian Tsunami Early Warning Centre (ITEWC)", publisher: "INCOIS (Indian National Centre for Ocean Information Services)", publishedAt: "2007-10-15", url: "https://incois.gov.in", summary: "In direct response to the 2004 disaster, Ministry of Earth Sciences established ITEWC at INCOIS Hyderabad, deploying real-time ocean bottom pressure recorders and coastal radar networks." }
+    ],
+    timeline: [
+      { date: "26 December 2004 06:28 IST", event: "Mw 9.1 Undersea Rupture", description: "Megathrust earthquake off west coast of Northern Sumatra triggered basin-wide tsunami waves traveling at 800 km/h [S1].", citations: ["S1"] },
+      { date: "26 December 2004 06:45 IST", event: "Andaman & Nicobar Inundated", description: "Tsunami waves over 12 meters pulverized Car Nicobar, Great Nicobar, and Katchal islands [S2].", citations: ["S2"] },
+      { date: "26 December 2004 08:45 IST", event: "Mainland Coastfall", description: "Surges struck Nagapattinam, Velankanni, Cuddalore, Kanyakumari, and Chennai coast with devastating force [S2][S4].", citations: ["S2", "S4"] },
+      { date: "26 December 2004 11:00 IST", event: "Operation Sea Waves & Castor", description: "Indian Navy dispatched hospital ships, aircraft, and naval relief contingents across coastal states and neighboring Sri Lanka [S2][S4].", citations: ["S2", "S4"] }
+    ],
+    whatHappened: "On the morning of 26 December 2004, an enormous magnitude 9.1 undersea megathrust earthquake off the west coast of Sumatra generated a devastating tsunami across the Indian Ocean [S1]. Between 06:45 and 09:30 IST, massive waves between 5 and 12 meters slammed into the Andaman and Nicobar archipelago and the eastern coastline of mainland India, catching coastal populations completely off guard [S1][S2][S4]. Nagapattinam in Tamil Nadu suffered the catastrophic brunt with over 6,000 fatalities [S2].",
+    affectedAreas: "Tamil Nadu (Nagapattinam, Cuddalore, Kanyakumari, Chennai, Kancheepuram, Tiruvallur), Andaman & Nicobar Islands (Car Nicobar, Katchal, Campbell Bay), Kerala (Kollam, Alappuzha, Ernakulam), Andhra Pradesh (Prakasam, Krishna), and UT of Puducherry [S2].",
+    humanImpact: "12,405 confirmed fatalities in India, 5,640 missing, over 650,000 persons evacuated to relief camps, and livelihoods of 1.5 million fishermen upended [S2][S4].",
+    infrastructureDamage: "235,000 houses washed away or flooded, 83,788 fishing vessels destroyed, harbors silted, and coastal bridges and communication links severed [S2][S3].",
+    economicImpact: "Direct damages and losses estimated at \u20B94,500 crore ($1.02 billion USD in 2004), destroying 80% of coastal fishing infrastructure [S3].",
+    governmentResponse: "Govt of India deployed Armed Forces in Operation Sea Waves; refused foreign financial assistance, asserting national self-reliance in disaster management, and drafted the National Disaster Management Act 2005 [S2][S5].",
+    rescueRelief: "Setting up of 250+ relief camps, distribution of dry rations, construction of temporary intermediate shelter colonies, and psychological trauma counselling [S2][S4].",
+    recovery: "Construction of permanent multi-hazard resistant houses 500m inland from the high-tide line, and commissioning of the state-of-the-art Indian Tsunami Early Warning Centre (ITEWC) at INCOIS [S3][S5].",
+    sourceAssessment: "High-confidence historical evidence based on USGS seismic logs, MHA official disaster records, joint World Bank recovery studies, and INCOIS technical publications.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 2004,
+    numericCasualties: 12405,
+    economicLossInrCr: 4500,
+    decade: "2000s"
+  },
+  {
+    id: "seed-2013-uttarakhand-floods",
+    eventName: "2013 Uttarakhand (Kedarnath) Flash Floods",
+    disasterType: "Flood",
+    location: "Kedarnath, Mandakini Valley, Rudraprayag and Chamoli",
+    state: "Uttarakhand",
+    country: "India",
+    eventDate: "2013-06-16T00:00:00.000Z",
+    dateRange: "16 - 17 June 2013",
+    reportedCasualties: "5,748 declared dead / missing by Government of Uttarakhand; thousands injured [S1][S2][S4].",
+    reportedDamage: "4,200 villages affected, 9,264 cattle dead, 2,141 houses completely flattened, and hundreds of roads and bridges washed away [S2][S3].",
+    sources: [
+      { id: "S1", title: "Hydrometeorological Analysis of Unprecedented Uttarakhand Deluge in June 2013", publisher: "India Meteorological Department (IMD) & CWC", publishedAt: "2013-07-20", url: "https://mausam.imd.gov.in", summary: "A rare atmospheric confluence of western disturbances and monsoon depression unleashed 375% of normal precipitation, causing multi-cloudburst events and Chorabari glacial lake outburst." },
+      { id: "S2", title: "Uttarakhand Disaster 2013: Post-Disaster Needs Assessment (PDNA)", publisher: "Government of Uttarakhand, World Bank & ADB", publishedAt: "2013-09-12", url: "https://www.worldbank.org", summary: "Official death and missing count totaled 5,748 persons. Total recovery and reconstruction needs were assessed at $1.1 billion (\u20B96,600+ crore)." },
+      { id: "S3", title: "Geological Analysis of the Kedarnath Debris Flow Disaster", publisher: "Geological Survey of India (GSI) & Wadia Institute of Himalayan Geology", publishedAt: "2013-08-30", url: "https://www.gsi.gov.in", summary: "Moraine-dammed Chorabari Lake burst its banks, releasing millions of cubic meters of water, boulders, and silt into Kedarnath town within 15 minutes." },
+      { id: "S4", title: "Operation Rahat: Indian Armed Forces Air-Evacuates 100,000 Stranded Pilgrims", publisher: "The Indian Express & PIB Defense Wing", publishedAt: "2013-07-02", url: "https://indianexpress.com", summary: "Indian Air Force, Army, and ITBP executed the largest civilian helicopter rescue operation in world history, airlifting over 100,000 pilgrims despite hazardous Himalayan weather." },
+      { id: "S5", title: "Rebuilding Kedarnath: Himalayan Ecology and Pilgrim Safety Systems", publisher: "National Disaster Management Authority (NDMA)", publishedAt: "2015-06-16", url: "https://ndma.gov.in", summary: "Post-2013 overhaul instituted strict visitor registration biometric gates, automated weather stations across Char Dham routes, and protective river embankments." }
+    ],
+    timeline: [
+      { date: "15 June 2013", event: "Extreme Cloudbursts Begin", description: "Torrential rains of 340 mm in 24 hours struck the upper catchment of the Mandakini and Alaknanda rivers [S1].", citations: ["S1"] },
+      { date: "16 June 2013 18:00 IST", event: "First Glacial Surge", description: "Water and debris flooded Kedarnath township, destroying guest houses and market streets [S3].", citations: ["S3"] },
+      { date: "17 June 2013 07:15 IST", event: "Chorabari Lake Outburst Deluge", description: "Chorabari Tal moraine collapsed, sending a catastrophic 10-meter wall of mud and boulders directly through Kedarnath [S1][S3].", citations: ["S1", "S3"] },
+      { date: "18 June 2013", event: "Operation Rahat & Surya Hope Launched", description: "IAF deployed 45 helicopters alongside 10,000 Army troops in the world\u2019s largest helicopter rescue operation [S2][S4].", citations: ["S2", "S4"] }
+    ],
+    whatHappened: "Between 16 and 17 June 2013, unprecedented cloudbursts combined with the catastrophic outburst of the moraine-dammed Chorabari Glacial Lake unleashed a massive debris flow down the Kedarnath valley in Uttarakhand [S1][S3]. A torrential wave of mud, boulders, and icy water engulfed Kedarnath temple town, Rambara, Gaurikund, and downstream villages along the Mandakini River [S1][S3][S4]. Over 5,700 pilgrims, local residents, and trekking porters were declared dead or missing [S2].",
+    affectedAreas: "5 Himalayan districts: Rudraprayag (Kedarnath valley, Rambara, Gaurikund), Chamoli (Badrinath, Hemkund Sahib), Uttarkashi, Pithoragarh, and Tehri Garhwal [S2].",
+    humanImpact: "5,748 people dead or missing; over 100,000 pilgrims trapped across steep Himalayan gorges; 300,000 people across 4,200 villages affected [S2][S4].",
+    infrastructureDamage: "Rambara town completely erased from the map, 2,141 houses destroyed, 1,307 km of motorable roads wiped out, and 147 bridges washed away [S2][S3].",
+    economicImpact: "Direct damages and economic loss evaluated at \u20B96,600+ crore ($1.1 billion USD in 2013), crippling the regional pilgrimage economy for over three years [S2].",
+    governmentResponse: "Govt launched Operation Rahat (IAF) and Operation Surya Hope (Indian Army), rescuing 105,000 people under treacherous high-altitude conditions [S2][S4].",
+    rescueRelief: "IAF flew over 2,200 sorties; brave sacrifices of 20 rescue personnel in a Mi-17 V5 crash near Gaurikund; round-the-clock airlift of food and medical supplies [S4].",
+    recovery: "Comprehensive reconstruction of Kedarnath shrine area with 3-tier protective river walls, pedestrian pathways, and automated early warning river sensors [S5].",
+    sourceAssessment: "High-confidence record synthesized from IMD meteorology papers, GSI geological surveys, World Bank PDNA assessments, and Defense Ministry operation logs.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 2013,
+    numericCasualties: 5748,
+    economicLossInrCr: 6600,
+    decade: "2010s"
+  },
+  {
+    id: "seed-2018-kerala-floods",
+    eventName: "2018 Kerala Floods",
+    disasterType: "Flood",
+    location: "Idukki, Ernakulam, Thrissur, Alappuzha, Wayanad and Pathanamthitta",
+    state: "Kerala",
+    country: "India",
+    eventDate: "2018-08-15T00:00:00.000Z",
+    dateRange: "8 - 22 August 2018",
+    reportedCasualties: "483 deaths reported by Government of Kerala; 140 missing; 1.45 million displaced [S1][S2][S4].",
+    reportedDamage: "Over 280,000 houses damaged, 83,000 km of roads destroyed, and thousands of landslides across Western Ghats [S2][S3].",
+    sources: [
+      { id: "S1", title: "Study of Floods in Kerala in August 2018", publisher: "Central Water Commission (CWC)", publishedAt: "2018-09-10", url: "https://cwc.gov.in", summary: "Kerala received 2346.6 mm of rainfall from 1 June to 19 August against normal of 1649.5 mm (42% excess), filling 35 major reservoirs to capacity and forcing emergency shutter openings." },
+      { id: "S2", title: "Kerala Post Disaster Needs Assessment: Floods and Landslides August 2018", publisher: "United Nations, World Bank, ADB & Govt of Kerala", publishedAt: "2018-10-25", url: "https://www.worldbank.org", summary: "Assessment determined 483 deaths and estimated total economic damage at \u20B931,000 crore ($4.4 billion), directly impacting 5.4 million people." },
+      { id: "S3", title: "Kerala Floods 2018: Environmental Impact and Landslides", publisher: "Geological Survey of India (GSI)", publishedAt: "2018-11-15", url: "https://www.gsi.gov.in", summary: "Intense rainfall triggered 1,486 major and minor landslides across Idukki, Wayanad, Malappuram, and Palakkad districts." },
+      { id: "S4", title: "The Great Kerala Deluge and Kerala Fishermen as Kerala\u2019s Own Army", publisher: "The Hindu", publishedAt: "2018-08-20", url: "https://www.thehindu.com", summary: "Over 4,500 traditional fishermen deployed 669 country boats into inundated streets, rescuing over 65,000 stranded residents in Chengannur and Aluva." },
+      { id: "S5", title: "Rebuild Kerala Initiative (RKI): Ecological Resilience Blueprint", publisher: "Government of Kerala & Planning Board", publishedAt: "2019-03-01", url: "https://rebuild.kerala.gov.in", summary: "Creation of the Rebuild Kerala Initiative to enact Room for the River flood mitigation strategies and climate-resilient transport design." }
+    ],
+    timeline: [
+      { date: "8 August 2018", event: "Excess Monsoon Surge Begins", description: "Intense rainstorms triggered 24 major landslides in Idukki and Wayanad [S1][S3].", citations: ["S1", "S3"] },
+      { date: "10 August 2018", event: "Idukki Dam Shutters Opened", description: "For the first time in 26 years, all 5 shutters of the Cheruthoni dam were opened to release excess inflows [S1].", citations: ["S1"] },
+      { date: "15 August 2018", event: "Statewide Peak Deluge", description: "Red alerts sounded across 12 districts as Periyar, Pamba, and Chalakudy rivers submerged towns [S1][S4].", citations: ["S1", "S4"] },
+      { date: "16 August 2018", event: "Fishermen & Tri-Service Fleet Rescue", description: "Over 65,000 people rescued by traditional fishing boats working in coordination with NDRF, Navy, and Army [S4].", citations: ["S4"] }
+    ],
+    whatHappened: "In August 2018, Kerala experienced its worst flooding in nearly a century due to unusually high monsoon rainfall, receiving 164% above normal precipitation in the second week of August [S1]. 35 of the state\u2019s major dams were opened simultaneously to prevent structural breaches, sending floodwaters surging into populated river basins across 13 of Kerala\u2019s 14 districts [S1][S2]. Simultaneous hill slope landslides cut off high-range settlements in Idukki and Wayanad [S2][S3].",
+    affectedAreas: "13 of 14 districts: Idukki, Ernakulam, Thrissur, Alappuzha, Pathanamthitta, Wayanad, Malappuram, Kottayam, Palakkad, Kozhikode, Kannur, Kollam, and Thiruvananthapuram [S2].",
+    humanImpact: "483 people killed, 140 missing, and 1,450,000 displaced into 3,879 relief camps across the state [S2][S4].",
+    infrastructureDamage: "280,000 houses damaged, Cochin International Airport runway flooded for 14 days, and 83,000 km of roads severely damaged [S2][S3].",
+    economicImpact: "Total damage and loss calculated at \u20B931,000 crore ($4.4 billion USD in 2018), with severe blows to spice plantations, tourism, and small commerce [S2].",
+    governmentResponse: "Govt of Kerala established the Rebuild Kerala Initiative; NDRF, Indian Army, Navy, Air Force, and Coast Guard mounted Operation Madad and Operation Sahyog [S2][S4].",
+    rescueRelief: "Historic civilian mobilization: 4,500 fishermen with 669 boats rescued 65,000 people; statewide youth tech volunteers built crowdsourced rescue portals [S4].",
+    recovery: "Rebuild Kerala Initiative enacted the Room for the River policy modeled after the Netherlands, eco-sensitive zone mapping, and green infrastructure funding [S2][S5].",
+    sourceAssessment: "High-confidence data validated by CWC hydrometeorological reports, UN/World Bank Joint PDNA, and GSI landslide inventories.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 2018,
+    numericCasualties: 483,
+    economicLossInrCr: 31e3,
+    decade: "2010s"
+  },
+  {
+    id: "seed-2020-amphan",
+    eventName: "2020 Cyclone Amphan",
+    disasterType: "Cyclone",
+    location: "Kolkata, North & South 24 Parganas, East Medinipur and Coastal Odisha",
+    state: "West Bengal",
+    country: "India",
+    eventDate: "2020-05-20T00:00:00.000Z",
+    dateRange: "16 - 21 May 2020 (Landfall: 20 May 2020)",
+    reportedCasualties: "98 fatalities in West Bengal and Odisha; over 10 million people directly affected [S1][S2][S4].",
+    reportedDamage: "2.8 million homes damaged or destroyed, 1.7 million hectares of agricultural land salinized, and widespread destruction of Kolkata\u2019s urban power and telecom infrastructure [S2][S3].",
+    sources: [
+      { id: "S1", title: "Super Cyclonic Storm Amphan: A Comprehensive Meteorological Report", publisher: "India Meteorological Department (IMD)", publishedAt: "2020-06-15", url: "https://mausam.imd.gov.in", summary: "Amphan was the first Super Cyclonic Storm in the Bay of Bengal since 1999, achieving maximum sustained winds of 240-250 km/h with central pressure of 906 hPa before landfall near Digha/Bakkhali at 155-165 km/h gusting to 185 km/h." },
+      { id: "S2", title: "Cyclone Amphan: Damage and Loss Assessment in West Bengal", publisher: "Government of West Bengal & Disaster Management Dept", publishedAt: "2020-06-02", url: "https://wbdmd.gov.in", summary: "State assessment confirmed 98 deaths and estimated total economic damage across 8 affected districts at \u20B91,02,442 crore ($13.5 billion)." },
+      { id: "S3", title: "State of the Global Climate 2020: Extreme Weather Events", publisher: "World Meteorological Organization (WMO)", publishedAt: "2021-04-19", url: "https://public.wmo.int", summary: "Amphan was named the costliest tropical cyclone ever recorded in the North Indian Ocean, generating $13.5 billion in economic losses." },
+      { id: "S4", title: "Cyclone Amphan Battered Bengal with Winds of 133 km/h in Kolkata", publisher: "NDTV & The Telegraph India", publishedAt: "2020-05-21", url: "https://www.ndtv.com", summary: "Urban devastation in Kolkata: thousands of trees uprooted, electricity substations submerged, and heritage structures damaged during the 6-hour storm transit." },
+      { id: "S5", title: "Sundarbans Biosphere Ecological Resilience post-Amphan", publisher: "WWF India & Forest Department West Bengal", publishedAt: "2020-08-10", url: "https://www.wwfindia.org", summary: "Cyclone breached 160 km of river embankments in the Sundarbans mangrove delta, flooding freshwater ponds and destroying tiger reserve watchtowers." }
+    ],
+    timeline: [
+      { date: "16 May 2020", event: "Rapid Intensification in Bay of Bengal", description: "System intensified from a cyclonic storm to Super Cyclone in less than 36 hours [S1].", citations: ["S1"] },
+      { date: "18 May 2020", event: "Peak Super Cyclone Intensity", description: "Core sustained winds reached 240-250 km/h with 906 hPa central pressure [S1].", citations: ["S1"] },
+      { date: "19 May 2020", event: "Mass Evacuation of 600,000+ Citizens", description: "NDRF and state authorities evacuated 500,000 people in West Bengal and 150,000 in Odisha amid COVID-19 pandemic protocols [S2][S4].", citations: ["S2", "S4"] },
+      { date: "20 May 2020 14:30 IST", event: "Landfall at Bakkhali/Sundarbans", description: "Crossed coast as Very Severe Cyclonic Storm with 155-165 km/h winds and 5m storm surge [S1][S2].", citations: ["S1", "S2"] },
+      { date: "20 May 2020 18:00 IST", event: "Kolkata Urban Destruction", description: "Eye passed over South 24 Parganas; Kolkata airport flooded and 5,000+ trees uprooted [S4].", citations: ["S4"] }
+    ],
+    whatHappened: "On 20 May 2020, Cyclone Amphan made landfall near Bakkhali in the Sundarbans delta as a Very Severe Cyclonic Storm with sustained winds of 155-165 km/h gusting to 185 km/h [S1]. Having previously reached Super Cyclonic strength over the open Bay of Bengal, Amphan caused catastrophic storm surges of up to 5 meters that breached hundreds of kilometers of river embankments in South and North 24 Parganas, and battered the Kolkata metropolitan area with hurricane-force gusts for over six hours [S1][S2][S4].",
+    affectedAreas: "West Bengal (South 24 Parganas, North 24 Parganas, Kolkata, East Medinipur, Howrah, Hooghly, Nadia) and Odisha (Bhadrak, Balasore, Kendrapara, Jagatsinghpur) [S1][S2].",
+    humanImpact: "98 fatalities in India (96 in West Bengal, 2 in Odisha); over 10 million people directly affected; 2.8 million homes damaged [S2][S4].",
+    infrastructureDamage: "2.8 million houses damaged, 160 km of coastal/river embankments breached, 50,000 electricity poles snapped, and major damage to Netaji Subhash Chandra Bose International Airport in Kolkata [S2][S4].",
+    economicImpact: "Estimated losses reached \u20B91,02,442 crore ($13.5 billion USD), officially recognized by WMO as the costliest tropical cyclone in North Indian Ocean history [S2][S3].",
+    governmentResponse: "NDRF deployed 41 teams; Indian Army sent columns to assist Kolkata municipal restoration; Prime Minister announced immediate \u20B91,000 crore relief advance [S2][S4].",
+    rescueRelief: "Massive pre-emptive evacuation of 650,000 people prevented large-scale loss of life; distribution of dry food packets, tarpaulins, and halogen tablets in the Sundarbans [S2][S4].",
+    recovery: "Restoration of mangrove green belts, reconstruction of concrete river embankments, and compensation packages for farmers suffering crop salinization [S2][S5].",
+    sourceAssessment: "High-confidence data validated by IMD meteorological tracks, Government of West Bengal loss audits, and WMO climate reports.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 2020,
+    numericCasualties: 98,
+    economicLossInrCr: 102442,
+    decade: "2020s"
+  },
+  {
+    id: "seed-2024-wayanad-landslide",
+    eventName: "2024 Wayanad Landslides",
+    disasterType: "Landslide",
+    location: "Chooralmala, Mundakkai, Meppadi and Attamala",
+    state: "Kerala",
+    country: "India",
+    eventDate: "2024-07-30T00:00:00.000Z",
+    dateRange: "30 July 2024 (01:00 - 04:10 IST)",
+    reportedCasualties: "420+ fatalities confirmed and recovered; over 150 missing; 397 people injured [S1][S2][S4].",
+    reportedDamage: "Entire villages of Mundakkai and Chooralmala buried under 15-30 feet of mud, boulders, and tree trunks; 1,500+ buildings leveled [S2][S3].",
+    sources: [
+      { id: "S1", title: "Preliminary Geotechnical and Remote Sensing Investigation of Wayanad Debris Flow", publisher: "Geological Survey of India (GSI) & ISRO NRSC", publishedAt: "2024-08-05", url: "https://www.gsi.gov.in", summary: "Heavy precipitation of 572 mm in 48 hours triggered a catastrophic 8 km long debris flow from the slopes of Vellarimala (altitude 1,550m) through Mundakkai and Chooralmala." },
+      { id: "S2", title: "Wayanad Landslides Disaster Report and Rescue Operations", publisher: "Kerala State Disaster Management Authority (KSDMA)", publishedAt: "2024-08-15", url: "https://sdma.kerala.gov.in", summary: "Official search and rescue registry documented 420+ recovered bodies and body parts; 2,500 people evacuated to 17 relief camps." },
+      { id: "S3", title: "Impact Assessment of the Mundakkai-Chooralmala Catastrophe", publisher: "State Disaster Management Department & Revenue Dept", publishedAt: "2024-08-20", url: "https://kerala.gov.in", summary: "Direct infrastructure loss estimated at \u20B91,200+ crore, obliterating schools, primary healthcare centers, tea estate quarters, and the Chooralmala connecting bridge." },
+      { id: "S4", title: "Indian Army Builds 190-Foot Bailey Bridge in 31 Hours at Chooralmala", publisher: "The Indian Express & Defense PRO", publishedAt: "2024-08-01", url: "https://indianexpress.com", summary: "Madras Engineer Group (MEG) of the Indian Army constructed a 190-ft Bailey Bridge in 31 hours under heavy rain, enabling heavy excavators to cross the Iruvanipuzha River to reach trapped survivors in Mundakkai." },
+      { id: "S5", title: "Ecological Vulnerability of Western Ghats Plantation Slopes", publisher: "National Institute of Disaster Management (NIDM)", publishedAt: "2024-09-01", url: "https://nidm.gov.in", summary: "Technical report on land-use changes, geotechnical slope stability, and high-resolution automated rain gauge alert thresholds in Western Ghats." }
+    ],
+    timeline: [
+      { date: "29 July 2024", event: "Record Extreme Downpour", description: "Wayanad hills received 572 mm of rain in 48 hours, completely saturating topsoil [S1].", citations: ["S1"] },
+      { date: "30 July 2024 01:15 IST", event: "First Landslide at Mundakkai", description: "Massive landslide buried sleeping estate workers and families in Mundakkai [S2][S4].", citations: ["S2", "S4"] },
+      { date: "30 July 2024 04:10 IST", event: "Second Landslide Destroys Chooralmala Bridge", description: "Second wave wiped out the main Chooralmala concrete bridge and rescue assembly center, isolating hundreds [S1][S4].", citations: ["S1", "S4"] },
+      { date: "1 August 2024 17:30 IST", event: "Army Completes Bailey Bridge", description: "Indian Army MEG engineered 190-foot Bailey Bridge in record 31 hours, opening access for heavy excavators [S4].", citations: ["S4"] }
+    ],
+    whatHappened: "In the pre-dawn hours of 30 July 2024, twin mega-landslides struck the mountainous Meppadi panchayat in Wayanad district of Kerala following 572 mm of relentless rainfall over 48 hours [S1][S2]. Originating near the crest of Vellarimala, an 8-kilometer torrent of mud, house-sized boulders, and uprooted trees cascaded down the Iruvanipuzha River gorge, obliterating the settlements of Mundakkai and Chooralmala [S1][S2][S4]. Over 420 people died in one of the deadliest landslide disasters in modern Indian history [S2].",
+    affectedAreas: "Wayanad district (Mundakkai, Chooralmala, Attamala, Meppadi, and downstream riverbeds into Nilambur in Malappuram district) [S1][S2].",
+    humanImpact: "420+ dead; over 150 missing; 397 injured; 2,500 displaced into relief camps [S2][S4].",
+    infrastructureDamage: "Over 1,500 residential and commercial structures demolished, primary schools crushed, tea processing units flattened, and the vital Chooralmala river bridge destroyed [S2][S3].",
+    economicImpact: "Direct losses estimated at \u20B91,200+ crore across private housing, plantation agriculture, ecotourism, and public roads [S3].",
+    governmentResponse: "KSDMA, NDRF (6 battalions), Indian Army (Madras Regiment and MEG), Indian Navy, Indian Air Force, and Coast Guard mounted coordinated rescue operations with canine and radar life-detector squads [S2][S4].",
+    rescueRelief: "Construction of the landmark 190-ft Bailey Bridge in 31 hours; deployment of zipping lines across raging river torrents; DNA profiling for victim identification [S4].",
+    recovery: "Comprehensive township resettlement plan announced by Govt of Kerala outside landslide-hazard zones, accompanied by high-density automated early warning rain gauges [S2][S5].",
+    sourceAssessment: "High-confidence data validated by GSI and ISRO remote sensing imagery, KSDMA ground casualty censuses, and Defense Ministry engineering records.",
+    conflictingReports: [],
+    synthesizedAt: now,
+    evidenceStatus: "High Confidence",
+    retrievalMetadata: { queriesExecuted: ["seed", "historical_catalog"], rawSourcesCount: 5, dedupedSourcesCount: 5 },
+    year: 2024,
+    numericCasualties: 420,
+    economicLossInrCr: 1200,
+    decade: "2020s"
+  }
+];
+
+// server/jobs/historicalBackfillJob.ts
+var jobLocks = /* @__PURE__ */ new Set();
+function acquireLock(key) {
+  if (jobLocks.has(key)) return false;
+  jobLocks.add(key);
+  return true;
+}
+function releaseLock(key) {
+  jobLocks.delete(key);
+}
+function slug(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 80);
+}
+async function seedHistoricalCatalog() {
+  const result = {
+    jobType: "backfill",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  const source = await resolveSource("historical-catalog");
+  for (const item of HISTORICAL_DISASTERS_CATALOG) {
+    result.recordsProcessed++;
+    try {
+      const year = item.eventDate ? new Date(item.eventDate).getUTCFullYear() : item.year;
+      const eventKey = `${slug(item.disasterType)}-${slug(item.state || item.location || "india")}-${year}-${slug(item.eventName)}`;
+      const upserted = await supabaseRest("canonical_events?on_conflict=event_key", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          event_key: eventKey,
+          title: item.eventName,
+          event_type: item.disasterType,
+          status: "ARCHIVED",
+          severity: item.evidenceStatus === "High Confidence" ? "Severe" : "Moderate",
+          urgency: "Past",
+          certainty: "Observed",
+          description: item.whatHappened,
+          instruction: item.rescueRelief || null,
+          location_name: item.location,
+          state: item.state,
+          country: item.country || "India",
+          started_at: item.eventDate,
+          last_observed_at: item.eventDate,
+          ended_at: item.eventDate,
+          archived_at: (/* @__PURE__ */ new Date()).toISOString(),
+          verification_status: "PROVISIONALLY_VERIFIED",
+          verification_score: item.evidenceStatus === "High Confidence" ? 0.88 : 0.72,
+          verification_method: "CURATED_HISTORICAL_CATALOG",
+          verification_reason: item.sourceAssessment || "Curated Indian historical disaster catalog.",
+          location_confidence: 0.8
+        })
+      });
+      let eventId = upserted?.[0]?.id;
+      if (!eventId) {
+        const existing = await supabaseRest(
+          `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+          { method: "GET" }
+        ).catch(() => []);
+        eventId = existing[0]?.id;
+      }
+      if (!eventId) {
+        result.recordsRejected++;
+        continue;
+      }
+      let observationCount = 0;
+      let firstObsId;
+      for (const citation of item.sources) {
+        const extId = `${item.id}-${citation.id}`;
+        const hash = contentHash(`${item.id}|${citation.id}|${citation.title}|${citation.url}`);
+        const observations = await supabaseRest("source_observations?on_conflict=source_id,external_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+          body: JSON.stringify({
+            source_id: source.id,
+            external_id: extId,
+            title: citation.title.slice(0, 500),
+            raw_content: citation.summary || item.whatHappened,
+            raw_payload: { catalogId: item.id, citation },
+            source_url: citation.url || null,
+            publisher: citation.publisher || "Curated Historical Catalog",
+            published_at: citation.publishedAt || item.eventDate,
+            retrieved_at: (/* @__PURE__ */ new Date()).toISOString(),
+            location_text: item.location,
+            event_category: item.disasterType,
+            content_hash: hash
+          })
+        }).catch(() => []);
+        let observationId = observations?.[0]?.id;
+        if (!observationId) {
+          const existingObs = await supabaseRest(
+            `source_observations?and=(source_id.eq.${source.id},external_id.eq.${encodeURIComponent(extId)})&select=id&limit=1`,
+            { method: "GET" }
+          ).catch(() => []);
+          observationId = existingObs[0]?.id;
+        }
+        if (!observationId) continue;
+        if (!firstObsId) firstObsId = observationId;
+        observationCount++;
+        await supabaseRest("event_sources?on_conflict=event_id,source_id,source_observation_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates" },
+          body: JSON.stringify({
+            event_id: eventId,
+            source_id: source.id,
+            source_observation_id: observationId,
+            citation_id: citation.id
+          })
+        });
+        await supabaseRest("event_observations?on_conflict=event_id,observation_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates" },
+          body: JSON.stringify({
+            event_id: eventId,
+            observation_id: observationId,
+            match_score: 1,
+            relationship: "CURATED_HISTORICAL_SOURCE"
+          })
+        }).catch(() => void 0);
+      }
+      const claimsToInsert = [
+        item.reportedCasualties ? { type: "CASUALTIES", value: item.reportedCasualties } : null,
+        item.reportedDamage ? { type: "DAMAGE", value: item.reportedDamage } : null,
+        item.humanImpact ? { type: "HUMAN_IMPACT", value: item.humanImpact } : null,
+        item.infrastructureDamage ? { type: "INFRASTRUCTURE_DAMAGE", value: item.infrastructureDamage } : null,
+        item.economicImpact ? { type: "ECONOMIC_IMPACT", value: item.economicImpact } : null,
+        item.eventDate ? { type: "START_DATE", value: item.eventDate } : null,
+        item.affectedAreas ? { type: "AFFECTED_AREAS", value: item.affectedAreas } : null,
+        item.governmentResponse ? { type: "GOVERNMENT_RESPONSE", value: item.governmentResponse } : null,
+        item.rescueRelief ? { type: "RESCUE_RELIEF", value: item.rescueRelief } : null,
+        item.recovery ? { type: "RECOVERY", value: item.recovery } : null
+      ].filter(Boolean);
+      for (const claim of claimsToInsert) {
+        await supabaseRest("canonical_event_claims?on_conflict=event_id,claim_type,claim_value,source_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates" },
+          body: JSON.stringify({
+            event_id: eventId,
+            claim_type: claim.type,
+            claim_value: claim.value.slice(0, 500),
+            source_observation_id: firstObsId || null,
+            source_id: source.id,
+            confidence: 0.9,
+            verification_status: "PROVISIONALLY_VERIFIED"
+          })
+        }).catch(() => void 0);
+      }
+      const richBundleDocHash = contentHash(`rich-evidence-bundle|${eventId}`);
+      await supabaseRest("search_documents?on_conflict=document_hash", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify({
+          document_type: "external_research",
+          event_id: eventId,
+          title: "__AAPDA_RICH_EVIDENCE_BUNDLE__",
+          content: JSON.stringify({ ...item, id: eventId }),
+          source_url: item.sources[0]?.url || null,
+          document_hash: richBundleDocHash
+        })
+      }).catch(() => void 0);
+      const docId = await upsertSearchDocument({
+        documentType: "canonical_event",
+        eventId,
+        title: item.eventName,
+        content: [
+          item.whatHappened,
+          item.affectedAreas,
+          item.humanImpact,
+          item.infrastructureDamage,
+          item.governmentResponse,
+          item.sourceAssessment
+        ].filter(Boolean).join("\n\n"),
+        sourceUrl: item.sources[0]?.url || null
+      });
+      if (docId) await embedAndStoreSearchDocument(docId, `${item.eventName}. ${item.whatHappened}`);
+      if (observationCount > 0) result.recordsCreated++;
+      else result.recordsUpdated++;
+    } catch (error) {
+      result.recordsRejected++;
+      result.errorMessage = error.message;
+    }
+  }
+  if (result.recordsRejected > 0 && result.recordsCreated + result.recordsUpdated === 0) result.status = "FAILED";
+  else if (result.recordsRejected > 0) result.status = "PARTIAL";
+  return result;
+}
+async function runHistoricalBackfillJob() {
+  if (!acquireLock("backfill")) {
+    return {
+      jobType: "backfill",
+      status: "PARTIAL",
+      recordsProcessed: 0,
+      recordsCreated: 0,
+      recordsUpdated: 0,
+      recordsRejected: 0,
+      errorMessage: "A backfill run is already in progress"
+    };
+  }
+  const runId = await startJobRun("backfill");
+  const result = {
+    jobType: "backfill",
+    status: "COMPLETED",
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0
+  };
+  try {
+    if (!isSupabaseConfigured()) {
+      result.status = "FAILED";
+      result.errorMessage = "Supabase is not configured";
+      return result;
+    }
+    const phases = [
+      { name: "historical_catalog", run: seedHistoricalCatalog },
+      { name: "ingestion", run: runIngestionJob },
+      { name: "reconciliation", run: runReconciliationJob },
+      { name: "citizen_verification", run: runCitizenVerificationJob },
+      { name: "lifecycle", run: runLifecycleJob },
+      { name: "notification", run: runNotificationJob },
+      { name: "embedding", run: runEmbeddingJob }
+    ];
+    const phaseMeta = {};
+    for (const phase of phases) {
+      const phaseResult = await phase.run();
+      phaseMeta[phase.name] = {
+        status: phaseResult.status,
+        processed: phaseResult.recordsProcessed,
+        created: phaseResult.recordsCreated,
+        updated: phaseResult.recordsUpdated,
+        rejected: phaseResult.recordsRejected
+      };
+      result.recordsProcessed += phaseResult.recordsProcessed;
+      result.recordsCreated += phaseResult.recordsCreated;
+      result.recordsUpdated += phaseResult.recordsUpdated;
+      result.recordsRejected += phaseResult.recordsRejected;
+      if (phaseResult.status === "FAILED") result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || "failed"}`;
+    }
+    const failedPhases = Object.entries(phaseMeta).filter(([, meta]) => meta.status === "FAILED");
+    if (failedPhases.length === phases.length) result.status = "FAILED";
+    else if (failedPhases.length > 0 || result.errorMessage) result.status = "PARTIAL";
+  } catch (err) {
+    result.status = "FAILED";
+    result.errorMessage = err.message;
+  } finally {
+    releaseLock("backfill");
+  }
+  if (runId) await finishJobRun(runId, result, { phases: "see metadata" });
+  return result;
 }
 
 // server/routes.ts
 var router = (0, import_express.Router)();
 var upload = (0, import_multer.default)({ storage: import_multer.default.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
-warmRecentIndiaArchive(100);
-var globalSearchCounter = 0;
-var GLOBAL_SEARCH_CEILING = 150;
-var geocodeCache = /* @__PURE__ */ new Map();
-var GEOCODE_CACHE_TTL_MS = 10 * 60 * 1e3;
-function canonicalizeFilterCategory(value) {
-  if (!value) return void 0;
-  const lower = value.toLowerCase();
-  if (/all\s+hazard|^all$/.test(lower)) return void 0;
-  if (lower.includes("cyclone")) return "Cyclone";
-  if (lower.includes("flood") || lower.includes("deluge")) return "Flood";
-  if (lower.includes("earthquake")) return "Earthquake";
-  if (lower.includes("tsunami")) return "Tsunami";
-  if (lower.includes("landslide") || lower.includes("avalanche")) return "Landslide";
-  if (lower.includes("heat") || lower.includes("extreme weather")) return "Heat Wave";
-  return value;
+function readNumber(value) {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : void 0;
 }
-function canonicalizeFilterDecade(value) {
-  if (!value || /^all$/i.test(value.trim())) return void 0;
-  const match = value.match(/(19|20)\d{2}/);
-  return match ? `${match[0].slice(0, 3)}0s` : value;
+function pointWkt(longitude, latitude) {
+  return `SRID=4326;POINT(${longitude} ${latitude})`;
 }
-setInterval(() => {
-  globalSearchCounter = Math.max(0, globalSearchCounter - 20);
-}, 6e4);
-function canonicalEventToEvidenceBundle(event) {
-  const year = event.startedAt ? new Date(event.startedAt).getFullYear() : new Date(event.updatedAt).getFullYear();
+async function getEventClaims(eventId) {
+  if (!isSupabaseConfigured()) return {};
+  const rows = await supabaseRest(
+    `canonical_event_claims?event_id=eq.${encodeURIComponent(eventId)}&select=claim_type,claim_value`,
+    { method: "GET" }
+  ).catch(() => []);
+  const claims = {};
+  for (const row of rows) {
+    if (!claims[row.claim_type]) claims[row.claim_type] = [];
+    claims[row.claim_type].push(row.claim_value);
+  }
+  return claims;
+}
+function canonicalEventToEvidenceBundle(event, claims) {
   const sources = event.citations.map((citation, index) => ({
     id: citation.id || `S${index + 1}`,
     title: citation.title,
     publisher: citation.publisher || citation.sourceName,
-    publishedAt: citation.publishedAt || citation.retrievedAt || event.updatedAt,
+    publishedAt: citation.publishedAt || citation.retrievedAt || event.startedAt || event.updatedAt,
     url: citation.url || "",
     summary: citation.summary || `${citation.sourceName} reported this event.`,
-    qualityScore: event.verificationScore
+    qualityScore: Math.round(event.verificationScore * 100)
   }));
+  const sourceText = sources.map((source) => `${source.title}. ${source.summary}`).join(" ");
+  const casualtyFacts = extractSourceFacts(sources, /\b(?:\d[\d,]*(?:\s*-\s*\d[\d,]*)?\s+)?(?:dead|deaths?|killed|fatalit(?:y|ies)|injured|missing|casualt(?:y|ies)|evacuat(?:ed|ion)|displaced|affected)\b[^.;]{0,160}/gi, 3);
+  const damageFacts = extractSourceFacts(sources, /\b(?:rs\.?|₹|inr|crore|lakh|damage(?:d)?|destroyed|collapsed|washed away|houses?|roads?|bridges?|power|infrastructure|crop|loss)\b[^.;]{0,180}/gi, 3);
+  const responseFacts = extractSourceFacts(sources, /\b(?:rescue|relief|ndrf|sdrf|army|navy|government|administration|evacuat(?:ed|ion)|shelter|compensation|aid)\b[^.;]{0,180}/gi, 3);
+  const recoveryFacts = extractSourceFacts(sources, /\b(?:recovery|rehabilitation|reconstruction|restoration|relief camp|compensation|survivors?|aftermath)\b[^.;]{0,180}/gi, 3);
+  const timeline = buildTimelineFromSources(sources, event.startedAt || event.lastObservedAt || event.updatedAt);
+  const sourceCount = Math.max(event.sourceCount, sources.length);
+  const distinctPublishers = new Set(sources.map((source) => publisherKey2(source))).size;
+  const synthesizedSummary = summarizeFromSources(sources, event.description);
+  const casualties = claims?.["CASUALTIES"]?.[0] || casualtyFacts.join("; ") || extractCasualtyFallback(sourceText, sources[0]?.id) || "Casualty and human impact details documented in source citations.";
+  const damage = claims?.["DAMAGE"]?.[0] || damageFacts.join("; ") || "Damage and loss details documented in source citations.";
+  const humanImpact = claims?.["HUMAN_IMPACT"]?.[0] || claims?.["CASUALTIES"]?.[0] || casualtyFacts.join("; ") || "Human impact documented in verified citations.";
+  const infrastructureDamage = claims?.["INFRASTRUCTURE_DAMAGE"]?.[0] || claims?.["DAMAGE"]?.[0] || damageFacts.join("; ") || "Infrastructure impact documented in verified citations.";
+  const economicImpact = claims?.["ECONOMIC_IMPACT"]?.[0] || damageFacts.filter((fact) => /rs\.?|₹|inr|crore|lakh|loss/i.test(fact)).join("; ") || "";
+  const governmentResponse = claims?.["GOVERNMENT_RESPONSE"]?.[0] || responseFacts.join("; ") || event.verificationReason || "";
+  const rescueRelief = claims?.["RESCUE_RELIEF"]?.[0] || responseFacts.join("; ") || event.instruction || "";
+  const recovery = claims?.["RECOVERY"]?.[0] || (event.status === "ARCHIVED" || event.status === "ENDED" ? recoveryFacts.join("; ") : "");
+  const affectedAreas = claims?.["AFFECTED_AREAS"]?.[0] || event.locationName;
+  const eventDateFormatted = event.startedAt ? new Date(event.startedAt).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" }) : "Date unavailable";
   return {
     id: event.id,
     eventName: event.title,
@@ -2756,54 +6399,101 @@ function canonicalEventToEvidenceBundle(event) {
     state: event.state || "India",
     country: event.country,
     eventDate: event.startedAt,
-    dateRange: event.startedAt ? new Date(event.startedAt).toLocaleDateString("en-IN") : "Date unavailable",
-    numericCasualtiesRange: void 0,
-    reportedCasualties: "Details were not clearly quantified in the verified database record.",
-    reportedDamage: "Details were not clearly quantified in the verified database record.",
+    dateRange: eventDateFormatted,
+    reportedCasualties: casualties,
+    reportedDamage: damage,
     sources,
-    timeline: [
-      {
-        date: event.lastObservedAt || event.updatedAt,
-        event: event.status,
-        description: event.description,
-        citations: sources.map((source) => source.id)
-      }
-    ],
-    whatHappened: event.description,
-    affectedAreas: event.locationName,
-    humanImpact: "Refer to source citations for confirmed public impact details.",
-    infrastructureDamage: "Refer to source citations for confirmed infrastructure impact details.",
-    economicImpact: "Refer to source citations for confirmed economic impact details.",
-    governmentResponse: event.verificationReason,
-    rescueRelief: event.instruction || "No verified instruction was attached to this record.",
-    recovery: event.status === "ARCHIVED" || event.status === "ENDED" ? "Event is available in the historical archive." : "Event remains active or developing.",
-    sourceAssessment: `${event.verificationStatus} via ${event.verificationMethod}. Verification score ${Math.round(event.verificationScore * 100)}%.`,
+    timeline,
+    whatHappened: synthesizedSummary,
+    affectedAreas,
+    humanImpact,
+    infrastructureDamage,
+    economicImpact,
+    governmentResponse,
+    rescueRelief,
+    recovery,
+    sourceAssessment: `${event.verificationStatus} via ${event.verificationMethod}. Verification score ${Math.round(event.verificationScore * 100)}%. Coverage: ${sourceCount} source(s), ${distinctPublishers} distinct publisher(s), ${timeline.length} timeline milestone(s).`,
     conflictingReports: [],
     synthesizedAt: event.updatedAt,
     evidenceStatus: event.verificationScore >= 0.8 ? "High Confidence" : event.verificationScore >= 0.55 ? "Moderate Evidence" : "Limited Coverage",
     retrievalMetadata: {
       queriesExecuted: ["canonical_events"],
-      rawSourcesCount: event.sourceCount,
-      dedupedSourcesCount: event.sourceCount
-    },
-    year: Number.isFinite(year) ? year : (/* @__PURE__ */ new Date()).getFullYear(),
-    numericCasualties: 0,
-    decade: Number.isFinite(year) ? `${String(Math.floor(year / 10) * 10)}s` : "2020s"
+      rawSourcesCount: sourceCount,
+      dedupedSourcesCount: sourceCount
+    }
   };
 }
-function pointWkt(longitude, latitude) {
-  return `SRID=4326;POINT(${longitude} ${latitude})`;
+function publisherKey2(source) {
+  const publisher = String(source.publisher || "").toLowerCase().replace(/^www\./, "").trim();
+  if (publisher) return publisher;
+  try {
+    return source.url ? new URL(source.url).hostname.replace(/^www\./, "") : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
-function readNumber(value) {
-  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-  return Number.isFinite(parsed) ? parsed : void 0;
+function cleanSnippet(value) {
+  return value.replace(/\s+/g, " ").replace(/\s+([,.;:])/g, "$1").trim().replace(/^[-:;,\s]+/, "").slice(0, 260);
 }
-async function getOwnedProfile(userId) {
-  const profiles = await supabaseRest(
-    `profiles?id=eq.${encodeURIComponent(userId)}&select=id,name,email,role,created_at,updated_at&limit=1`,
-    { method: "GET" }
-  );
-  return profiles[0] || null;
+function extractSourceFacts(sources, pattern, maxFacts) {
+  const facts = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const source of sources) {
+    const text = `${source.title}. ${source.summary}`;
+    pattern.lastIndex = 0;
+    const matches = Array.from(text.matchAll(pattern));
+    for (const match of matches) {
+      const snippet = cleanSnippet(match[0]);
+      if (snippet.length < 12) continue;
+      const normalized = snippet.toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      facts.push(`[${source.id}] ${snippet}`);
+      if (facts.length >= maxFacts) return facts;
+    }
+  }
+  return facts;
+}
+function extractCasualtyFallback(text, sourceId) {
+  const match = text.match(/\b\d[\d,]*(?:\s*-\s*\d[\d,]*)?\s+(?:people\s+)?(?:dead|deaths?|killed|injured|missing|casualt(?:y|ies)|affected)\b[^.;]{0,80}/i);
+  return match ? `${sourceId ? `[${sourceId}] ` : ""}${cleanSnippet(match[0])}` : "";
+}
+function summarizeFromSources(sources, fallback) {
+  const fragments = sources.slice(0, 5).map((source) => {
+    const summary = cleanSnippet(source.summary || source.title);
+    return summary ? `${summary} [${source.id}]` : "";
+  }).filter(Boolean);
+  return fragments.length ? fragments.join(" ") : fallback;
+}
+function buildTimelineFromSources(sources, fallbackDate) {
+  const fallbackParsed = Date.parse(fallbackDate);
+  return sources.map((source, index) => {
+    const parsed = Date.parse(source.publishedAt);
+    const isHistoricalYear = Number.isFinite(parsed) && new Date(parsed).getUTCFullYear() < 2026;
+    let date = source.publishedAt;
+    if (Number.isFinite(parsed)) {
+      date = new Date(parsed).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+    } else if (fallbackDate) {
+      date = Number.isFinite(fallbackParsed) ? new Date(fallbackParsed).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : fallbackDate;
+    }
+    return {
+      date,
+      event: cleanSnippet(source.title).slice(0, 120) || `Milestone ${index + 1}`,
+      description: `${cleanSnippet(source.summary || source.title)} [${source.id}]`,
+      citations: [source.id],
+      sortTime: isHistoricalYear ? parsed : Number.isFinite(fallbackParsed) ? fallbackParsed + index : Number.MAX_SAFE_INTEGER
+    };
+  }).filter((step) => step.description.length > 8).sort((a, b) => a.sortTime - b.sortTime).slice(0, 12).map(({ sortTime: _sortTime, ...step }) => step);
+}
+function queryMatchesBundle(query, bundle) {
+  const lower = query.toLowerCase();
+  const text = `${bundle.eventName} ${bundle.disasterType} ${bundle.location} ${bundle.state}`.toLowerCase();
+  const disasterTypes = ["cyclone", "flood", "earthquake", "landslide", "tsunami", "lightning", "thunderstorm", "heat"];
+  const requestedType = disasterTypes.find((type) => lower.includes(type));
+  if (requestedType && !text.includes(requestedType)) return false;
+  const stop = /* @__PURE__ */ new Set(["what", "happened", "during", "tell", "about", "india", "indian", "disaster"]);
+  const important = lower.split(/[^a-z0-9]+/).filter((token) => token.length >= 4 && !stop.has(token) && token !== requestedType);
+  return important.length === 0 || important.some((token) => text.includes(token));
 }
 router.get("/events/active", async (_req, res) => {
   try {
@@ -2811,225 +6501,549 @@ router.get("/events/active", async (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=60");
     res.json(result);
   } catch (error) {
-    res.status(500).json({
-      error: "Failed to retrieve active canonical events",
-      details: error.message
-    });
+    sendError(res, error);
   }
 });
-router.get("/profile", requireAuth, async (req, res) => {
+router.get("/events/nearby", async (req, res) => {
   try {
-    const profile = await getOwnedProfile(req.user.id);
-    const locations = await supabaseRest(
-      `user_locations?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,location_type,label,city,district,state,country,accuracy_meters,created_at,updated_at&order=created_at.desc`,
-      { method: "GET" }
-    );
-    const subscriptions = await supabaseRest(
-      `subscriptions?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,email_enabled,sms_enabled,push_enabled,nearby_radius_km,severity_threshold,created_at,updated_at&limit=1`,
-      { method: "GET" }
-    );
-    res.json({ profile, locations, subscription: subscriptions[0] || null });
+    const lat = readNumber(req.query.lat);
+    const lng = readNumber(req.query.lng);
+    const radiusKm = readNumber(req.query.radiusKm) ?? 50;
+    if (lat === void 0 || lng === void 0) {
+      throw badRequest("lat and lng query parameters are required");
+    }
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      throw badRequest("lat and lng must be valid WGS84 coordinates");
+    }
+    if (!isSupabaseConfigured()) throw unavailable("Database not configured");
+    const events = await nearbyEvents(lat, lng, radiusKm);
+    res.setHeader("Cache-Control", "public, max-age=30");
+    res.json({ events, count: events.length });
   } catch (error) {
-    res.status(500).json({ error: "Failed to load profile", details: error.message });
+    sendError(res, error);
   }
 });
-router.post("/profile/setup", requireAuth, async (req, res) => {
+router.get("/events/:id", async (req, res) => {
   try {
-    const name = typeof req.body.name === "string" ? req.body.name.trim() : "";
-    if (!name) return res.status(400).json({ error: "Name is required" });
-    const rows = await supabaseRest(
-      "profiles?on_conflict=id",
-      {
+    if (!isSupabaseConfigured()) throw unavailable("Database not configured");
+    const event = await getCanonicalEventById(req.params.id);
+    if (!event) throw notFound("Event not found or not publicly visible");
+    const citations = await getEventCitations(req.params.id);
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.json({ event, citations });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/events/:id/sources", async (req, res) => {
+  try {
+    if (!isSupabaseConfigured()) throw unavailable("Database not configured");
+    const citations = await getEventCitations(req.params.id);
+    res.json({ sources: citations });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/events/:id/timeline", async (req, res) => {
+  try {
+    if (!isSupabaseConfigured()) throw unavailable("Database not configured");
+    const timeline = await getEventTimeline(req.params.id);
+    res.json({ timeline });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+function normalizeSearchQuery(query) {
+  return query.trim().toLowerCase().replace(/\s+/g, " ");
+}
+function persistenceSucceeded(p) {
+  return Boolean(p && p.eventId && p.observationsPersisted > 0 && p.errors.length === 0);
+}
+async function persistRichEvidenceBundle(eventId, bundle) {
+  if (!eventId || !isSupabaseConfigured()) return;
+  const storedBundle = { ...bundle, id: eventId };
+  const now2 = (/* @__PURE__ */ new Date()).toISOString();
+  const documentHash = contentHash(`rich-evidence-bundle|${eventId}`);
+  await supabaseRest(`canonical_events?id=eq.${eventId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      title: bundle.eventName,
+      event_type: bundle.disasterType || "Cyclone",
+      status: "ARCHIVED",
+      description: bundle.whatHappened,
+      location_name: bundle.location || "India",
+      state: bundle.state || null,
+      started_at: bundle.eventDate || null,
+      last_observed_at: bundle.eventDate || null,
+      ended_at: bundle.eventDate || null,
+      verification_status: "PROVISIONALLY_VERIFIED",
+      verification_score: 0.88,
+      verification_method: "AI_SYNTHESIZED_GROUNDED_RESEARCH",
+      verification_reason: bundle.sourceAssessment || "Multi-source grounded historical synthesis."
+    })
+  }).catch(() => void 0);
+  const source = await resolveSource("google-news-rss");
+  const claims = [
+    bundle.reportedCasualties ? { type: "CASUALTIES", value: bundle.reportedCasualties } : null,
+    bundle.reportedDamage ? { type: "DAMAGE", value: bundle.reportedDamage } : null,
+    bundle.humanImpact ? { type: "HUMAN_IMPACT", value: bundle.humanImpact } : null,
+    bundle.infrastructureDamage ? { type: "INFRASTRUCTURE_DAMAGE", value: bundle.infrastructureDamage } : null,
+    bundle.economicImpact ? { type: "ECONOMIC_IMPACT", value: bundle.economicImpact } : null,
+    bundle.eventDate ? { type: "START_DATE", value: bundle.eventDate } : null,
+    bundle.affectedAreas ? { type: "AFFECTED_AREAS", value: bundle.affectedAreas } : null,
+    bundle.governmentResponse ? { type: "GOVERNMENT_RESPONSE", value: bundle.governmentResponse } : null,
+    bundle.rescueRelief ? { type: "RESCUE_RELIEF", value: bundle.rescueRelief } : null,
+    bundle.recovery ? { type: "RECOVERY", value: bundle.recovery } : null
+  ].filter(Boolean);
+  for (const claim of claims) {
+    await supabaseRest("canonical_event_claims?on_conflict=event_id,claim_type,claim_value,source_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates" },
+      body: JSON.stringify({
+        event_id: eventId,
+        claim_type: claim.type,
+        claim_value: claim.value.slice(0, 500),
+        source_id: source.id,
+        confidence: 0.88,
+        verification_status: "PROVISIONALLY_VERIFIED"
+      })
+    }).catch(() => void 0);
+  }
+  for (const citation of bundle.sources || []) {
+    const extId = `research-${contentHash(`${eventId}-${citation.id}-${citation.url || citation.title}`).slice(0, 32)}`;
+    const hash = contentHash(`${citation.title}|${citation.summary}|${citation.url || ""}`);
+    const obs = await supabaseRest("source_observations?on_conflict=source_id,external_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify({
+        source_id: source.id,
+        external_id: extId,
+        title: citation.title.slice(0, 500),
+        raw_content: citation.summary || bundle.whatHappened,
+        source_url: citation.url || null,
+        publisher: citation.publisher || "Media Source",
+        publishedAt: citation.publishedAt || bundle.eventDate || now2,
+        retrieved_at: now2,
+        event_category: bundle.disasterType || "General Alert",
+        content_hash: hash
+      })
+    }).catch(() => []);
+    const obsId = obs?.[0]?.id;
+    if (obsId) {
+      await supabaseRest("event_sources?on_conflict=event_id,source_id,source_observation_id", {
+        method: "POST",
+        headers: { Prefer: "resolution=ignore-duplicates" },
+        body: JSON.stringify({
+          event_id: eventId,
+          source_id: source.id,
+          source_observation_id: obsId,
+          citation_id: citation.id
+        })
+      }).catch(() => void 0);
+    }
+  }
+  await supabaseRest("search_documents?on_conflict=document_hash", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify({
+      document_type: "external_research",
+      event_id: eventId,
+      title: RICH_BUNDLE_DOCUMENT_TITLE,
+      content: JSON.stringify(storedBundle),
+      source_url: storedBundle.sources?.[0]?.url || null,
+      document_hash: documentHash
+    })
+  }).catch(() => void 0);
+  const docId = await upsertSearchDocument({
+    documentType: "canonical_event",
+    eventId,
+    title: bundle.eventName,
+    content: [
+      bundle.whatHappened,
+      bundle.affectedAreas,
+      bundle.humanImpact,
+      bundle.infrastructureDamage,
+      bundle.governmentResponse,
+      bundle.sourceAssessment
+    ].filter(Boolean).join("\n\n"),
+    sourceUrl: bundle.sources?.[0]?.url || null
+  });
+  if (docId) await embedAndStoreSearchDocument(docId, `${bundle.eventName}. ${bundle.whatHappened}`).catch(() => void 0);
+}
+async function getPersistedEvidenceBundle(eventId) {
+  if (!isSupabaseConfigured()) return null;
+  const rows = await supabaseRest(
+    `search_documents?event_id=eq.${eventId}&document_type=eq.external_research&title=eq.${encodeURIComponent(RICH_BUNDLE_DOCUMENT_TITLE)}&select=content&limit=1`,
+    { method: "GET" }
+  ).catch(() => []);
+  const raw = rows[0]?.content;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed?.eventName || !Array.isArray(parsed.sources)) return null;
+    return { ...parsed, id: eventId };
+  } catch {
+    return null;
+  }
+}
+async function bundleForCanonicalEvent(event) {
+  const stored = await getPersistedEvidenceBundle(event.id);
+  if (stored) return stored;
+  const claims = await getEventClaims(event.id);
+  return canonicalEventToEvidenceBundle(event, claims);
+}
+async function persistExternalResearch(query, bundle) {
+  if (!isSupabaseConfigured()) return;
+  const locations = bundle.location || "India";
+  const now2 = (/* @__PURE__ */ new Date()).toISOString();
+  const eventKey = `research-${contentHash(`${bundle.eventName}|${locations}|${bundle.eventDate || ""}`).slice(0, 32)}`;
+  try {
+    const existing = await supabaseRest(
+      `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+      { method: "GET" }
+    ).catch(() => []);
+    let eventId = existing[0]?.id;
+    if (!eventId) {
+      const rows = await supabaseRest("canonical_events?on_conflict=event_key", {
         method: "POST",
         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
         body: JSON.stringify({
-          id: req.user.id,
-          name,
-          email: req.user.email || "",
-          role: "user",
-          updated_at: (/* @__PURE__ */ new Date()).toISOString()
-        })
-      }
-    );
-    res.status(201).json({ profile: rows[0] || null });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to initialize profile", details: error.message });
-  }
-});
-router.post("/profile/home-location", requireAuth, async (req, res) => {
-  try {
-    const latitude = readNumber(req.body.latitude);
-    const longitude = readNumber(req.body.longitude);
-    if (latitude === void 0 || longitude === void 0) {
-      return res.status(400).json({ error: "Coordinates are required for a saved home location" });
-    }
-    const rows = await supabaseRest(
-      "user_locations",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          user_id: req.user.id,
-          location_type: "HOME",
-          label: typeof req.body.label === "string" ? req.body.label : "Home",
-          geometry: pointWkt(longitude, latitude),
-          city: typeof req.body.city === "string" ? req.body.city : null,
-          state: typeof req.body.state === "string" ? req.body.state : null,
+          event_key: eventKey,
+          title: (bundle.eventName || query).slice(0, 500),
+          event_type: bundle.disasterType || "General Alert",
+          status: "ARCHIVED",
+          severity: "Unknown",
+          urgency: "Past",
+          certainty: "Observed",
+          description: (bundle.whatHappened || "").slice(0, 5e3),
+          location_name: locations.slice(0, 500),
+          state: bundle.state || null,
           country: "India",
-          accuracy_meters: readNumber(req.body.accuracyMeters)
+          started_at: bundle.eventDate || null,
+          last_observed_at: bundle.eventDate || null,
+          verification_status: "PROVISIONALLY_VERIFIED",
+          verification_score: 0.6,
+          verification_method: "EXTERNAL_RESEARCH_PERSIST",
+          verification_reason: "Persisted from universal search external research with validated citations.",
+          location_confidence: 0.5
         })
-      }
-    );
-    res.status(201).json({ location: rows[0] || null });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to save home location", details: error.message });
-  }
-});
-router.patch("/profile", requireAuth, async (req, res) => {
-  try {
-    const name = typeof req.body.name === "string" ? req.body.name.trim() : "";
-    if (!name) return res.status(400).json({ error: "Name is required" });
-    const updated = await supabaseRest(
-      `profiles?id=eq.${encodeURIComponent(req.user.id)}`,
-      { method: "PATCH", body: JSON.stringify({ name, updated_at: (/* @__PURE__ */ new Date()).toISOString() }) }
-    );
-    res.json({ profile: updated[0] || null });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to update profile", details: error.message });
-  }
-});
-router.patch("/subscriptions", requireAuth, async (req, res) => {
-  try {
-    const payload = {
-      user_id: req.user.id,
-      email_enabled: Boolean(req.body.emailEnabled),
-      sms_enabled: Boolean(req.body.smsEnabled),
-      push_enabled: Boolean(req.body.pushEnabled),
-      nearby_radius_km: readNumber(req.body.nearbyRadiusKm) || 50,
-      severity_threshold: typeof req.body.severityThreshold === "string" ? req.body.severityThreshold : "Moderate",
-      updated_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    const rows = await supabaseRest(
-      "subscriptions?on_conflict=user_id",
-      {
-        method: "POST",
-        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-        body: JSON.stringify(payload)
-      }
-    );
-    res.json({ subscription: rows[0] || null });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to update subscriptions", details: error.message });
-  }
-});
-router.post("/reports", requireAuth, async (req, res) => {
-  try {
-    const reportText = typeof req.body.reportText === "string" ? req.body.reportText.trim() : "";
-    const latitude = readNumber(req.body.latitude);
-    const longitude = readNumber(req.body.longitude);
-    const accuracyMeters = readNumber(req.body.accuracyMeters);
-    const maxAccuracy = Number(process.env.REPORT_MAX_ACCURACY_METERS || 150);
-    if (!reportText) return res.status(400).json({ error: "Report text is required" });
-    if (latitude === void 0 || longitude === void 0 || accuracyMeters === void 0) {
-      return res.status(400).json({ error: "Current browser coordinates and accuracy are required" });
+      }).catch(() => []);
+      eventId = rows[0]?.id;
     }
-    if (accuracyMeters > maxAccuracy) {
-      return res.status(422).json({ error: `Location accuracy must be ${maxAccuracy} meters or better` });
+    if (!eventId) {
+      const existingAfter = await supabaseRest(
+        `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+        { method: "GET" }
+      ).catch(() => []);
+      eventId = existingAfter[0]?.id;
     }
-    const rows = await supabaseRest(
-      "citizen_reports",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          user_id: req.user.id,
-          report_text: reportText,
-          geometry: pointWkt(longitude, latitude),
-          accuracy_meters: accuracyMeters,
-          reported_category: typeof req.body.category === "string" ? req.body.category : null,
-          status: "PENDING",
-          verification_score: 0,
-          verification_reason: "Awaiting cross-source verification"
-        })
+    if (!eventId) return;
+    const newsSource = await resolveSource("google-news-rss");
+    for (const source of bundle.sources.slice(0, 5)) {
+      const observationHash = contentHash(`${source.title}
+${source.summary}`);
+      const existingObs = await supabaseRest(
+        `source_observations?and=(source_id.eq.${newsSource.id},content_hash.eq.${observationHash})&select=id&limit=1`,
+        { method: "GET" }
+      ).catch(() => []);
+      let observationId = existingObs[0]?.id;
+      if (!observationId) {
+        const observationRows = await supabaseRest("source_observations?on_conflict=source_id,content_hash", {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+          body: JSON.stringify({
+            source_id: newsSource.id,
+            external_id: `research-${observationHash.slice(0, 40)}`,
+            title: (source.title || "").slice(0, 500),
+            raw_content: (source.summary || "").slice(0, 8e3),
+            source_url: (source.url || "").slice(0, 2e3) || null,
+            publisher: (source.publisher || "Unknown").slice(0, 200),
+            published_at: source.publishedAt || now2,
+            retrieved_at: now2,
+            event_category: bundle.disasterType || "General Alert",
+            content_hash: observationHash
+          })
+        }).catch(() => []);
+        observationId = observationRows?.[0]?.id;
       }
-    );
-    res.status(201).json({ report: rows[0] || null });
+      if (observationId) {
+        await supabaseRest("event_sources?on_conflict=event_id,source_id,source_observation_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=ignore-duplicates" },
+          body: JSON.stringify({ event_id: eventId, source_id: newsSource.id, source_observation_id: observationId })
+        }).catch(() => void 0);
+        await upsertSearchDocument({
+          documentType: "external_research",
+          eventId,
+          observationId,
+          title: source.title || query,
+          content: source.summary || "",
+          sourceUrl: source.url || null
+        });
+      }
+    }
+    const eventDocId = await upsertSearchDocument({
+      documentType: "canonical_event",
+      eventId,
+      title: bundle.eventName || query,
+      content: `${bundle.disasterType}. ${locations}. ${bundle.whatHappened}`.slice(0, 4e3),
+      sourceUrl: bundle.sources[0]?.url || null
+    });
+    if (eventDocId) {
+      await embedAndStoreSearchDocument(eventDocId, `${bundle.eventName}. ${bundle.whatHappened}`);
+    }
+    await persistRichEvidenceBundle(eventId, bundle);
   } catch (error) {
-    res.status(500).json({ error: "Failed to submit citizen report", details: error.message });
+    console.error("[search:persist] external research persistence failed:", error.message);
+  }
+}
+router.post("/search", async (req, res) => {
+  try {
+    const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
+    if (!query) throw badRequest("Query is required");
+    if (query.length > 300) throw badRequest("Query is too long (max 300 characters)");
+    rateLimit(req, "search", 30, 6e4);
+    const normalizedQuery = normalizeSearchQuery(query);
+    const cacheKey = `search:${normalizedQuery}`;
+    const cached = cache.get("search", cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "private, max-age=60");
+      res.json(cached);
+      return;
+    }
+    const [lexicalDocs, canonicalMatches] = await Promise.all([
+      lexicalSearch(query, 12),
+      searchCanonicalEventsLexical(query, 20)
+    ]);
+    if (canonicalMatches.length > 0) {
+      const results = await Promise.all(canonicalMatches.slice(0, 10).map(bundleForCanonicalEvent));
+      const response2 = {
+        results,
+        source: "database",
+        provenance: "lexical"
+      };
+      cache.set("search", cacheKey, response2, cache.getTTL("search"));
+      res.json(response2);
+      return;
+    }
+    if (lexicalDocs.length > 0) {
+      const eventIds = Array.from(new Set(lexicalDocs.map((doc) => doc.event_id).filter((id) => Boolean(id))));
+      if (eventIds.length > 0) {
+        const rows = await supabaseRest(
+          `past_canonical_events?id=in.(${eventIds.join(",")})&select=*&verification_status=in.(OFFICIAL_VERIFIED,CROSS_SOURCE_VERIFIED,PROVISIONALLY_VERIFIED)&limit=10`,
+          { method: "GET" }
+        ).catch(() => []);
+        if (rows.length > 0) {
+          const response2 = { results: await Promise.all(rows.map(bundleForCanonicalEvent)), source: "database", provenance: "lexical_documents" };
+          cache.set("search", cacheKey, response2, cache.getTTL("search"));
+          res.json(response2);
+          return;
+        }
+      }
+    }
+    if (isEmbeddingAvailable()) {
+      const vectorHits = await vectorEventSearch(query, 10, 0.35);
+      if (vectorHits.length > 0) {
+        const ids = vectorHits.map((hit) => hit.event_id);
+        const rows = await supabaseRest(
+          `past_canonical_events?id=in.(${ids.join(",")})&select=*&verification_status=in.(OFFICIAL_VERIFIED,CROSS_SOURCE_VERIFIED,PROVISIONALLY_VERIFIED)&limit=10`,
+          { method: "GET" }
+        ).catch(() => []);
+        if (rows.length > 0) {
+          const response2 = { results: await Promise.all(rows.map(bundleForCanonicalEvent)), source: "database", provenance: "vector" };
+          cache.set("search", cacheKey, response2, cache.getTTL("search"));
+          res.json(response2);
+          return;
+        }
+        const docHits = await vectorDocumentSearch(query, 8, 0.35);
+        if (docHits.length > 0) {
+          const response2 = {
+            results: docHits.slice(0, 5).map((doc) => ({
+              id: doc.doc_id,
+              eventName: doc.title,
+              disasterType: "General Alert",
+              location: "India",
+              state: "India",
+              country: "India",
+              dateRange: "Retrieved document",
+              reportedCasualties: "",
+              reportedDamage: "",
+              sources: [{
+                id: "S1",
+                title: doc.title,
+                publisher: "Aapda Drishti Search Corpus",
+                publishedAt: (/* @__PURE__ */ new Date()).toISOString(),
+                url: doc.source_url || "",
+                summary: (doc.content || "").slice(0, 400)
+              }],
+              timeline: [],
+              whatHappened: (doc.content || "").slice(0, 1200),
+              affectedAreas: "",
+              humanImpact: "",
+              infrastructureDamage: "",
+              economicImpact: "",
+              governmentResponse: "",
+              rescueRelief: "",
+              recovery: "",
+              sourceAssessment: `Vector similarity ${(doc.similarity * 100).toFixed(0)}% from the search document corpus.`,
+              conflictingReports: [],
+              synthesizedAt: (/* @__PURE__ */ new Date()).toISOString(),
+              evidenceStatus: "Limited Coverage",
+              retrievalMetadata: { queriesExecuted: ["match_documents"], rawSourcesCount: docHits.length, dedupedSourcesCount: docHits.length }
+            })),
+            source: "database",
+            provenance: "vector_documents"
+          };
+          cache.set("search", cacheKey, response2, cache.getTTL("search"));
+          res.json(response2);
+          return;
+        }
+      }
+    }
+    const bundle = await buildHistoricalEvidenceBundle(query);
+    await persistExternalResearch(query, bundle);
+    const response = { results: [bundle], source: "external_research", provenance: "external" };
+    cache.set("search", cacheKey, response, cache.getTTL("search"));
+    res.json(response);
+  } catch (error) {
+    if (error instanceof Error && /no live google news sources|insufficient relevant historical evidence/i.test(error.message)) {
+      res.json({ results: [], source: "none", provenance: "none", message: "No verified information was found for this query." });
+      return;
+    }
+    sendError(res, error);
   }
 });
-router.get("/reports/mine", requireAuth, async (req, res) => {
+router.get("/past/archive", async (req, res) => {
   try {
-    const reports = await supabaseRest(
-      `citizen_reports?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,report_text,accuracy_meters,reported_category,reported_at,status,verification_score,verification_reason,linked_event_id,created_at&order=reported_at.desc`,
-      { method: "GET" }
-    );
-    res.json({ reports });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to load reports", details: error.message });
-  }
-});
-router.get("/notifications", requireAuth, async (req, res) => {
-  try {
-    const notifications = await supabaseRest(
-      `notifications?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,event_id,channel,status,reason,sent_at,created_at&order=created_at.desc`,
-      { method: "GET" }
-    );
-    res.json({ notifications });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to load notifications", details: error.message });
-  }
-});
-router.get("/admin/events", requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const events = await supabaseRest("canonical_events?select=id,title,event_type,status,severity,verification_status,verification_score,updated_at&order=updated_at.desc&limit=100", { method: "GET" });
-    res.json({ events });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to load admin events", details: error.message });
-  }
-});
-router.get("/admin/reports", requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const reports = await supabaseRest("citizen_reports?select=id,user_id,report_text,reported_category,status,verification_score,verification_reason,reported_at&order=reported_at.desc&limit=100", { method: "GET" });
-    res.json({ reports });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to load admin reports", details: error.message });
-  }
-});
-router.get("/admin/sources", requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const sources = await supabaseRest("source_definitions?select=id,name,source_type,enabled,priority,trust_weight,last_success_at,last_failure_at,health_status&order=name.asc", { method: "GET" });
-    res.json({ sources });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to load admin sources", details: error.message });
-  }
-});
-router.get("/admin/jobs", requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const jobs = await supabaseRest("job_runs?select=id,job_type,started_at,finished_at,status,records_processed,records_created,records_updated,records_rejected,error_message&order=started_at.desc&limit=100", { method: "GET" });
-    res.json({ jobs });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to load admin jobs", details: error.message });
-  }
-});
-router.post("/transcribe", upload.single("file"), async (req, res) => {
-  try {
-    if (!isGroqConfigured()) {
-      return res.status(503).json({
-        error: "Groq is not configured on the server",
-        details: "Set GROQ_API_KEY in the server environment and restart the app."
+    if (!isSupabaseConfigured()) throw unavailable("Database not configured");
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 200);
+    const archive = await listArchivedCanonicalEvents(limit);
+    const items = await Promise.all(archive.items.map(bundleForCanonicalEvent));
+    const category = typeof req.query.category === "string" && !/^all/i.test(req.query.category) ? req.query.category : void 0;
+    const state = typeof req.query.state === "string" && !/^all/i.test(req.query.state) ? req.query.state : void 0;
+    const decade = typeof req.query.decade === "string" && !/^all/i.test(req.query.decade) ? req.query.decade : void 0;
+    let filtered = items;
+    if (category) filtered = filtered.filter((item) => item.disasterType === category);
+    if (state) filtered = filtered.filter((item) => item.state.toLowerCase() === state.toLowerCase());
+    if (decade) {
+      filtered = filtered.filter((item) => {
+        const year = item.eventDate ? new Date(item.eventDate).getFullYear() : NaN;
+        const itemDecade = Number.isFinite(year) ? `${String(Math.floor(year / 10) * 10)}s` : "";
+        return itemDecade === decade;
       });
     }
-    const audioBase64 = typeof req.body.audioBase64 === "string" ? req.body.audioBase64 : void 0;
-    const mimeType = typeof req.body.mimeType === "string" ? req.body.mimeType : req.file?.mimetype;
-    if (!req.file?.buffer && !audioBase64) {
-      return res.status(400).json({ error: "Audio data is required for transcription" });
-    }
-    const transcription = await transcribeAudio(req.file?.buffer || audioBase64, mimeType || "audio/webm");
-    res.json({ text: transcription.text, sourceText: transcription.text, success: true });
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.json({ items: filtered, count: filtered.length, retrievedAt: archive.retrievedAt, cacheStatus: archive.cacheStatus });
   } catch (error) {
-    res.status(500).json({
-      error: "Audio transcription failed",
-      details: error.message
+    sendError(res, error);
+  }
+});
+router.post("/past/search", async (req, res) => {
+  try {
+    const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
+    if (!query) throw badRequest("Query parameter is required");
+    rateLimit(req, "past-search", 20, 6e4);
+    const forceResearch = req.body?.forceResearch === true;
+    const research = await researchHistoricalDisaster(query, { historical: true, forceResearch });
+    if (research.source === "database" && research.event?.id) {
+      const dto = await getCanonicalEventById(research.event.id);
+      if (dto) {
+        const bundle = await bundleForCanonicalEvent(dto);
+        if (queryMatchesBundle(query, bundle)) {
+          res.setHeader("Cache-Control", "private, max-age=900");
+          res.json({ bundle, source: "database", retrieval: research.retrieval });
+          return;
+        }
+      }
+    }
+    if (research.source === "none") {
+      res.json({
+        bundle: null,
+        noResults: true,
+        error: null,
+        details: "No sufficiently reliable evidence was available from the database or external sources.",
+        retrieval: research.retrieval
+      });
+      return;
+    }
+    const evidenceBundle = await buildHistoricalEvidenceBundle(query);
+    const eventId = research.persistence?.eventId || research.event?.id || null;
+    if (eventId) await persistRichEvidenceBundle(eventId, evidenceBundle).catch((error) => {
+      console.error("[past:search] rich dossier persistence failed:", error.message);
     });
+    res.json({
+      bundle: eventId ? { ...evidenceBundle, id: eventId } : evidenceBundle,
+      source: "multi_source_research",
+      event: research.event,
+      citations: research.citations,
+      verification: research.verification,
+      retrieval: research.retrieval,
+      persistence: {
+        succeeded: persistenceSucceeded(research.persistence),
+        eventId: research.persistence?.eventId || null,
+        observationsPersisted: research.persistence?.observationsPersisted || 0,
+        embedded: research.persistence?.embedded || false,
+        errors: research.persistence?.errors || []
+      }
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/past/compare", async (req, res) => {
+  try {
+    const bundles = req.body?.bundles;
+    if (!Array.isArray(bundles) || bundles.length < 2 || bundles.length > 4) {
+      throw badRequest("Select between 2 and 4 events to compare");
+    }
+    res.json(await compareDisasterEvents(bundles));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/past/chat", async (req, res) => {
+  try {
+    const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    if (!message) throw badRequest("Message is required");
+    if (message.length > 2e3) throw badRequest("Message is too long (max 2000 characters)");
+    rateLimit(req, "chat", 20, 6e4);
+    const moderation = moderateChatInput(message);
+    if (!moderation.allowed) {
+      res.status(422).json({
+        success: false,
+        error: { code: "CHAT_INPUT_BLOCKED", message: "Please rephrase your message using respectful disaster-related wording." }
+      });
+      return;
+    }
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    const associatedBundle = req.body?.associatedBundle || null;
+    let groundingBundle = associatedBundle;
+    let groundingSource = "conversation";
+    if (!groundingBundle) {
+      const research = await researchHistoricalDisaster(message, { historical: true });
+      if (research.source === "database" && research.event?.id) {
+        const dto = await getCanonicalEventById(research.event.id);
+        if (dto) {
+          groundingBundle = await bundleForCanonicalEvent(dto);
+          groundingSource = "database";
+        }
+      } else if (research.source === "multi_source_research" && research.evidence.length > 0) {
+        try {
+          const builtBundle = await buildHistoricalEvidenceBundle(message);
+          const eventId = research.persistence?.eventId || research.event?.id || null;
+          if (eventId) await persistRichEvidenceBundle(eventId, builtBundle).catch(() => void 0);
+          groundingBundle = eventId ? { ...builtBundle, id: eventId } : builtBundle;
+          groundingSource = "multi_source_research";
+        } catch {
+          groundingBundle = null;
+        }
+      }
+    }
+    const chatResponse = await chatResearchAssistant({ message, history, associatedBundle: groundingBundle });
+    if (groundingBundle) chatResponse.groundingSource = groundingSource;
+    res.json(chatResponse);
+  } catch (error) {
+    sendError(res, error);
   }
 });
 router.get("/alerts", async (req, res) => {
@@ -3039,13 +7053,13 @@ router.get("/alerts", async (req, res) => {
     res.setHeader("ETag", result.etag);
     res.setHeader("Cache-Control", "public, max-age=15");
     if (!result.isModified && clientEtag) {
-      return res.status(304).end();
+      res.status(304).end();
+      return;
     }
     const categories = Array.from(new Set(result.alerts.map((a) => a.category)));
-    const alerts = result.alerts;
     res.json({
-      alerts,
-      activeCount: alerts.length,
+      alerts: result.alerts,
+      activeCount: result.alerts.length,
       categoriesCount: categories.length,
       categories,
       lastUpdated: result.lastUpdated,
@@ -3053,25 +7067,17 @@ router.get("/alerts", async (req, res) => {
       etag: result.etag
     });
   } catch (error) {
-    res.status(500).json({
-      error: "Failed to retrieve SACHET alerts",
-      details: error.message
-    });
+    sendError(res, error);
   }
 });
 router.get("/alerts/:id/news", async (req, res) => {
   try {
-    const { id } = req.params;
-    const query = req.query.q || "Odisha cyclone warning";
+    const query = req.query.q || `${req.params.id} India disaster`;
     const windowHours = parseInt(req.query.window || "72", 10);
-    const news = await searchGoogleNews(query, {
-      isCurrentNews: true,
-      windowHours,
-      maxResults: 6
-    });
+    const news = await searchGoogleNews(query, { isCurrentNews: true, windowHours, maxResults: 6 });
     res.setHeader("Cache-Control", "public, max-age=60");
     res.json({
-      alertId: id,
+      alertId: req.params.id,
       query,
       windowHours,
       articles: news,
@@ -3079,264 +7085,951 @@ router.get("/alerts/:id/news", async (req, res) => {
       retrievedAt: (/* @__PURE__ */ new Date()).toISOString()
     });
   } catch (error) {
-    res.status(500).json({
-      error: "Failed to retrieve current news for alert",
-      details: error.message
-    });
+    sendError(res, error);
   }
 });
 router.get("/geocode", async (req, res) => {
   try {
     const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
-    if (!query) {
-      return res.status(400).json({ error: "Location query is required" });
-    }
-    const cacheKey = query.toLowerCase();
-    const cached = geocodeCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
+    if (!query) throw badRequest("Location query is required");
+    const cacheKey = `geocode:${query.toLowerCase()}`;
+    const cached = cache.get("geocode", cacheKey);
+    if (cached) {
       res.setHeader("Cache-Control", "public, max-age=600");
-      return res.json(cached.payload);
+      res.json(cached);
+      return;
     }
     const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&q=${encodeURIComponent(query)}`;
     const response = await fetch(url, {
-      headers: {
-        "User-Agent": "DisasterIntelligencePlatform/1.0 (geocoding)",
-        Accept: "application/json"
-      }
+      headers: { "User-Agent": "AapdaDrishti/2.0 (geocoding)", Accept: "application/json" }
     });
-    if (!response.ok) {
-      return res.status(502).json({
-        error: "Geocoding service unavailable"
-      });
-    }
+    if (!response.ok) throw unavailable("Geocoding service unavailable");
     const results = await response.json();
-    const places = Array.isArray(results) ? results.map((item) => ({
-      name: item.display_name || item.name || query,
-      lat: Number(item.lat),
-      lng: Number(item.lon),
-      state: item.address?.state || item.address?.state_district || item.address?.county || void 0,
-      district: item.address?.county || item.address?.city_district || item.address?.district || void 0,
-      country: item.address?.country || "India",
-      raw: item
-    })) : [];
-    const filtered = places.filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng));
-    const payload = {
-      query,
-      count: filtered.length,
-      places: filtered,
-      timestamp: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    geocodeCache.set(cacheKey, {
-      expiresAt: Date.now() + GEOCODE_CACHE_TTL_MS,
-      payload
-    });
+    const places = (Array.isArray(results) ? results : []).map((item) => {
+      const address = item.address || {};
+      return {
+        name: String(item.display_name || item.name || query),
+        lat: Number(item.lat),
+        lng: Number(item.lon),
+        state: address.state || address.state_district || address.county || void 0,
+        district: address.county || address.city_district || address.district || void 0,
+        country: address.country || "India"
+      };
+    }).filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng));
+    const payload = { query, count: places.length, places, timestamp: (/* @__PURE__ */ new Date()).toISOString() };
+    cache.set("geocode", cacheKey, payload, cache.getTTL("geocode"));
     res.setHeader("Cache-Control", "public, max-age=600");
     res.json(payload);
   } catch (error) {
-    res.status(500).json({
-      error: "Failed to resolve location",
-      details: error.message
-    });
+    sendError(res, error);
   }
 });
-router.post("/past/search", async (req, res) => {
+router.post("/transcribe", requireAuth, upload.single("file"), async (req, res) => {
   try {
-    const { query, category, state } = req.body;
-    if (!query || typeof query !== "string") {
-      return res.status(400).json({ error: "Query parameter is required" });
-    }
-    if (globalSearchCounter >= GLOBAL_SEARCH_CEILING) {
-      return res.status(429).json({
-        error: "Please allow results to load before searching again (Demo rate ceiling reached)."
-      });
-    }
-    globalSearchCounter++;
-    const databaseMatches = await searchCanonicalEvents(query);
-    if (databaseMatches.length > 0) {
-      res.setHeader("Cache-Control", "private, max-age=900");
-      return res.json({ bundle: canonicalEventToEvidenceBundle(databaseMatches[0]), source: "database" });
-    }
-    const bundle = await buildHistoricalEvidenceBundle(query, category, state);
-    res.json({ bundle });
+    if (!isGroqConfigured()) throw unavailable("Groq is not configured on the server (set GROQ_API_KEY)");
+    rateLimit(req, "stt", 20, 6e4);
+    const audioBase64 = typeof req.body?.audioBase64 === "string" ? req.body.audioBase64 : void 0;
+    const mimeType = typeof req.body?.mimeType === "string" ? req.body.mimeType : req.file?.mimetype;
+    if (!req.file?.buffer && !audioBase64) throw badRequest("Audio data is required for transcription");
+    const transcription = await transcribeAudio(req.file?.buffer || audioBase64, mimeType || "audio/webm");
+    res.json({ text: transcription.text, sourceText: transcription.text, success: true });
   } catch (error) {
-    const details = error.message;
-    if (/no live google news sources were found|insufficient relevant historical evidence/i.test(details)) {
-      return res.status(200).json({
-        bundle: null,
-        noResults: true,
-        error: null,
-        details: /insufficient/i.test(details) ? "Insufficient relevant historical evidence was retrieved to build a reliable dossier for this event." : "No live news sources were found for this query."
-      });
-    }
-    res.status(500).json({
-      error: "Failed to execute historical research search",
-      details
-    });
+    sendError(res, error);
   }
 });
-router.get("/past/archive", async (req, res) => {
+router.post("/tts", requireAuth, async (req, res) => {
   try {
-    const archive = await listArchivedCanonicalEvents();
-    const items = archive.items.map(canonicalEventToEvidenceBundle);
-    res.setHeader("Cache-Control", "public, max-age=300");
-    res.json({
-      items,
-      count: items.length,
-      retrievedAt: archive.retrievedAt,
-      cacheStatus: archive.cacheStatus
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: "Failed to build recent disaster archive",
-      details: error.message
-    });
-  }
-});
-router.post("/past/filter-search", async (req, res) => {
-  try {
-    if (globalSearchCounter >= GLOBAL_SEARCH_CEILING) {
-      return res.status(429).json({
-        error: "Please allow results to load before applying another filter."
-      });
-    }
-    const body = req.body && typeof req.body === "object" ? req.body : {};
-    const readFilter = (value) => {
-      if (typeof value !== "string" || !value.trim()) return void 0;
-      return value.trim();
-    };
-    const categoryFilter = canonicalizeFilterCategory(readFilter(body.category));
-    const requestedState = readFilter(body.state);
-    const stateFilter = requestedState && !/^all\s+states?$/i.test(requestedState) ? requestedState : void 0;
-    const decadeFilter = canonicalizeFilterDecade(readFilter(body.decade));
-    const requestedLimit = Number(body.limit);
-    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.floor(requestedLimit), 1), 100) : 100;
-    const archived = await listArchivedCanonicalEvents();
-    let items = archived.items.map(canonicalEventToEvidenceBundle);
-    if (categoryFilter) items = items.filter((item) => item.disasterType === categoryFilter);
-    if (stateFilter) items = items.filter((item) => item.state.toLowerCase() === stateFilter.toLowerCase());
-    if (decadeFilter) items = items.filter((item) => item.decade === decadeFilter);
-    if (items.length === 0) {
-      globalSearchCounter++;
-      items = await buildFilteredIndiaArchive(limit, {
-        categoryFilter,
-        stateFilter,
-        decadeFilter
-      });
-    }
-    res.setHeader("Cache-Control", "private, max-age=300");
-    res.json({
-      items: items.slice(0, limit),
-      count: items.length,
-      appliedFilters: {
-        category: categoryFilter || "all",
-        state: stateFilter || "All States",
-        decade: decadeFilter || "all"
-      },
-      retrievedAt: (/* @__PURE__ */ new Date()).toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: "Failed to apply disaster filters",
-      details: error.message
-    });
-  }
-});
-router.post("/past/compare", async (req, res) => {
-  try {
-    const { bundles } = req.body;
-    if (!Array.isArray(bundles) || bundles.length < 2 || bundles.length > 4) {
-      return res.status(400).json({ error: "Select between 2 and 4 events to compare" });
-    }
-    const comparison = await compareDisasterEvents(bundles);
-    res.json(comparison);
-  } catch (error) {
-    res.status(500).json({
-      error: "Failed to generate comparison matrix",
-      details: error.message
-    });
-  }
-});
-router.post("/past/chat", async (req, res) => {
-  try {
-    const { message, history, associatedBundle } = req.body;
-    if (!message) {
-      return res.status(400).json({ error: "Message is required" });
-    }
-    const moderation = moderateChatInput(message);
-    if (!moderation.allowed) {
-      return res.status(422).json({
-        error: "Please rephrase your message using respectful disaster-related wording.",
-        code: "CHAT_INPUT_BLOCKED"
-      });
-    }
-    const chatResponse = await chatResearchAssistant({
-      message,
-      history: Array.isArray(history) ? history : [],
-      associatedBundle
-    });
-    res.json(chatResponse);
-  } catch (error) {
-    res.status(500).json({
-      error: "AI Assistant query failed",
-      details: error.message
-    });
-  }
-});
-router.post("/tts", async (req, res) => {
-  try {
-    if (!isGroqConfigured()) {
-      return res.status(503).json({
-        error: "Groq is not configured on the server",
-        details: "Set GROQ_API_KEY in the server environment and restart the app."
-      });
-    }
-    const { text, voiceName } = req.body;
-    if (!text) {
-      return res.status(400).json({ error: "Text is required for TTS" });
-    }
-    const audioBase64 = await generateTTSAudio(text, voiceName || "Kore");
+    if (!isGroqConfigured()) throw unavailable("Groq is not configured on the server (set GROQ_API_KEY)");
+    rateLimit(req, "tts", 30, 6e4);
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text) throw badRequest("Text is required for TTS");
+    if (text.length > 2e3) throw badRequest("Text is too long for a single TTS request (max 2000 characters)");
+    const audioBase64 = await generateTTSAudio(text, typeof req.body?.voiceName === "string" ? req.body.voiceName : void 0);
+    if (!audioBase64) throw unavailable("TTS synthesis failed on the provider");
     res.json({ audioBase64 });
   } catch (error) {
-    res.status(500).json({
-      error: "TTS generation failed",
-      details: error.message
-    });
+    sendError(res, error);
   }
 });
-router.get("/health", (req, res) => {
+router.get("/profile", requireAuth, async (req, res) => {
+  try {
+    const [profiles, locations, subscriptions, phoneNumbers] = await Promise.all([
+      supabaseRest(
+        `profiles?id=eq.${encodeURIComponent(req.user.id)}&select=id,name,email,role,created_at,updated_at&limit=1`,
+        { method: "GET" }
+      ),
+      // user_locations stores geography; the RPC projects computed lat/lng.
+      supabaseRest(
+        "rpc/user_locations_geo",
+        {
+          method: "POST",
+          body: JSON.stringify({ p_user_id: req.user.id }),
+          headers: {
+            select: "id,location_type,label,city,district,state,country,accuracy_meters,latitude,longitude,created_at,updated_at"
+          }
+        }
+      ),
+      supabaseRest(
+        `subscriptions?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,email_enabled,sms_enabled,push_enabled,nearby_radius_km,severity_threshold,created_at,updated_at&limit=1`,
+        { method: "GET" }
+      ),
+      supabaseRest(
+        `phone_numbers?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,phone_number,verified,created_at&order=created_at.desc`,
+        { method: "GET" }
+      )
+    ]);
+    res.json({
+      profile: profiles[0] || null,
+      locations,
+      subscription: subscriptions[0] || null,
+      phoneNumbers
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.patch("/profile", requireAuth, async (req, res) => {
+  try {
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    if (!name) throw badRequest("Name is required");
+    if (name.length > 120) throw badRequest("Name is too long");
+    const updated = await supabaseRest(
+      `profiles?id=eq.${encodeURIComponent(req.user.id)}&select=id,name,email,role,updated_at`,
+      { method: "PATCH", body: JSON.stringify({ name }) }
+    );
+    res.json({ profile: updated[0] || null });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.put("/profile/home-location", requireAuth, async (req, res) => {
+  try {
+    const latitude = readNumber(req.body?.latitude);
+    const longitude = readNumber(req.body?.longitude);
+    if (latitude === void 0 || longitude === void 0) {
+      throw badRequest("Coordinates are required for a saved home location");
+    }
+    if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+      throw badRequest("Coordinates must be valid WGS84 values");
+    }
+    const existing = await supabaseRest(
+      `user_locations?user_id=eq.${encodeURIComponent(req.user.id)}&location_type=eq.HOME&select=id&limit=1`,
+      { method: "GET" }
+    );
+    const payload = {
+      location_type: "HOME",
+      label: typeof req.body?.label === "string" && req.body.label.trim() ? req.body.label.trim().slice(0, 120) : "Home",
+      geometry: pointWkt(longitude, latitude),
+      city: typeof req.body?.city === "string" ? req.body.city.slice(0, 120) : null,
+      district: typeof req.body?.district === "string" ? req.body.district.slice(0, 120) : null,
+      state: typeof req.body?.state === "string" ? req.body.state.slice(0, 120) : null,
+      country: "India",
+      accuracy_meters: readNumber(req.body?.accuracyMeters) ?? null
+    };
+    const rows = existing[0] ? await supabaseRest(
+      `user_locations?id=eq.${existing[0].id}&select=id,location_type,label,city,district,state,latitude,longitude,updated_at`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    ) : await supabaseRest(
+      "user_locations",
+      {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ user_id: req.user.id, ...payload })
+      }
+    );
+    res.json({ location: rows[0] || null });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.delete("/profile/home-location", requireAuth, async (req, res) => {
+  try {
+    await supabaseRest(
+      `user_locations?user_id=eq.${encodeURIComponent(req.user.id)}&location_type=eq.HOME`,
+      { method: "DELETE" }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.patch("/subscriptions", requireAuth, async (req, res) => {
+  try {
+    const radius = readNumber(req.body?.nearbyRadiusKm);
+    const payload = {
+      email_enabled: Boolean(req.body?.emailEnabled),
+      sms_enabled: Boolean(req.body?.smsEnabled),
+      push_enabled: Boolean(req.body?.pushEnabled),
+      nearby_radius_km: radius !== void 0 ? Math.max(1, Math.min(radius, 500)) : 50,
+      severity_threshold: typeof req.body?.severityThreshold === "string" && ["Unknown", "Minor", "Moderate", "Severe", "Extreme"].includes(req.body.severityThreshold) ? req.body.severityThreshold : "Moderate"
+    };
+    const rows = await supabaseRest(
+      `subscriptions?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,email_enabled,sms_enabled,push_enabled,nearby_radius_km,severity_threshold,updated_at`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    );
+    if (rows.length === 0) {
+      const created = await supabaseRest(
+        "subscriptions",
+        {
+          method: "POST",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ user_id: req.user.id, ...payload })
+        }
+      );
+      res.json({ subscription: created[0] || null });
+      return;
+    }
+    res.json({ subscription: rows[0] });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/phone-numbers", requireAuth, async (req, res) => {
+  try {
+    const phone = typeof req.body?.phoneNumber === "string" ? req.body.phoneNumber.trim() : "";
+    if (!/^\+?[0-9]{10,15}$/.test(phone)) throw badRequest("A valid phone number (10-15 digits) is required");
+    const rows = await supabaseRest(
+      "phone_numbers",
+      {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ user_id: req.user.id, phone_number: phone, verified: false })
+      }
+    );
+    res.status(201).json({ phoneNumber: rows[0] || null });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/phone-numbers/:id/send-otp", requireAuth, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid phone number id is required");
+    const rows = await supabaseRest(
+      `phone_numbers?id=eq.${req.params.id}&user_id=eq.${encodeURIComponent(req.user.id)}&select=id,phone_number,verified&limit=1`,
+      { method: "GET" }
+    );
+    const record = rows[0];
+    if (!record) throw notFound("Phone number not found");
+    if (record.verified) throw badRequest("This number is already verified");
+    if (!isSmsConfigured()) throw unavailable("SMS provider is not configured on the server");
+    rateLimit(req, `otp-send:${req.user.id}`, 5, 15 * 6e4);
+    const code = String(Math.floor(1e5 + Math.random() * 9e5));
+    const codeHash = (0, import_node_crypto.createHash)("sha256").update(`${record.id}:${code}`).digest("hex");
+    const expiresAt = new Date(Date.now() + 10 * 6e4).toISOString();
+    await supabaseRest(`phone_numbers?id=eq.${record.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        verification_code_hash: codeHash,
+        verification_expires_at: expiresAt,
+        verification_attempts: 0
+      })
+    });
+    const provider2 = getSmsProvider();
+    if (!provider2) throw unavailable("SMS provider unavailable");
+    if (process.env.DEV_OTP_MODE === "true") {
+      console.log(`
+========================================
+[DEV OTP] Phone: ${record.phone_number} | Code: ${code}
+========================================
+`);
+    }
+    const otpSent = await provider2.send({
+      to: record.phone_number,
+      body: `Aapda Drishti verification code: ${code}. Valid for 10 minutes. Do not share this code.`
+    });
+    if (!otpSent.success) {
+      await supabaseRest(`phone_numbers?id=eq.${record.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ verification_code_hash: null, verification_expires_at: null })
+      });
+      throw new Error(otpSent.error || "SMS delivery failed");
+    }
+    res.json({ success: true, expiresAt });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/phone-numbers/:id/verify-otp", requireAuth, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid phone number id is required");
+    const code = typeof req.body?.code === "string" ? req.body.code.trim() : "";
+    if (!/^\d{6}$/.test(code)) throw badRequest("A 6-digit verification code is required");
+    const rows = await supabaseRest(
+      `phone_numbers?id=eq.${req.params.id}&user_id=eq.${encodeURIComponent(req.user.id)}&select=id,verification_code_hash,verification_expires_at,verification_attempts,verified&limit=1`,
+      { method: "GET" }
+    );
+    const record = rows[0];
+    if (!record) throw notFound("Phone number not found");
+    if (record.verified) {
+      res.json({ success: true, verified: true });
+      return;
+    }
+    if (!record.verification_code_hash || !record.verification_expires_at) {
+      throw badRequest("No verification code was sent. Request a new code.");
+    }
+    if (new Date(record.verification_expires_at).getTime() < Date.now()) {
+      throw badRequest("The verification code has expired. Request a new one.", "OTP_EXPIRED");
+    }
+    if (record.verification_attempts >= 5) {
+      throw badRequest("Too many attempts. Request a new code.", "OTP_LOCKED");
+    }
+    const codeHash = (0, import_node_crypto.createHash)("sha256").update(`${record.id}:${code}`).digest("hex");
+    if (codeHash !== record.verification_code_hash) {
+      await supabaseRest(`phone_numbers?id=eq.${record.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ verification_attempts: record.verification_attempts + 1 })
+      });
+      throw badRequest("Incorrect verification code.", "OTP_INVALID");
+    }
+    await supabaseRest(`phone_numbers?id=eq.${record.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        verified: true,
+        verified_at: (/* @__PURE__ */ new Date()).toISOString(),
+        verification_code_hash: null,
+        verification_expires_at: null,
+        verification_attempts: 0
+      })
+    });
+    res.json({ success: true, verified: true });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.delete("/phone-numbers/:id", requireAuth, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid phone number id is required");
+    await supabaseRest(
+      `phone_numbers?id=eq.${req.params.id}&user_id=eq.${encodeURIComponent(req.user.id)}`,
+      { method: "DELETE" }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+var MEDIA_ALLOWED_TYPES = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/heic": "heic",
+  "video/mp4": "mp4",
+  "video/quicktime": "mov"
+};
+var MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+var MEDIA_MAX_COUNT = 3;
+var mediaUpload = (0, import_multer.default)({
+  storage: import_multer.default.memoryStorage(),
+  limits: { fileSize: MEDIA_MAX_BYTES, files: MEDIA_MAX_COUNT }
+});
+router.post("/reports/media", requireAuth, mediaUpload.array("files", MEDIA_MAX_COUNT), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (files.length === 0) throw badRequest("At least one media file is required");
+    if (!isSupabaseConfigured()) throw unavailable("Storage is not configured");
+    const objectUrls = [];
+    for (const file of files) {
+      const ext = MEDIA_ALLOWED_TYPES[file.mimetype];
+      if (!ext) throw badRequest(`Unsupported media type: ${file.mimetype}. Allowed: images (jpeg/png/webp/heic) and videos (mp4/mov).`, "MEDIA_TYPE");
+      if (file.size > MEDIA_MAX_BYTES) throw badRequest(`File exceeds the ${MEDIA_MAX_BYTES / (1024 * 1024)} MB limit`, "MEDIA_SIZE");
+      const objectPath = `${req.user.id}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+      const response = await fetch(
+        `${getSupabaseUrl()}/storage/v1/object/report-media/${objectPath}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+            "Content-Type": file.mimetype,
+            "x-upsert": "false"
+          },
+          body: new Uint8Array(file.buffer),
+          signal: AbortSignal.timeout(3e4)
+        }
+      );
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`Storage upload failed (${response.status}): ${detail.slice(0, 200)}`);
+      }
+      objectUrls.push(objectPath);
+    }
+    res.status(201).json({ objects: objectUrls });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/reports/media/signed-urls", requireAuth, async (req, res) => {
+  try {
+    const objects = Array.isArray(req.body?.objects) ? req.body.objects.filter((o) => typeof o === "string" && o.startsWith(`${req.user.id}/`)).slice(0, MEDIA_MAX_COUNT) : [];
+    if (objects.length === 0) throw badRequest("Valid media object paths are required");
+    if (!isSupabaseConfigured()) throw unavailable("Storage is not configured");
+    const signed = [];
+    for (const object of objects) {
+      const response = await fetch(`${getSupabaseUrl()}/storage/v1/object/sign/report-media/${object}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ expiresIn: 300 }),
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (!response.ok) {
+        signed.push({ object, signedUrl: null });
+        continue;
+      }
+      const payload = await response.json();
+      signed.push({
+        object,
+        signedUrl: payload.signedURL ? `${getSupabaseUrl()}${payload.signedURL}` : null
+      });
+    }
+    res.json({ signed });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/reports", requireAuth, async (req, res) => {
+  try {
+    const reportText = typeof req.body?.reportText === "string" ? req.body.reportText.trim() : "";
+    const latitude = readNumber(req.body?.latitude);
+    const longitude = readNumber(req.body?.longitude);
+    const accuracyMeters = readNumber(req.body?.accuracyMeters);
+    const maxAccuracy = Number(process.env.REPORT_MAX_ACCURACY_METERS || 150);
+    const validCategories = ["Flood", "Cyclone", "Heavy Rain", "Thunderstorm", "Lightning", "Heat Wave", "Cold Wave", "Landslide", "Earthquake", "Avalanche", "Forest Fire", "Urban Flood", "Air Pollution", "Storm", "General Alert"];
+    if (!reportText) throw badRequest("Report text is required");
+    if (reportText.length > 4e3) throw badRequest("Report text is too long (max 4000 characters)");
+    if (latitude === void 0 || longitude === void 0 || accuracyMeters === void 0) {
+      throw badRequest("Current browser coordinates and accuracy are required");
+    }
+    if (accuracyMeters > maxAccuracy) {
+      throw badRequest(`Location accuracy must be ${maxAccuracy} meters or better`, "LOCATION_ACCURACY");
+    }
+    const category = typeof req.body?.category === "string" && validCategories.includes(req.body.category) ? req.body.category : "General Alert";
+    const moderation = moderateChatInput(reportText);
+    if (!moderation.allowed) {
+      res.status(422).json({
+        success: false,
+        error: { code: "REPORT_CONTENT_BLOCKED", message: "Please rephrase the report using respectful language." }
+      });
+      return;
+    }
+    const userHistory = await supabaseRest(
+      `citizen_reports?user_id=eq.${encodeURIComponent(req.user.id)}&select=report_text,reported_at&order=reported_at.desc&limit=20`,
+      { method: "GET" }
+    ).catch(() => []);
+    const risk = scoreReportRisk({
+      reportText,
+      honeypot: typeof req.body?.honeypot === "string" ? req.body.honeypot : null,
+      elapsedMs: readNumber(req.body?.elapsedMs) ?? null,
+      accuracyMeters,
+      latitude,
+      longitude,
+      userRecentReports: userHistory.map((r) => ({ reportText: r.report_text, reportedAt: r.reported_at }))
+    });
+    const mediaUrls = Array.isArray(req.body?.mediaUrls) ? req.body.mediaUrls.filter((path2) => typeof path2 === "string" && path2.startsWith(`${req.user.id}/`) && !path2.includes("..")).slice(0, 3) : [];
+    const rows = await supabaseRest("citizen_reports", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        user_id: req.user.id,
+        report_text: reportText,
+        geometry: pointWkt(longitude, latitude),
+        accuracy_meters: accuracyMeters,
+        media_urls: mediaUrls,
+        reported_category: category,
+        status: "PENDING",
+        verification_score: 0,
+        verification_reason: "Awaiting cross-source verification.",
+        risk_score: risk.riskScore,
+        risk_factors: risk.riskFactors
+      })
+    });
+    res.status(201).json({ report: rows[0] || null, riskScore: risk.riskScore });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/reports/mine", requireAuth, async (req, res) => {
+  try {
+    const reports = await supabaseRest(
+      `citizen_reports?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,report_text,accuracy_meters,media_urls,reported_category,reported_at,status,verification_score,verification_reason,linked_event_id,created_at&order=reported_at.desc&limit=50`,
+      { method: "GET" }
+    );
+    res.json({ reports });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/notifications", requireAuth, async (req, res) => {
+  try {
+    const notifications = await supabaseRest(
+      `notifications?user_id=eq.${encodeURIComponent(req.user.id)}&select=id,event_id,channel,status,reason,sent_at,error_message,created_at&order=created_at.desc&limit=50`,
+      { method: "GET" }
+    );
+    res.json({ notifications });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/insights", async (_req, res) => {
+  try {
+    const cached = cache.get("insights", "global");
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=600");
+      res.json(cached);
+      return;
+    }
+    const insights = await computeInsights();
+    if (insights.cacheStatus === "MISS") {
+      cache.set("insights", "global", insights, 600);
+    }
+    res.setHeader("Cache-Control", "public, max-age=600");
+    res.json(insights);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/overview", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const countOf = async (resource) => {
+      try {
+        const response = await fetch(`${getSupabaseUrl()}/rest/v1/${resource}&limit=1`, {
+          method: "GET",
+          headers: {
+            apikey: SUPABASE_SECRET_KEY,
+            Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+            Prefer: "count=exact",
+            Accept: "application/json"
+          }
+        });
+        const range = response.headers.get("content-range");
+        if (!range) return 0;
+        const total = range.split("/")[1];
+        return total === "*" ? 0 : Number(total) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const [activeEvents, archivedEvents, totalReports, pendingReports, recentJobs, failedJobs] = await Promise.all([
+      countOf("canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING,ENDING)"),
+      countOf("canonical_events?status=in.(ENDED,ARCHIVED)"),
+      countOf("citizen_reports?select=id"),
+      countOf("citizen_reports?status=in.(PENDING,VERIFYING)&select=id"),
+      countOf(`job_runs?started_at=gte.${encodeURIComponent(new Date(Date.now() - 24 * 3600 * 1e3).toISOString())}&select=id`),
+      countOf("job_runs?status=eq.FAILED&select=id")
+    ]);
+    let lastJobAt = null;
+    try {
+      const last = await supabaseRest(
+        "job_runs?select=started_at&order=started_at.desc&limit=1",
+        { method: "GET" }
+      );
+      lastJobAt = last[0]?.started_at || null;
+    } catch {
+      lastJobAt = null;
+    }
+    res.json({
+      activeEvents,
+      archivedEvents,
+      totalReports,
+      pendingReports,
+      recentJobs,
+      failedJobs,
+      lastJobAt,
+      database: isSupabaseConfigured(),
+      groq: isGroqConfigured(),
+      embeddings: isEmbeddingAvailable(),
+      email: isEmailConfigured(),
+      sms: isSmsConfigured()
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/events", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const events = await supabaseRest(
+      "canonical_events?select=id,title,event_type,status,severity,verification_status,verification_score,state,last_observed_at,updated_at&order=updated_at.desc&limit=100",
+      { method: "GET" }
+    );
+    res.json({ events });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/reports", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const reports = await supabaseRest(
+      "citizen_reports?select=id,user_id,report_text,reported_category,status,verification_score,verification_reason,linked_event_id,reported_at&order=reported_at.desc&limit=100",
+      { method: "GET" }
+    );
+    res.json({ reports });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/sources", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const sources = await supabaseRest(
+      "source_definitions?select=id,source_key,name,source_type,enabled,priority,trust_weight,last_success_at,last_failure_at,health_status,source_health(status,last_run,records_received,records_accepted,records_rejected,message)&order=name.asc",
+      { method: "GET" }
+    );
+    res.json({ sources });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/jobs", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const jobs = await supabaseRest(
+      "job_runs?select=id,job_type,started_at,finished_at,status,records_processed,records_created,records_updated,records_rejected,error_message,metadata&order=started_at.desc&limit=100",
+      { method: "GET" }
+    );
+    res.json({ jobs });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/embeddings-health", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const [events, eventEmbeddings, observations, sourceEmbeddings, documents, docEmbeddings] = await Promise.all([
+      supabaseRest("canonical_events?select=id", { method: "GET" }).catch(() => []),
+      supabaseRest("event_embeddings?select=event_id,embedding_model,embedding_dimensions", { method: "GET" }).catch(() => []),
+      supabaseRest("source_observations?select=id", { method: "GET" }).catch(() => []),
+      supabaseRest("source_embeddings?select=observation_id", { method: "GET" }).catch(() => []),
+      supabaseRest("search_documents?select=id", { method: "GET" }).catch(() => []),
+      supabaseRest("search_documents?embedding=not.is.null&select=id,embedding_provider,embedding_model", { method: "GET" }).catch(() => [])
+    ]);
+    const models = /* @__PURE__ */ new Set([
+      ...eventEmbeddings.map((e) => `${e.embedding_model}@${e.embedding_dimensions}`),
+      ...docEmbeddings.map((d) => d.embedding_model)
+    ]);
+    res.json({
+      provider: isEmbeddingAvailable() ? "gemini" : "unconfigured",
+      available: isEmbeddingAvailable(),
+      model: process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-2",
+      dimensions: getEmbeddingDimensions(),
+      modelsInUse: Array.from(models),
+      canonicalEvents: events.length,
+      eventsEmbedded: eventEmbeddings.length,
+      sourceObservations: observations.length,
+      observationsEmbedded: sourceEmbeddings.length,
+      searchDocuments: documents.length,
+      documentsEmbedded: docEmbeddings.length
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/ai-health", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    res.json({
+      groq: {
+        configured: isGroqConfigured(),
+        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+        fallbacks: process.env.GROQ_MODEL_FALLBACKS || "none",
+        sttModel: process.env.GROQ_STT_MODEL || "whisper-large-v3-turbo",
+        ttsModel: process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-v1-english",
+        keyPool: getKeyPoolHealth()
+      },
+      embedding: {
+        available: isEmbeddingAvailable(),
+        provider: "gemini",
+        model: process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-2",
+        dimensions: getEmbeddingDimensions()
+      },
+      notifications: { email: isEmailConfigured(), sms: isSmsConfigured() },
+      database: { configured: isSupabaseConfigured() }
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+var ADMIN_JOB_MAP = {
+  ingest: runIngestionJob,
+  reconcile: runReconciliationJob,
+  lifecycle: runLifecycleJob,
+  embeddings: runEmbeddingJob,
+  "verify-reports": runCitizenVerificationJob,
+  notifications: runNotificationJob,
+  backfill: runHistoricalBackfillJob
+};
+router.post("/admin/jobs/:job", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const job = ADMIN_JOB_MAP[req.params.job];
+    if (!job) throw notFound(`Unknown job: ${req.params.job}`);
+    const result = await job();
+    res.json({ success: true, result });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+var REPORT_ACTIONS = {
+  verify: { action: "verify", status: "VERIFIED", score: 0.7, reasonTemplate: "Verified by admin moderation" },
+  reject: { action: "reject", status: "REJECTED", score: 0, reasonTemplate: "Rejected by admin moderation" },
+  duplicate: { action: "duplicate", status: "DUPLICATE", score: 0, reasonTemplate: "Marked duplicate by admin moderation" }
+};
+router.patch("/admin/reports/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid report id is required");
+    const actionKey = typeof req.body?.action === "string" ? req.body.action : "";
+    const action = REPORT_ACTIONS[actionKey];
+    if (!action) {
+      throw badRequest(`action must be one of: ${Object.keys(REPORT_ACTIONS).join(", ")}`);
+    }
+    const reason = typeof req.body?.reason === "string" && req.body.reason.trim() ? req.body.reason.trim().slice(0, 500) : action.reasonTemplate;
+    const patch = {
+      status: action.status,
+      verification_score: action.score,
+      verification_reason: reason
+    };
+    if (typeof req.body?.linkedEventId === "string" && /^[0-9a-f-]{36}$/i.test(req.body.linkedEventId)) {
+      patch.linked_event_id = req.body.linkedEventId;
+    } else if (req.body?.linkedEventId === null) {
+      patch.linked_event_id = null;
+    }
+    const rows = await supabaseRest(
+      `citizen_reports?id=eq.${req.params.id}&select=id,status,verification_score,verification_reason,linked_event_id`,
+      { method: "PATCH", body: JSON.stringify(patch) }
+    );
+    if (rows.length === 0) throw notFound("Report not found");
+    res.json({ report: rows[0] });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+var EVENT_STATUSES = ["DEVELOPING", "ACTIVE", "UPDATING", "ENDING", "ENDED", "ARCHIVED", "REJECTED"];
+router.patch("/admin/events/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid event id is required");
+    const patch = {};
+    if (typeof req.body?.status === "string") {
+      if (!EVENT_STATUSES.includes(req.body.status)) {
+        throw badRequest(`status must be one of: ${EVENT_STATUSES.join(", ")}`);
+      }
+      patch.status = req.body.status;
+    }
+    if (typeof req.body?.severity === "string" && ["Unknown", "Minor", "Moderate", "Severe", "Extreme"].includes(req.body.severity)) {
+      patch.severity = req.body.severity;
+    }
+    if (typeof req.body?.verificationReason === "string" && req.body.verificationReason.trim()) {
+      patch.verification_reason = req.body.verificationReason.trim().slice(0, 500);
+    }
+    if (req.body?.reject === true) {
+      patch.verification_status = "REJECTED";
+      patch.verification_reason = typeof req.body?.verificationReason === "string" && req.body.verificationReason.trim() ? req.body.verificationReason.trim().slice(0, 500) : "Rejected by admin review";
+      patch.status = "REJECTED";
+    }
+    if (Object.keys(patch).length === 0) throw badRequest("No valid fields to update were provided");
+    const rows = await supabaseRest(
+      `canonical_events?id=eq.${req.params.id}&select=id,title,status,severity,verification_status,verification_reason`,
+      { method: "PATCH", body: JSON.stringify(patch) }
+    );
+    if (rows.length === 0) throw notFound("Event not found");
+    res.json({ event: rows[0] });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/events/:id/sources", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid event id is required");
+    const sources = await supabaseRest(
+      `event_sources?event_id=eq.${req.params.id}&select=source_id,citation_id,source_definitions(name,source_type,trust_weight),source_observations(id,title,source_url,publisher,published_at,retrieved_at)&order=created_at.asc`,
+      { method: "GET" }
+    );
+    res.json({ sources });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.patch("/admin/sources/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid source id is required");
+    const patch = {};
+    if (typeof req.body?.enabled === "boolean") patch.enabled = req.body.enabled;
+    if (typeof req.body?.priority === "number") {
+      patch.priority = Math.max(1, Math.min(Math.round(req.body.priority), 1e3));
+    }
+    if (typeof req.body?.trustWeight === "number") {
+      patch.trust_weight = Math.max(0, Math.min(req.body.trustWeight, 1));
+    }
+    if (Object.keys(patch).length === 0) throw badRequest("No valid fields to update were provided");
+    const rows = await supabaseRest(
+      `source_definitions?id=eq.${req.params.id}&select=id,source_key,name,enabled,priority,trust_weight`,
+      { method: "PATCH", body: JSON.stringify(patch) }
+    );
+    if (rows.length === 0) throw notFound("Source not found");
+    res.json({ source: rows[0] });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/admin/sources/:id/observations", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest("A valid source id is required");
+    const observations = await supabaseRest(
+      `source_observations?source_id=eq.${req.params.id}&select=id,title,source_url,publisher,published_at,retrieved_at,content_hash&order=retrieved_at.desc&limit=50`,
+      { method: "GET" }
+    );
+    res.json({ observations });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/admin/research/historical", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const rawQueries = Array.isArray(req.body?.queries) ? req.body.queries : [req.body?.query];
+    const queries = Array.from(new Set(rawQueries.filter((value) => typeof value === "string").map((value) => value.trim()).filter((value) => Boolean(value))));
+    if (queries.length === 0) throw badRequest("Query is required");
+    if (queries.length > 12) throw badRequest("Run at most 12 research queries in one shift");
+    if (queries.some((query) => query.length > 300)) throw badRequest("Each query must be 300 characters or less");
+    rateLimit(req, `admin-research:${req.user.id}`, 10, 6e4);
+    const forceResearch = req.body?.forceResearch === true;
+    const allowedResearchSources = [
+      "sachet-cap",
+      "imd",
+      "cwc",
+      "incois",
+      "fsi",
+      "dgre",
+      "state-disaster-authorities",
+      "google-news-rss",
+      "national-news",
+      "regional-news",
+      "citizen",
+      "reddit",
+      "youtube",
+      "x",
+      "data-gov"
+    ];
+    const requestedSources = Array.isArray(req.body?.sources) ? req.body.sources.filter((s) => typeof s === "string" && allowedResearchSources.includes(s)) : void 0;
+    const runOne = async (query) => {
+      const research = await researchHistoricalDisaster(query, {
+        historical: true,
+        forceResearch,
+        sources: requestedSources
+      });
+      let bundle = null;
+      if (research.source === "database" && research.event?.id) {
+        const dto = await getCanonicalEventById(research.event.id);
+        bundle = dto ? await bundleForCanonicalEvent(dto) : null;
+      } else if (research.source === "multi_source_research") {
+        bundle = await buildHistoricalEvidenceBundle(query).catch(() => null);
+        const eventId = research.persistence?.eventId || research.event?.id || null;
+        if (bundle && eventId) {
+          await persistRichEvidenceBundle(eventId, bundle).catch((error) => {
+            console.error("[admin:research] rich dossier persistence failed:", error.message);
+          });
+          bundle = { ...bundle, id: eventId };
+        }
+      }
+      return {
+        query: research.query,
+        source: research.source,
+        event: research.event,
+        bundle,
+        citations: research.citations,
+        verification: research.verification,
+        retrieval: research.retrieval,
+        persistence: {
+          succeeded: persistenceSucceeded(research.persistence),
+          eventId: research.persistence?.eventId || null,
+          eventKey: research.persistence?.eventKey || null,
+          observationsPersisted: research.persistence?.observationsPersisted || 0,
+          documentsPersisted: research.persistence?.documentsPersisted || 0,
+          embedded: research.persistence?.embedded || false,
+          errors: research.persistence?.errors || []
+        }
+      };
+    };
+    const results = [];
+    for (const query of queries) {
+      results.push(await runOne(query));
+    }
+    res.json(queries.length === 1 ? results[0] : { batch: true, count: results.length, results });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+function requireCronSecret(req, res, next) {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) {
+    sendError(res, unavailable("Job scheduling not configured (set CRON_SECRET)"));
+    return;
+  }
+  const provided = req.headers["x-cron-secret"] || req.body?.cronSecret;
+  if (provided !== secret) {
+    sendError(res, unauthorized("Invalid cron secret"));
+    return;
+  }
+  next();
+}
+router.post("/jobs/:job", requireCronSecret, async (req, res) => {
+  try {
+    const job = ADMIN_JOB_MAP[req.params.job];
+    if (!job) throw notFound(`Unknown job: ${req.params.job}`);
+    const result = await job();
+    res.json({ success: true, result });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.get("/health", async (_req, res) => {
+  const checks = {};
+  if (isSupabaseConfigured()) {
+    try {
+      await supabaseRest("profiles?select=id&limit=1", { method: "GET" });
+      checks.database = { status: "operational" };
+    } catch (error) {
+      checks.database = { status: "degraded", detail: error.message.slice(0, 120) };
+    }
+  } else {
+    checks.database = { status: "not_configured" };
+  }
+  checks.groqAI = { status: isGroqConfigured() ? "configured" : "not_configured" };
+  checks.embedding = { status: isEmbeddingAvailable() ? "configured" : "not_configured" };
+  checks.sachet = { status: process.env.SOURCE_SACHET_ENABLED === "false" ? "disabled" : "operational" };
+  checks.googleNews = { status: process.env.SOURCE_GOOGLE_NEWS_ENABLED === "false" ? "disabled" : "operational" };
+  checks.email = { status: isEmailConfigured() ? "configured" : "not_configured" };
+  checks.sms = { status: isSmsConfigured() ? "configured" : "not_configured" };
+  const operational = Object.values(checks).filter((c) => c.status === "operational" || c.status === "configured").length;
   res.json({
-    status: "ok",
+    status: checks.database?.status === "degraded" ? "degraded" : "ok",
     timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-    providers: {
-      sachet: "operational",
-      googleNews: "operational",
-      groqAI: isGroqConfigured() ? "configured" : "missing_key_fallback_active"
-    },
-    version: "1.0.0"
+    checks,
+    operationalCount: operational,
+    version: "2.1.0"
   });
 });
 var routes_default = router;
 
 // server/app.ts
 function getAllowedOrigins() {
+  const isProd = process.env.NODE_ENV === "production";
   const raw = [
     process.env.CORS_ORIGINS,
     process.env.FRONTEND_URL,
     process.env.APP_URL,
     process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "",
-    process.env.NODE_ENV === "development" ? "http://localhost:5173" : "",
-    process.env.NODE_ENV === "development" ? "http://127.0.0.1:5173" : "",
-    process.env.NODE_ENV === "development" ? "http://localhost:3000" : ""
+    // Localhost defaults exist ONLY in development; production fails closed and
+    // requires explicitly configured origins.
+    ...isProd ? [] : ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]
   ].filter((value) => Boolean(value)).flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
   return new Set(raw);
 }
 function corsMiddleware(req, res, next) {
   const origin = req.headers.origin;
   const allowedOrigins = getAllowedOrigins();
-  if (origin && (allowedOrigins.size === 0 || allowedOrigins.has(origin))) {
+  if (origin && allowedOrigins.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else if (origin) {
+    if (req.method === "OPTIONS") {
+      res.status(403).end();
+      return;
+    }
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader(
@@ -3370,7 +8063,8 @@ function createApp(options = {}) {
 // server.ts
 async function startServer() {
   const app = createApp({ mode: "dev", serveStatic: false });
-  const port = Number(process.env.PORT || 3e3);
+  const portFromEnv = Number(process.env.PORT);
+  const port = Number.isFinite(portFromEnv) && portFromEnv > 0 ? portFromEnv : 5e3;
   const server = (0, import_http.createServer)(app);
   server.listen(port, "0.0.0.0", () => {
     console.log(`Disaster Intelligence Platform API listening on port ${port}`);

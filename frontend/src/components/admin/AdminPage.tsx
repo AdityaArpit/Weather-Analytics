@@ -85,12 +85,19 @@ interface InsightsPayload {
 }
 
 interface ResearchResult {
+  query?: string;
   source: 'database' | 'multi_source_research' | 'none';
   event: { id: string | null; eventKey: string | null; title: string; verificationStatus: string; verificationScore: number } | null;
   citations: Array<{ citationId: string; sourceType: string; publisher: string | null; title: string; url: string | null; publishedAt: string | null; retrievedAt: string; summary: string }>;
   verification: { status: string; score: number; method: string; reason: string } | null;
   retrieval: { sourcesQueried: string[]; sourcesSucceeded: string[]; sourcesFailed: Array<{ source: string; error: string }>; evidenceCount: number; dbMatch: boolean; dbSearched: boolean };
   persistence: { succeeded: boolean; eventId: string | null; observationsPersisted: number; documentsPersisted: number; embedded: boolean; errors: string[] } | null;
+}
+
+interface ResearchBatchResult {
+  batch: true;
+  count: number;
+  results: ResearchResult[];
 }
 
 function fmtTime(value: string | null): string {
@@ -117,6 +124,7 @@ export const AdminPage: React.FC = () => {
   const [researchForce, setResearchForce] = useState(false);
   const [researchBusy, setResearchBusy] = useState(false);
   const [researchResult, setResearchResult] = useState<ResearchResult | null>(null);
+  const [researchBatch, setResearchBatch] = useState<ResearchBatchResult | null>(null);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -163,18 +171,34 @@ export const AdminPage: React.FC = () => {
   };
 
   const runResearch = async () => {
-    const query = researchQuery.trim();
-    if (!query) {
+    const queries = researchQuery
+      .split(/\n|;/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (queries.length === 0) {
       push('error', 'Enter a disaster name, location, or year to research.');
+      return;
+    }
+    if (queries.length > 12) {
+      push('error', 'Run at most 12 research queries in one shift.');
       return;
     }
     setResearchBusy(true);
     setResearchResult(null);
+    setResearchBatch(null);
     try {
-      const result = await api.post<ResearchResult>('/api/admin/research/historical', {
-        query,
+      const result = await api.post<ResearchResult | ResearchBatchResult>('/api/admin/research/historical', {
+        ...(queries.length === 1 ? { query: queries[0] } : { queries }),
         forceResearch: researchForce,
       });
+      if ('batch' in result) {
+        setResearchBatch(result);
+        const persisted = result.results.filter((item) => item.persistence?.succeeded).length;
+        const dbHits = result.results.filter((item) => item.source === 'database').length;
+        push('success', `Analysis shift complete: ${persisted} persisted, ${dbHits} already in DB, ${result.count} total.`);
+        await loadAll();
+        return;
+      }
       setResearchResult(result);
       if (result.source === 'database') push('success', 'Verified database record found — no external research needed.');
       else if (result.source === 'none') push('error', 'No sufficiently reliable evidence was available.');
@@ -314,14 +338,13 @@ export const AdminPage: React.FC = () => {
       >
         <div className="space-y-4">
           <div className="flex flex-col sm:flex-row gap-2">
-            <input
-              type="text"
+            <textarea
               value={researchQuery}
               onChange={(e) => setResearchQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && !researchBusy) void runResearch(); }}
-              placeholder="e.g. 2018 Kerala floods"
-              aria-label="Disaster research query"
-              className="flex-1 px-4 py-2.5 rounded-xl border border-[#DDDDDD] bg-white text-sm text-[#0F1B29] placeholder:text-[#747F8D]/60 focus:outline-none focus:ring-2 focus:ring-[#0F1B29]/20 focus:border-[#0F1B29]/40"
+              placeholder={'e.g. 2018 Kerala floods\nCyclone Amphan 2020\nWayanad landslide 2024'}
+              aria-label="Disaster research queries"
+              rows={3}
+              className="flex-1 px-4 py-2.5 rounded-xl border border-[#DDDDDD] bg-white text-sm text-[#0F1B29] placeholder:text-[#747F8D]/60 focus:outline-none focus:ring-2 focus:ring-[#0F1B29]/20 focus:border-[#0F1B29]/40 resize-y min-h-[92px]"
             />
             <label className="flex items-center gap-2 px-3 rounded-xl border border-[#DDDDDD] bg-[#F3F4F5]/40 text-xs font-semibold text-[#747F8D] cursor-pointer select-none">
               <input
@@ -334,7 +357,7 @@ export const AdminPage: React.FC = () => {
             </label>
             <PrimaryButton onClick={runResearch} disabled={researchBusy}>
               {researchBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-              {researchBusy ? 'Researching…' : 'Research'}
+              {researchBusy ? 'Analyzing...' : 'Run Analysis'}
             </PrimaryButton>
           </div>
 
@@ -342,6 +365,36 @@ export const AdminPage: React.FC = () => {
             <div className="text-xs text-[#747F8D] flex items-center gap-2">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
               Database search → source discovery → Google News / YouTube / Reddit / data.gov.in / citizen evidence → dedup → verification → persistence → embedding
+            </div>
+          )}
+
+          {researchBatch && !researchBusy && (
+            <div className="space-y-2 p-4 rounded-2xl border border-[#DDDDDD] bg-[#F3F4F5]/30">
+              <div className="flex flex-wrap items-center gap-2">
+                <StatusBadge tone="ink">Analysis shift</StatusBadge>
+                <StatusBadge tone="neutral">{researchBatch.count} queries</StatusBadge>
+              </div>
+              <div className="space-y-2 max-h-72 overflow-y-auto">
+                {researchBatch.results.map((result) => (
+                  <div key={result.query || result.event?.id || result.event?.title} className="rounded-xl border border-[#DDDDDD] bg-white p-3 text-xs space-y-1.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold text-[#0F1B29]">{result.query || result.event?.title || 'Research query'}</span>
+                      <StatusBadge tone={result.source === 'database' ? 'success' : result.source === 'none' ? 'danger' : 'ink'}>
+                        {result.source.replace(/_/g, ' ')}
+                      </StatusBadge>
+                      {result.persistence && (
+                        <StatusBadge tone={result.persistence.succeeded ? 'success' : 'warning'}>
+                          {result.persistence.succeeded ? 'persisted' : 'not persisted'}
+                        </StatusBadge>
+                      )}
+                    </div>
+                    {result.event && <p className="text-[#747F8D]">{result.event.title}</p>}
+                    <p className="text-[#747F8D]">
+                      {result.retrieval.evidenceCount} evidence items · {result.persistence?.observationsPersisted || 0} observations · embedded: {String(result.persistence?.embedded || false)}
+                    </p>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 

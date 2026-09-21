@@ -26,8 +26,6 @@ language sql
 stable
 as $$ select array['OFFICIAL_VERIFIED','CROSS_SOURCE_VERIFIED','PROVISIONALLY_VERIFIED'] $$;
 
-
-
 -- ---------------------------------------------------------------------------
 -- Identity & preferences
 -- ---------------------------------------------------------------------------
@@ -40,6 +38,7 @@ create table public.profiles (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
 create or replace function public.is_admin()
 returns boolean
 language sql
@@ -49,6 +48,7 @@ set search_path = public
 as $$
   select exists(select 1 from public.profiles where id = auth.uid() and role = 'admin')
 $$;
+
 create table public.user_locations (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references public.profiles(id) on delete cascade,
@@ -133,9 +133,6 @@ create table public.source_observations (
   created_at timestamptz not null default now()
 );
 
--- Dedup identity: exact duplicates from the SAME source are impossible, while
--- the same underlying report arriving through DIFFERENT legitimate sources
--- remains representable.
 create unique index source_observations_source_content_hash_key
   on public.source_observations (source_id, content_hash);
 create unique index source_observations_source_external_id_key
@@ -222,9 +219,7 @@ create table public.event_updates (
 );
 
 -- Claim-level provenance: every important factual field shown by the frontend
--- maps to one or more supporting claim records. claim_type is open text so new
--- claim kinds (CASUALTIES, DAMAGE, START_DATE, GOVERNMENT_RESPONSE, ...) do not
--- require a migration; uniqueness keeps (event, type, value, source) stable.
+-- maps to one or more supporting claim records.
 create table public.canonical_event_claims (
   id uuid primary key default gen_random_uuid(),
   event_id uuid not null references public.canonical_events(id) on delete cascade,
@@ -277,7 +272,6 @@ create table public.search_documents (
 
 create index search_documents_document_type_idx on public.search_documents(document_type);
 
--- Lexical search: stored tsvector over title (A) + content (B) with GIN index.
 alter table public.search_documents
   add column search_vector tsvector
   generated always as (
@@ -303,9 +297,6 @@ create table public.citizen_reports (
   verification_score numeric not null default 0 check (verification_score between 0 and 1),
   verification_reason text,
   linked_event_id uuid references public.canonical_events(id),
-  -- Anti-abuse: composite risk score (0=safe, 1=certain abuse) plus the
-  -- individual detector results. High-risk reports are quarantined by the
-  -- verification job (REJECTED with reason), never silently dropped.
   risk_score numeric not null default 0 check (risk_score between 0 and 1),
   risk_factors jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default now(),
@@ -365,21 +356,29 @@ create table public.source_health (
 insert into public.source_definitions (source_key, name, source_type, base_url, enabled, priority, trust_weight, health_status)
 values
   ('sachet-cap', 'SACHET / NDMA CAP Alerts', 'OFFICIAL', 'https://sachet.ndma.gov.in', true, 10, 0.95, 'UNKNOWN'),
+  ('imd', 'India Meteorological Department', 'OFFICIAL', 'https://mausam.imd.gov.in', true, 11, 0.95, 'UNKNOWN'),
+  ('cwc', 'Central Water Commission', 'OFFICIAL', 'https://cwc.gov.in', true, 12, 0.95, 'UNKNOWN'),
+  ('incois', 'INCOIS Ocean Alerts', 'OFFICIAL', 'https://incois.gov.in', true, 13, 0.95, 'UNKNOWN'),
+  ('fsi', 'Forest Survey of India', 'OFFICIAL', 'https://fsi.nic.in', true, 14, 0.95, 'UNKNOWN'),
+  ('dgre', 'DGRE Snow and Avalanche Warnings', 'OFFICIAL', 'https://www.drdo.gov.in/labs-and-establishments/defence-geoinformatics-research-establishment-dgre', true, 15, 0.95, 'UNKNOWN'),
+  ('state-disaster-authorities', 'State Disaster Management Authorities', 'OFFICIAL', null, true, 25, 0.9, 'UNKNOWN'),
   ('google-news-rss', 'Google News (India disaster coverage)', 'NEWS', 'https://news.google.com', true, 50, 0.55, 'UNKNOWN'),
+  ('national-news', 'Major Indian National News', 'NEWS', 'https://news.google.com', true, 51, 0.55, 'UNKNOWN'),
+  ('regional-news', 'Major Indian Regional News', 'NEWS', 'https://news.google.com', true, 52, 0.55, 'UNKNOWN'),
+  ('reddit', 'Reddit (r/India disaster threads)', 'SOCIAL', 'https://www.reddit.com', true, 70, 0.25, 'UNKNOWN'),
+  ('youtube', 'YouTube News Channels', 'SOCIAL', 'https://www.googleapis.com/youtube/v3', true, 71, 0.3, 'UNKNOWN'),
+  ('x', 'X / Public Social Signals', 'SOCIAL', 'https://developer.x.com', false, 72, 0.25, 'DISABLED'),
+  ('data-gov', 'data.gov.in Open Datasets', 'DATASET', 'https://api.data.gov.in', true, 35, 0.75, 'UNKNOWN'),
+  ('historical-catalog', 'Curated Historical Disaster Catalog', 'SEED', null, true, 40, 0.8, 'UNKNOWN'),
   ('citizen', 'Citizen Reports', 'CITIZEN', null, true, 60, 0.35, 'UNKNOWN')
 on conflict (source_key) do nothing;
 
 -- ---------------------------------------------------------------------------
 -- Public projection views (computed latitude/longitude via PostGIS; real FTS
--- fields; citations as JSON). RLS on canonical_events applies to these views
--- because they are owned by postgres and execute with the querying role's
--- permissions (views are not security definer by default).
+-- fields; citations as JSON).
 -- ---------------------------------------------------------------------------
 
--- Citation ids: prefer the stored citation_id, else a stable per-event ordinal.
--- Citations are aggregated in a lateral subquery (a window function cannot sit
--- inside an aggregate, and a GROUP BY would break the e.* projection).
-create view public.active_canonical_events as
+create or replace view public.active_canonical_events as
 select
   e.*,
   st_y(e.centroid::geometry) as latitude,
@@ -426,7 +425,7 @@ where e.status in ('DEVELOPING', 'ACTIVE', 'UPDATING', 'ENDING')
   and e.verification_status in ('OFFICIAL_VERIFIED','CROSS_SOURCE_VERIFIED','PROVISIONALLY_VERIFIED')
   and (e.present_until is null or e.present_until >= now());
 
-create view public.past_canonical_events as
+create or replace view public.past_canonical_events as
 select
   e.*,
   st_y(e.centroid::geometry) as latitude,
@@ -483,6 +482,7 @@ alter table public.phone_numbers      enable row level security;
 alter table public.citizen_reports    enable row level security;
 alter table public.notifications      enable row level security;
 alter table public.canonical_events   enable row level security;
+alter table public.canonical_event_claims enable row level security;
 alter table public.source_definitions enable row level security;
 alter table public.source_observations enable row level security;
 alter table public.event_observations enable row level security;
@@ -524,7 +524,7 @@ create policy "reports admin manage" on public.citizen_reports
 create policy "notifications select own or admin" on public.notifications
   for select using (user_id = auth.uid() or public.is_admin());
 
--- Claim-level evidence inherits parent-event visibility (EXISTS, never true).
+-- Claim-level evidence inherits parent-event visibility.
 create policy "claims visibility" on public.canonical_event_claims
   for select using (
     exists (
@@ -548,8 +548,7 @@ create policy "report media owner read" on storage.objects
     )
   );
 
--- Canonical events: publicly verified rows are readable by everyone (including
--- anon); admins see everything (including PENDING/REJECTED evidence).
+-- Canonical events: publicly verified rows are readable by everyone.
 create policy "public read verified events" on public.canonical_events
   for select using (
     verification_status in ('OFFICIAL_VERIFIED','CROSS_SOURCE_VERIFIED','PROVISIONALLY_VERIFIED')
@@ -558,9 +557,6 @@ create policy "public read verified events" on public.canonical_events
 create policy "admin write canonical events" on public.canonical_events
   for all using (public.is_admin()) with check (public.is_admin());
 
--- Evidence tables MUST NOT use USING(true): rows belong to canonical events,
--- which may be private (PENDING/REJECTED). EXISTS against the parent event
--- enforces the same visibility rule at the evidence level.
 create policy "event sources visibility" on public.event_sources
   for select using (
     exists (
@@ -591,19 +587,13 @@ create policy "event updates visibility" on public.event_updates
     )
   );
 
--- Source definitions are public reference data (names/types only); mutations are
--- admin-only. Note: anon can read the definitions, not the observations.
 create policy "public read source definitions" on public.source_definitions
   for select using (true);
 create policy "admin manage source definitions" on public.source_definitions
   for all using (public.is_admin()) with check (public.is_admin());
 
--- Observations and embeddings/search documents are backend (service role) data;
--- no anon/authenticated policies exist, so only the service role can touch them.
--- job_runs / source_health likewise have no policies (service role only).
-
 -- ---------------------------------------------------------------------------
--- updated_at trigger function (triggers are attached in migration 005)
+-- updated_at trigger function
 -- ---------------------------------------------------------------------------
 create or replace function public.update_updated_at_column()
 returns trigger

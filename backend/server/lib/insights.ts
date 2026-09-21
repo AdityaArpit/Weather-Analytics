@@ -87,7 +87,7 @@ export async function computeInsights(): Promise<InsightsPayload> {
 
   try {
     // Fetch a bounded window of verified events (public surfaces only).
-    const rows = await supabaseRest<Array<{
+    type InsightRow = {
       id: string;
       event_type: string;
       status: string;
@@ -96,9 +96,20 @@ export async function computeInsights(): Promise<InsightsPayload> {
       started_at: string | null;
       verification_status: string;
       source_count: number | null;
-    }>>(
-      `canonical_events?select=id,event_type,status,severity,state,started_at,verification_status,source_count&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=2000`,
-      { method: 'GET' },
+    };
+    const select = 'id,event_type,status,severity,state,started_at,verification_status,source_count';
+    const [activeRows, pastRows] = await Promise.all([
+      supabaseRest<InsightRow[]>(
+        `active_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=1000`,
+        { method: 'GET' },
+      ),
+      supabaseRest<InsightRow[]>(
+        `past_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=1000`,
+        { method: 'GET' },
+      ),
+    ]);
+    const rows = [...activeRows, ...pastRows].filter(
+      (row, index, all) => all.findIndex((candidate) => candidate.id === row.id) === index,
     );
 
     if (rows.length === 0) return { ...EMPTY, cacheStatus: 'MISS' };

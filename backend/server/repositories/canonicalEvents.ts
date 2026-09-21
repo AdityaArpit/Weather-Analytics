@@ -81,7 +81,13 @@ function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
 }
 
 function toDtoList(rows: CanonicalEventRow[]): CanonicalEventDto[] {
-  return rows.map(rowToDto);
+  return rows.map(rowToDto).filter((event) => {
+    const materialText = `${event.title} ${event.description} ${event.instruction || ''}`;
+    const letters = [...materialText].filter((char) => /\p{L}/u.test(char));
+    if (letters.length < 12) return true;
+    const latinLetters = letters.filter((char) => /\p{Script=Latin}/u.test(char));
+    return latinLetters.length / letters.length >= 0.85;
+  });
 }
 
 const VIEW_SELECT = 'id,event_key,title,event_type,status,severity,urgency,certainty,description,instruction,location_name,city,district,state,country,latitude,longitude,started_at,last_observed_at,last_verified_at,present_until,ended_at,verification_status,verification_score,verification_method,verification_reason,location_confidence,source_count,citations,created_at,updated_at';
