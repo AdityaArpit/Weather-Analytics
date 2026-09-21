@@ -228,6 +228,14 @@ export const AIAssistantDrawer: React.FC<AIAssistantDrawerProps> = ({
           rows={1}
           value={inputValue}
           onChange={(event) => setInputValue(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
+              if (inputValue.trim() && !isRunning) {
+                void sendMessage(inputValue);
+              }
+            }
+          }}
           placeholder="Ask a disaster intelligence question..."
           className="min-h-10 max-h-28 flex-1 resize-none px-3.5 py-2.5 text-xs sm:text-sm rounded-xl bg-white border border-[#DDDDDD] text-[#0F1B29] placeholder:text-slate-400 focus:outline-none focus:border-[#747F8D] focus:ring-2 focus:ring-[#DDDDDD]/40 shadow-sm"
         />

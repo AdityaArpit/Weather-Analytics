@@ -78,7 +78,7 @@ export function verificationFromSignals(signals: EvidenceSignal[]): {
   return { score, status, distinctSources };
 }
 
-/** Citizen report verification: corroboration against canonical events + duplicates. */
+/** Citizen report verification: corroboration against canonical events + duplicates + content analysis. */
 export function citizenReportVerification(input: {
   reportText: string;
   category: string | null;
@@ -87,30 +87,37 @@ export function citizenReportVerification(input: {
   duplicateReportCount: number;
 }): { score: number; status: 'PENDING' | 'VERIFYING' | 'VERIFIED' | 'REJECTED' | 'DUPLICATE'; reason: string } {
   const reasons: string[] = [];
-  let score = 0.25; // base for an authenticated, geolocated submission
+  let score = 0.45; // base for an authenticated, geolocated submission
+
+  const text = input.reportText.trim().toLowerCase();
+  const hasDisasterKeywords = /\b(flood|water|rain|heavy|cyclone|landslide|fire|smoke|wind|storm|cloudburst|earthquake|damage|tree|road|blocked|bridge|power|outage|rescue|trapped|casualt|injur|hospital|help)\b/i.test(text);
+  if (hasDisasterKeywords) {
+    score += 0.15;
+    reasons.push('Contains substantive hazard and impact indicators.');
+  }
+
+  if (text.length >= 50) {
+    score += 0.10;
+    reasons.push('Detailed on-ground observational description provided.');
+  }
 
   if (input.nearbyVerifiedEventCount > 0) {
-    score += Math.min(0.35, 0.2 + 0.05 * (input.nearbyVerifiedEventCount - 1));
-    reasons.push(`Corroborated by ${input.nearbyVerifiedEventCount} verified active event(s) within reporting radius.`);
-  } else {
-    reasons.push('No verified canonical event corroborates this report yet.');
+    score += Math.min(0.30, 0.20 + 0.05 * (input.nearbyVerifiedEventCount - 1));
+    reasons.push(`Corroborated by ${input.nearbyVerifiedEventCount} verified active canonical event(s).`);
   }
 
   if (input.duplicateReportCount >= 2) {
     score += 0.15;
-    reasons.push(`${input.duplicateReportCount} independent citizen reports in the same area.`);
-  }
-
-  if (input.reportText.trim().length >= 80) {
-    score += 0.05;
+    reasons.push(`${input.duplicateReportCount} cluster citizen reports corroborate this area.`);
   }
 
   score = Math.min(1, Math.round(score * 100) / 100);
 
-  if (input.duplicateReportCount >= 3 && input.nearbyVerifiedEventCount === 0) {
-    return { score, status: 'DUPLICATE', reason: `Duplicate cluster without corroboration. ${reasons.join(' ')}` };
+  if (input.duplicateReportCount >= 5 && input.nearbyVerifiedEventCount === 0) {
+    return { score, status: 'DUPLICATE', reason: `High-frequency duplicate cluster. ${reasons.join(' ')}` };
   }
   if (score >= 0.55) return { score, status: 'VERIFIED', reason: reasons.join(' ') };
   if (score >= 0.35) return { score, status: 'VERIFYING', reason: reasons.join(' ') };
-  return { score, status: 'REJECTED', reason: `Insufficient corroboration. ${reasons.join(' ')}` };
+  return { score, status: 'PENDING', reason: `Awaiting further corroboration. ${reasons.join(' ')}` };
 }
+

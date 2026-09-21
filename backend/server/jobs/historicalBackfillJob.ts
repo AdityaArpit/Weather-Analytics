@@ -61,31 +61,43 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
           state: item.state,
           country: item.country || 'India',
           started_at: item.eventDate,
+          last_observed_at: item.eventDate,
           ended_at: item.eventDate,
           archived_at: new Date().toISOString(),
           verification_status: 'PROVISIONALLY_VERIFIED',
-          verification_score: item.evidenceStatus === 'High Confidence' ? 0.82 : 0.65,
+          verification_score: item.evidenceStatus === 'High Confidence' ? 0.88 : 0.72,
           verification_method: 'CURATED_HISTORICAL_CATALOG',
-          verification_reason: item.sourceAssessment,
-          location_confidence: 0.7,
+          verification_reason: item.sourceAssessment || 'Curated Indian historical disaster catalog.',
+          location_confidence: 0.8,
         }),
       });
 
-      const eventId = upserted[0]?.id;
+      let eventId = upserted?.[0]?.id;
+      if (!eventId) {
+        const existing = await supabaseRest<Array<{ id: string }>>(
+          `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+          { method: 'GET' },
+        ).catch(() => []);
+        eventId = existing[0]?.id;
+      }
+
       if (!eventId) {
         result.recordsRejected++;
         continue;
       }
 
       let observationCount = 0;
+      let firstObsId: string | undefined;
+
       for (const citation of item.sources) {
+        const extId = `${item.id}-${citation.id}`;
         const hash = contentHash(`${item.id}|${citation.id}|${citation.title}|${citation.url}`);
-        const observations = await supabaseRest<Array<{ id: string }>>('source_observations?on_conflict=source_id,content_hash', {
+        const observations = await supabaseRest<Array<{ id: string }>>('source_observations?on_conflict=source_id,external_id', {
           method: 'POST',
           headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
           body: JSON.stringify({
             source_id: source.id,
-            external_id: `${item.id}-${citation.id}`,
+            external_id: extId,
             title: citation.title.slice(0, 500),
             raw_content: citation.summary || item.whatHappened,
             raw_payload: { catalogId: item.id, citation },
@@ -97,10 +109,19 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
             event_category: item.disasterType,
             content_hash: hash,
           }),
-        });
+        }).catch(() => [] as Array<{ id: string }>);
 
-        const observationId = observations[0]?.id;
+        let observationId = observations?.[0]?.id;
+        if (!observationId) {
+          const existingObs = await supabaseRest<Array<{ id: string }>>(
+            `source_observations?and=(source_id.eq.${source.id},external_id.eq.${encodeURIComponent(extId)})&select=id&limit=1`,
+            { method: 'GET' },
+          ).catch(() => []);
+          observationId = existingObs[0]?.id;
+        }
+
         if (!observationId) continue;
+        if (!firstObsId) firstObsId = observationId;
         observationCount++;
 
         await supabaseRest('event_sources?on_conflict=event_id,source_id,source_observation_id', {
@@ -113,6 +134,7 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
             citation_id: citation.id,
           }),
         });
+
         await supabaseRest('event_observations?on_conflict=event_id,observation_id', {
           method: 'POST',
           headers: { Prefer: 'resolution=ignore-duplicates' },
@@ -124,6 +146,51 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
           }),
         }).catch(() => undefined);
       }
+
+      // Persist factual claims into canonical_event_claims
+      const claimsToInsert = [
+        item.reportedCasualties ? { type: 'CASUALTIES', value: item.reportedCasualties } : null,
+        item.reportedDamage ? { type: 'DAMAGE', value: item.reportedDamage } : null,
+        item.humanImpact ? { type: 'HUMAN_IMPACT', value: item.humanImpact } : null,
+        item.infrastructureDamage ? { type: 'INFRASTRUCTURE_DAMAGE', value: item.infrastructureDamage } : null,
+        item.economicImpact ? { type: 'ECONOMIC_IMPACT', value: item.economicImpact } : null,
+        item.eventDate ? { type: 'START_DATE', value: item.eventDate } : null,
+        item.affectedAreas ? { type: 'AFFECTED_AREAS', value: item.affectedAreas } : null,
+        item.governmentResponse ? { type: 'GOVERNMENT_RESPONSE', value: item.governmentResponse } : null,
+        item.rescueRelief ? { type: 'RESCUE_RELIEF', value: item.rescueRelief } : null,
+        item.recovery ? { type: 'RECOVERY', value: item.recovery } : null,
+      ].filter(Boolean) as Array<{ type: string; value: string }>;
+
+      for (const claim of claimsToInsert) {
+        await supabaseRest('canonical_event_claims?on_conflict=event_id,claim_type,claim_value,source_id', {
+          method: 'POST',
+          headers: { Prefer: 'resolution=ignore-duplicates' },
+          body: JSON.stringify({
+            event_id: eventId,
+            claim_type: claim.type,
+            claim_value: claim.value.slice(0, 500),
+            source_observation_id: firstObsId || null,
+            source_id: source.id,
+            confidence: 0.9,
+            verification_status: 'PROVISIONALLY_VERIFIED',
+          }),
+        }).catch(() => undefined);
+      }
+
+      // Persist full pre-packaged EvidenceBundle so frontend detail views render rich cards immediately
+      const richBundleDocHash = contentHash(`rich-evidence-bundle|${eventId}`);
+      await supabaseRest('search_documents?on_conflict=document_hash', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates' },
+        body: JSON.stringify({
+          document_type: 'external_research',
+          event_id: eventId,
+          title: '__AAPDA_RICH_EVIDENCE_BUNDLE__',
+          content: JSON.stringify({ ...item, id: eventId }),
+          source_url: item.sources[0]?.url || null,
+          document_hash: richBundleDocHash,
+        }),
+      }).catch(() => undefined);
 
       const docId = await upsertSearchDocument({
         documentType: 'canonical_event',

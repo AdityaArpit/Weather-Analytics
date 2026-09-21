@@ -216,10 +216,20 @@ function getGroqBaseUrl(): string {
 }
 
 function getGroqChatModels(): string[] {
-  return (process.env.GROQ_MODEL_FALLBACKS || process.env.GROQ_MODEL || 'openai/gpt-oss-120b')
+  const configured = (process.env.GROQ_MODEL_FALLBACKS || '')
     .split(',')
     .map((model) => model.trim())
     .filter(Boolean);
+  const primary = process.env.GROQ_MODEL?.trim() || 'openai/gpt-oss-120b';
+  return Array.from(
+    new Set([
+      primary,
+      ...configured,
+      'openai/gpt-oss-20b',
+      'qwen/qwen3.8-27b',
+      'llama-3.3-70b-versatile',
+    ]),
+  );
 }
 
 function getGroqSttModel(): string {
