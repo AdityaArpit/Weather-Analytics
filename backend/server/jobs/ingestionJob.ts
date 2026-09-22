@@ -3,7 +3,7 @@ import { supabaseRest, isSupabaseConfigured } from '../db/supabase';
 import { contentHash } from '../lib/contentHash';
 import { geocodeLocation, extractLocationsFromText } from '../lib/geocoding';
 import { resolveSource, type SourceKey } from '../lib/sourceRegistry';
-import { findBestCorrelation, type CorrelationCandidate } from '../lib/correlation';
+import { findBestCorrelation, CORRELATION_MATCH_THRESHOLD, type CorrelationCandidate } from '../lib/correlation';
 import { verificationFromSignals, type VerificationStatus } from '../lib/verification';
 import { upsertSearchDocument, embedAndStoreEvent, embedAndStoreSourceObservation, embedAndStoreSearchDocument } from '../lib/searchRetrieval';
 import { startJobRun, finishJobRun, recordSourceHealth, type JobResult } from './jobRunner';
@@ -299,7 +299,7 @@ async function attachToEvent(obs: NormalizedObservation, observationId: string, 
 
 export async function runIngestionJob(): Promise<JobResult> {
   const result: JobResult = {
-    jobType: 'ingest',
+    jobType: 'ingestion',
     status: 'COMPLETED',
     recordsProcessed: 0,
     recordsCreated: 0,
@@ -313,7 +313,7 @@ export async function runIngestionJob(): Promise<JobResult> {
     return result;
   }
 
-  const runId = await startJobRun('ingest');
+  const runId = await startJobRun('ingestion');
   const adapters = getConfiguredSourceAdapters();
   const correlationCandidates = await loadCorrelationCandidates();
 
@@ -326,7 +326,7 @@ export async function runIngestionJob(): Promise<JobResult> {
 
     try {
       const sourceDef = await resolveSource(adapter.sourceKey);
-      const rawObservations = await adapter.fetchRaw();
+      const rawObservations = await adapter.fetchRecent();
       recordsReceived = rawObservations.length;
 
       for (const raw of rawObservations) {
@@ -354,6 +354,7 @@ export async function runIngestionJob(): Promise<JobResult> {
 
         // Search for existing correlated canonical event
         const bestMatch = findBestCorrelation(
+          correlationCandidates,
           {
             title: obs.title,
             eventType: obs.eventType,
@@ -361,13 +362,12 @@ export async function runIngestionJob(): Promise<JobResult> {
             district: obs.district,
             lat: obs.lat,
             lng: obs.lng,
-            publishedAt: obs.publishedAt,
+            observedAt: obs.publishedAt,
           },
-          correlationCandidates,
         );
 
-        if (bestMatch && bestMatch.score >= 0.7) {
-          await attachToEvent(obs, observationId, bestMatch.candidate.id, bestMatch.score);
+        if (bestMatch && bestMatch.score >= CORRELATION_MATCH_THRESHOLD) {
+          await attachToEvent(obs, observationId, bestMatch.id, bestMatch.score);
           result.recordsUpdated++;
         } else {
           const newEventId = await createCanonicalEvent(obs, observationId);
@@ -377,10 +377,10 @@ export async function runIngestionJob(): Promise<JobResult> {
               id: newEventId,
               title: obs.title,
               event_type: obs.eventType,
-              state: obs.state,
-              district: obs.district,
-              latitude: obs.lat,
-              longitude: obs.lng,
+              state: obs.state ?? null,
+              district: obs.district ?? null,
+              latitude: obs.lat ?? null,
+              longitude: obs.lng ?? null,
               last_observed_at: new Date().toISOString(),
               started_at: obs.publishedAt,
             });
@@ -402,26 +402,30 @@ export async function runIngestionJob(): Promise<JobResult> {
         await embedAndStoreSourceObservation(observationId, `${obs.title} ${obs.description}`);
       }
 
-      await recordSourceHealth(sourceDef.id, {
+      const healthStatus: 'UP' | 'DEGRADED' = recordsAccepted > 0 || recordsReceived === 0 ? 'UP' : 'DEGRADED';
+      await recordSourceHealth(adapter.sourceKey, {
         latencyMs: Date.now() - startedAt,
         recordsReceived,
         recordsAccepted,
         recordsRejected,
-        status: recordsAccepted > 0 || recordsReceived === 0 ? 'HEALTHY' : 'DEGRADED',
+        status: healthStatus,
+        lastSuccessAt: new Date().toISOString(),
       });
+      if (healthStatus === 'DEGRADED' && result.status === 'COMPLETED') result.status = 'PARTIAL';
     } catch (err) {
       errorMessage = (err as Error).message;
       try {
-        const sourceDef = await resolveSource(adapter.sourceKey);
-        await recordSourceHealth(sourceDef.id, {
+        await recordSourceHealth(adapter.sourceKey, {
           latencyMs: Date.now() - startedAt,
           recordsReceived,
           recordsAccepted,
           recordsRejected,
-          status: 'UNHEALTHY',
-          message: errorMessage,
+          status: 'DOWN',
+          lastFailureAt: new Date().toISOString(),
+          errorMessage,
         });
-      } catch { /* source resolve failure */ }
+      } catch { /* best-effort health record */ }
+      if (result.status === 'COMPLETED') result.status = 'PARTIAL';
     }
   }
 

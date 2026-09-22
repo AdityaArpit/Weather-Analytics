@@ -23,6 +23,7 @@ import {
   vectorDocumentSearch,
   upsertSearchDocument,
   embedAndStoreSearchDocument,
+  embedAndStoreEvent,
 } from './searchRetrieval';
 import {
   searchCanonicalEventsLexical,
@@ -269,6 +270,55 @@ export interface NormalizedQuery {
   year: number | null;
   disasterType: string | null;
   state: string | null;
+  /** True when the query is a generic fact lookup ("death count", "damage report") rather than a named disaster. */
+  isGenericFactQuery: boolean;
+}
+
+/**
+ * Generic-fact queries ("death count in aila", "damage report") describe an
+ * attribute of an event, not an event. Persisting them as canonical events
+ * produced garbage rows like "death count" / "damage report" — they must be
+ * matched to an EXISTING event and enrich it instead of creating one.
+ */
+const GENERIC_FACT_PATTERNS = [
+  /^death\s*(count|toll|tolls)?\b/i,
+  /\bdeath\s*(count|toll)\b/i,
+  /^damage\s*(report|estimate|assessment)?\b/i,
+  /\b(damage|loss)\s*(report|estimate|details)?\b/i,
+  /^casualt(y|ies)\b/i,
+  /^injur(y|ies|ed)\b/i,
+  /^affected\s*(population|people|area|areas)?\b/i,
+  /^economic\s*(loss|impact|damage)\b/i,
+  /^fatalit(y|ies)\b/i,
+  /^missing\s*(persons?)?\b/i,
+  /^evacuat(ed|ion)\b/i,
+  /^rescue\s*(efforts?|operations?)\b/i,
+  /^relief\s*(efforts?|work|operations?)\b/i,
+  /^government\s*(response|action)\b/i,
+];
+
+/** Requests that reference an existing event rather than a new disaster. */
+const ENRICHMENT_INTENT = [
+  /\bdeep research\b/i,
+  /\bmore (info|information|details)\b/i,
+  /\bupdate\b/i,
+  /\brefresh\b/i,
+  /\badd (more|details|info)\b/i,
+  /\benrich\b/i,
+];
+
+export function titleCaseEventName(value: string): string {
+  const minor = new Set(['of', 'the', 'in', 'and', 'at', 'on', 'a', 'an', 'to', 'for', 'over', 'near', 'by', 'with']);
+  return value
+    .toLowerCase()
+    .split(/\s+/)
+    .map((word, index) =>
+      index > 0 && minor.has(word)
+        ? word
+        : word.charAt(0).toUpperCase() + word.slice(1),
+    )
+    .join(' ')
+    .trim();
 }
 
 export function normalizeHistoricalQuery(raw: string): NormalizedQuery {
@@ -292,7 +342,9 @@ export function normalizeHistoricalQuery(raw: string): NormalizedQuery {
     .replace(/\s+/g, ' ')
     .trim();
 
-  return { raw: trimmed, normalized, year, disasterType, state };
+  const isGenericFactQuery = GENERIC_FACT_PATTERNS.some((pattern) => pattern.test(normalized));
+
+  return { raw: trimmed, normalized, year, disasterType, state, isGenericFactQuery };
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +509,10 @@ function isRelevantDatabaseHit(
 export interface PersistedResearch {
   eventId: string | null;
   eventKey: string | null;
+  /** True when research was merged into an existing canonical event (enrichment) rather than creating one. */
+  enrichedExistingEvent: boolean;
+  /** The event title actually stored (evidence-derived, Title Case). */
+  eventTitle: string | null;
   verification: VerificationDecision;
   observationsPersisted: number;
   documentsPersisted: number;
@@ -464,14 +520,230 @@ export interface PersistedResearch {
   errors: string[];
 }
 
+/**
+ * Derives the canonical event title from the EVIDENCE, never the raw user
+ * query. The strongest available signal wins: the most common place name and
+ * the confirmed event date from independent citations. A query like "death
+ * count in aila" must never become an event titled "death count".
+ */
+function deriveEventTitleFromEvidence(evidence: RawHistoricalEvidence[], nq: NormalizedQuery): string {
+  const hazardWords = /cyclone|flood|earthquake|landslide|storm|heat ?wave|cold ?wave|avalanche|wildfire|forest fire|drought|tsunami|lightning|thunderstorm|cloudburst|tremor|snowfall|glacier|hail/i;
+
+  // The title must contain a HAZARD word. "Floods in Assam: 12 villages
+  // submerged" qualifies; "Hindu Kush region tremors" or "Heatwave mortality
+  // data" (dataset/fragment titles) do not become event names.
+  const hazardHeadlines = evidence.filter(
+    (item) => hazardWords.test(item.title) || hazardWords.test(item.content?.slice(0, 400) || ''),
+  );
+
+  // Dominant state/place across hazard headlines gives the location part.
+  const placeCounts = new Map<string, number>();
+  for (const item of hazardHeadlines) {
+    for (const state of KNOWN_STATES) {
+      if (`${item.title} ${item.locationText || ''} ${item.state || ''}`.toLowerCase().includes(state.toLowerCase())) {
+        placeCounts.set(state, (placeCounts.get(state) || 0) + 1);
+      }
+    }
+  }
+  const dominantPlace = [...placeCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
+    || nq.state
+    || hazardHeadlines[0]?.state
+    || 'India';
+
+  // Recognised NAMED EVENT (e.g. "Cyclone Amphan", "Cyclone Aila") from headlines.
+  const namedEvent = hazardHeadlines
+    .map((item) => item.title.match(/\b(cyclone|storm|typhoon)\s+([A-Z][a-z]{2,})\b/) || null)
+    .find((match): match is RegExpMatchArray => Boolean(match));
+  if (namedEvent) {
+    return titleCaseEventName(`${namedEvent[1]} ${namedEvent[2]}`).slice(0, 120);
+  }
+
+  // Generic but precise composite: "Flood — Assam 2026".
+  const type = nq.disasterType
+    || hazardHeadlines[0]?.disasterType
+    || (hazardHeadlines[0] ? inferTypeFromHeadline(hazardHeadlines[0].title) : null)
+    || 'Disaster';
+  const year = nq.year || (hazardHeadlines[0]?.eventDate ? new Date(hazardHeadlines[0].eventDate!).getUTCFullYear() : null);
+  return titleCaseEventName(`${type} — ${dominantPlace}${year ? ` ${year}` : ''}`);
+}
+
+function inferTypeFromHeadline(title: string): string | null {
+  const lower = title.toLowerCase();
+  if (/cyclone|typhoon/.test(lower)) return 'Cyclone';
+  if (/flood|inundat/.test(lower)) return 'Flood';
+  if (/earthquake|quake|seismic/.test(lower)) return 'Earthquake';
+  if (/landslide|mudslide/.test(lower)) return 'Landslide';
+  if (/heat ?wave/.test(lower)) return 'Heat Wave';
+  if (/cold ?wave|frost/.test(lower)) return 'Cold Wave';
+  if (/thunderstorm|lightning/.test(lower)) return 'Thunderstorm';
+  if (/cloudburst/.test(lower)) return 'Heavy Rain';
+  if (/avalanche/.test(lower)) return 'Avalanche';
+  if (/wildfire|forest fire/.test(lower)) return 'Forest Fire';
+  if (/drought/.test(lower)) return 'Drought';
+  if (/tsunami/.test(lower)) return 'Tsunami';
+  if (/storm/.test(lower)) return 'Storm';
+  return null;
+}
+
+/** Stable event key from the derived title (NOT the raw query). */
+function eventKeyFromTitle(title: string, year: number | null): string {
+  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 70);
+  return `${slug || 'disaster'}${year ? `-${year}` : ''}`;
+}
+
+/**
+ * Finds an existing canonical event that this research is really about. Used
+ * BOTH for generic fact queries ("death count in aila" -> the Aila event) and
+ * for enriching existing verified events with newly-researched evidence.
+ */
+async function findExistingEventForEnrichment(
+  nq: NormalizedQuery,
+  evidence: RawHistoricalEvidence[],
+): Promise<{ id: string; title: string; event_key: string } | null> {
+  if (!isSupabaseConfigured()) return null;
+
+  // Candidate 1: lexical search over the query itself.
+  const lexical = await searchCanonicalEventsLexical(nq.normalized, 5).catch(() => []);
+
+  // Candidate 2: lexical search over the DOMINANT EVIDENCE PHRASE — a "death
+  // count in aila" query finds "Cyclone Aila" through the evidence titles.
+  const phraseProbe = deriveEventTitleFromEvidence(evidence, nq);
+  const lexicalFromPhrase = phraseProbe
+    ? await searchCanonicalEventsLexical(phraseProbe, 5).catch(() => [])
+    : [];
+
+  const seen = new Set<string>();
+  for (const candidate of [...lexical, ...lexicalFromPhrase]) {
+    if (seen.has(candidate.id)) continue;
+    seen.add(candidate.id);
+    if (isRelevantDatabaseHit(nq, {
+      title: candidate.title,
+      event_type: candidate.eventType,
+      state: candidate.state || null,
+      location_name: candidate.locationName,
+    })) {
+      return { id: candidate.id, title: candidate.title, event_key: candidate.eventKey };
+    }
+  }
+  return null;
+}
+
+/**
+ * Merges newly-researched evidence into an EXISTING canonical event: links
+ * observations/sources, fills empty descriptions, and records fresh claims.
+ * Never downgrades the event's verification status — only improves it.
+ */
+async function enrichExistingEvent(
+  eventId: string,
+  evidence: RawHistoricalEvidence[],
+  verification: VerificationDecision,
+  out: PersistedResearch,
+): Promise<void> {
+  // Link every observation + source (same idempotent upserts as creation).
+  for (const item of evidence) {
+    try {
+      const source = await resolveSource(item.sourceKey);
+      const hash = contentHash(`${item.title}|${item.content}|${item.url || ''}`);
+      const inserted = await supabaseRest<Array<{ id: string }>>(
+        'source_observations?on_conflict=source_id,content_hash',
+        {
+          method: 'POST',
+          headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+          body: JSON.stringify({
+            source_id: source.id,
+            external_id: item.externalId,
+            content_hash: hash,
+            title: item.title.slice(0, 500),
+            raw_content: item.content.slice(0, 8000),
+            raw_payload: item.metadata || {},
+            source_url: item.url,
+            publisher: item.publisher,
+            published_at: item.publishedAt,
+            retrieved_at: item.retrievedAt,
+            location_text: item.locationText,
+            event_category: item.disasterType,
+          }),
+        },
+      );
+      let observationId = inserted[0]?.id || null;
+      if (!observationId) {
+        const existing = await supabaseRest<Array<{ id: string }>>(
+          `source_observations?and=(source_id.eq.${source.id},content_hash.eq.${hash})&select=id&limit=1`,
+          { method: 'GET' },
+        ).catch(() => []);
+        observationId = existing[0]?.id || null;
+      }
+      if (!observationId) continue;
+      out.observationsPersisted += 1;
+
+      await supabaseRest('event_sources?on_conflict=event_id,source_id,source_observation_id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=ignore-duplicates' },
+        body: JSON.stringify({ event_id: eventId, source_id: source.id, source_observation_id: observationId }),
+      });
+      await supabaseRest('event_observations?on_conflict=event_id,observation_id', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=ignore-duplicates' },
+        body: JSON.stringify({ event_id: eventId, observation_id: observationId }),
+      }).catch(() => undefined);
+    } catch (error) {
+      out.errors.push(`enrich ${item.sourceKey}: ${(error as Error).message.slice(0, 160)}`);
+    }
+  }
+
+  // Fill an empty/thin description from the best evidence (never overwrite a
+  // richer one; never touch official instruction text).
+  const bestContent = evidence.find((item) => (item.content || '').length > 120)?.content;
+  if (bestContent) {
+    const current = await supabaseRest<Array<{ description: string | null; verification_status: string }>>(
+      `canonical_events?id=eq.${eventId}&select=description,verification_status`,
+      { method: 'GET' },
+    ).catch(() => []);
+    const currentDescription = current[0]?.description || '';
+    const shouldUpdateDescription = currentDescription.length < 200 || /documented in source citations|Official alert published through SACHET\.?$/i.test(currentDescription);
+    if (shouldUpdateDescription) {
+      await supabaseRest(`canonical_events?id=eq.${eventId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          description: bestContent.slice(0, 3000),
+          ...(verification.score > 0.6 ? { verification_reason: `${verification.reason} Enriched by multi-source research.` } : {}),
+        }),
+      }).catch(() => undefined);
+    }
+  }
+
+  // Fresh evidence can raise (never lower) the verification score.
+  if (verification.score > 0.55) {
+    await supabaseRest(`canonical_events?id=eq.${eventId}&verification_score=lt.${verification.score}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        verification_status: verification.status === 'PENDING' ? undefined : verification.status,
+        verification_score: verification.score,
+      }),
+    }).catch(() => undefined);
+  }
+
+  // Re-embed the event so vector search reflects the enriched record.
+  const rows = await supabaseRest<Array<{ title: string; description: string | null }>>(
+    `canonical_events?id=eq.${eventId}&select=title,description`,
+    { method: 'GET' },
+  ).catch(() => []);
+  if (rows[0]) {
+    await embedAndStoreEvent(eventId, `${rows[0].title} ${rows[0].description || ''}`);
+  }
+}
+
 export async function persistResearchResult(
   nq: NormalizedQuery,
   evidence: RawHistoricalEvidence[],
   verification: VerificationDecision,
+  options: { enrichEventId?: string | null } = {},
 ): Promise<PersistedResearch> {
   const out: PersistedResearch = {
     eventId: null,
     eventKey: null,
+    enrichedExistingEvent: false,
+    eventTitle: null,
     verification,
     observationsPersisted: 0,
     documentsPersisted: 0,
@@ -483,12 +755,70 @@ export async function persistResearchResult(
     return out;
   }
 
-  const eventKey = deterministicEventKey(nq);
+  // ---- ENRICHMENT PATH: the query targets an event that already exists ----
+  // Generic fact queries ("death count in aila") and enrichment intents
+  // ("deep research on Amphan") must NEVER create new events; they attach
+  // evidence to the event they are about and fill in missing facts.
+  const wantsEnrichment = nq.isGenericFactQuery
+    || ENRICHMENT_INTENT.some((pattern) => pattern.test(nq.raw))
+    || Boolean(options.enrichEventId);
+
+  if (wantsEnrichment) {
+    const existing = options.enrichEventId
+      ? (await supabaseRest<Array<{ id: string; title: string; event_key: string }>>(
+          `canonical_events?id=eq.${options.enrichEventId}&select=id,title,event_key&limit=1`,
+          { method: 'GET' },
+        ).catch(() => [] as Array<{ id: string; title: string; event_key: string }>))[0] || null
+      : await findExistingEventForEnrichment(nq, evidence);
+
+    if (existing) {
+      out.eventId = existing.id;
+      out.eventKey = existing.event_key;
+      out.eventTitle = existing.title;
+      out.enrichedExistingEvent = true;
+      await enrichExistingEvent(existing.id, evidence, verification, out);
+
+      // Search document + embedding so the enriched facts are retrievable.
+      const docId = await upsertSearchDocument({
+        documentType: 'canonical_event',
+        eventId: existing.id,
+        title: existing.title,
+        content: evidence.slice(0, 5).map((item) => `${item.title}. ${item.content}`).join(' ').slice(0, 4000),
+        sourceUrl: evidence.find((item) => item.url)?.url || null,
+      });
+      if (docId) {
+        out.documentsPersisted += 1;
+        out.embedded = await embedAndStoreSearchDocument(docId, `${existing.title} ${evidence[0]?.content || ''}`);
+      }
+      return out;
+    }
+  }
+
+  // ---- CREATION PATH: genuinely new disaster ----
+  // The title comes from the evidence, never the raw query; generic fact
+  // queries without a matching existing event create NOTHING (they are
+  // attribute lookups, not disasters).
+  if (nq.isGenericFactQuery) {
+    out.errors.push('Not persisted: query is a generic fact lookup and no matching canonical event exists.');
+    return out;
+  }
+
+  const eventTitle = deriveEventTitleFromEvidence(evidence, nq);
+  const eventKey = eventKeyFromTitle(eventTitle, nq.year);
 
   try {
     // 1. Canonical event upsert by deterministic event_key — single idempotent
     // statement (INSERT ... ON CONFLICT (event_key) DO UPDATE). No GET-then-POST
     // race, no 409 duplicate-key noise.
+    const dominantPlace = (() => {
+      const places = new Map<string, number>();
+      for (const item of evidence.slice(0, 10)) {
+        const text = `${item.locationText || ''} ${item.state || ''}`.trim();
+        if (text && text.toLowerCase() !== 'india') places.set(text, (places.get(text) || 0) + 1);
+      }
+      return [...places.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || nq.state || 'India';
+    })();
+
     const upserted = await supabaseRest<Array<{ id: string }>>(
       'canonical_events?on_conflict=event_key',
       {
@@ -496,12 +826,12 @@ export async function persistResearchResult(
         headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
         body: JSON.stringify({
           event_key: eventKey,
-          title: nq.normalized,
+          title: eventTitle,
           event_type: nq.disasterType || 'General Alert',
           status: 'ENDED',
           severity: 'Unknown',
           description: evidence[0]?.content?.slice(0, 2000) || null,
-          location_name: nq.state || 'India',
+          location_name: dominantPlace.slice(0, 500),
           state: nq.state,
           started_at: nq.year ? `${nq.year}-01-01T00:00:00Z` : (evidence[0]?.eventDate || null),
           verification_status: verification.status,
@@ -523,6 +853,7 @@ export async function persistResearchResult(
     if (!eventId) throw new Error('Canonical event upsert returned no id');
     out.eventId = eventId;
     out.eventKey = eventKey;
+    out.eventTitle = eventTitle;
 
     // 2. Per-source observations + event_sources links + claim records.
     for (const item of evidence) {
@@ -591,7 +922,7 @@ export async function persistResearchResult(
     const docId = await upsertSearchDocument({
       documentType: 'canonical_event',
       eventId,
-      title: nq.normalized,
+      title: eventTitle,
       content: evidence
         .slice(0, 5)
         .map((item) => `${item.title}. ${item.content}`)
@@ -601,7 +932,7 @@ export async function persistResearchResult(
     });
     if (docId) {
       out.documentsPersisted += 1;
-      out.embedded = await embedAndStoreSearchDocument(docId, nq.normalized);
+      out.embedded = await embedAndStoreSearchDocument(docId, `${eventTitle}. ${evidence[0]?.content || ''}`);
     }
   } catch (error) {
     out.errors.push((error as Error).message.slice(0, 300));
@@ -832,7 +1163,7 @@ export async function researchHistoricalDisaster(
       ? {
           id: persistence.eventId,
           eventKey: persistence.eventKey,
-          title: nq.normalized,
+          title: persistence.eventTitle || nq.normalized,
           verificationStatus: verification.status,
           verificationScore: verification.score,
         }

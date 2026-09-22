@@ -27,6 +27,17 @@ function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 80);
 }
 
+/** Every stored event name is Title Case — "2020 cyclone amphan" is not acceptable. */
+function titleCaseEventName(value: string): string {
+  const minor = new Set(['of', 'the', 'in', 'and', 'at', 'on', 'a', 'an', 'to', 'for', 'over', 'near', 'by', 'with']);
+  return value
+    .toLowerCase()
+    .split(/\s+/)
+    .map((word, index) => (index > 0 && minor.has(word) ? word : word.charAt(0).toUpperCase() + word.slice(1)))
+    .join(' ')
+    .trim();
+}
+
 async function seedHistoricalCatalog(): Promise<JobResult> {
   const result: JobResult = {
     jobType: 'backfill',
@@ -44,12 +55,25 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
     try {
       const year = item.eventDate ? new Date(item.eventDate).getUTCFullYear() : item.year;
       const eventKey = `${slug(item.disasterType)}-${slug(item.state || item.location || 'india')}-${year}-${slug(item.eventName)}`;
+
+      // CREATION-ONLY: an event already in the database is never rewritten by
+      // the scheduled backfill. Existing records only evolve when a user's
+      // deep research genuinely extends them (researchOrchestrator enrich).
+      const existing = await supabaseRest<Array<{ id: string }>>(
+        `canonical_events?event_key=eq.${encodeURIComponent(eventKey)}&select=id&limit=1`,
+        { method: 'GET' },
+      ).catch(() => []);
+      if (existing.length > 0) {
+        result.recordsUpdated++; // counted as "already present, skipped"
+        continue;
+      }
+
       const upserted = await supabaseRest<Array<{ id: string }>>('canonical_events?on_conflict=event_key', {
         method: 'POST',
         headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
         body: JSON.stringify({
           event_key: eventKey,
-          title: item.eventName,
+          title: titleCaseEventName(item.eventName),
           event_type: item.disasterType,
           status: 'ARCHIVED',
           severity: item.evidenceStatus === 'High Confidence' ? 'Severe' : 'Moderate',
@@ -195,7 +219,7 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
       const docId = await upsertSearchDocument({
         documentType: 'canonical_event',
         eventId,
-        title: item.eventName,
+        title: titleCaseEventName(item.eventName),
         content: [
           item.whatHappened,
           item.affectedAreas,
@@ -209,7 +233,7 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
       if (docId) await embedAndStoreSearchDocument(docId, `${item.eventName}. ${item.whatHappened}`);
 
       if (observationCount > 0) result.recordsCreated++;
-      else result.recordsUpdated++;
+      else result.recordsRejected++;
     } catch (error) {
       result.recordsRejected++;
       result.errorMessage = (error as Error).message;

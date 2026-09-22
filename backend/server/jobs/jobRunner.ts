@@ -7,7 +7,8 @@ export type JobType =
   | 'embedding'
   | 'citizen_verification'
   | 'notification'
-  | 'backfill';
+  | 'backfill'
+  | 'past_discovery';
 
 export type JobStatus = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'PARTIAL';
 

@@ -1,5 +1,6 @@
 import { createServer } from 'http';
 import { createApp } from './server/app';
+import { startJobScheduler } from './server/jobs/scheduler';
 
 async function startServer() {
   const app = createApp({ mode: 'dev', serveStatic: false });
@@ -12,6 +13,9 @@ async function startServer() {
 
   server.listen(port, '0.0.0.0', () => {
     console.log(`Disaster Intelligence Platform API listening on port ${port}`);
+    // Automatic data-pipeline heartbeat: ingestion, reconciliation, lifecycle,
+    // notifications, embeddings and past-discovery all run on intervals now.
+    startJobScheduler();
   });
 }
 

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   Activity, AlertTriangle, Bot, CheckCircle2, Clock, Cpu, Database, FileWarning, Layers,
-  Loader2, Play, RefreshCw, Rss, Search, Server, ShieldCheck, XCircle,
+  Loader2, Play, RefreshCw, Rss, Search, Server, ShieldCheck, Trash2, XCircle,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import {
@@ -23,6 +23,12 @@ interface AdminEventRow {
   id: string; title: string; event_type: string; status: string; severity: string;
   verification_status: string; verification_score: number; state: string | null;
   last_observed_at: string | null; updated_at: string;
+}
+
+interface AdminPastEventRow {
+  id: string; title: string; event_type: string; status: string; severity: string;
+  verification_status: string; verification_score: number; state: string | null;
+  started_at: string | null; updated_at: string;
 }
 
 interface AdminReportRow {
@@ -63,8 +69,12 @@ const MANUAL_JOBS = [
   { key: 'embeddings', label: 'Embeddings', icon: Cpu, description: 'Backfill missing embeddings' },
   { key: 'verify-reports', label: 'Verify Reports', icon: ShieldCheck, description: 'Run citizen report verification' },
   { key: 'notifications', label: 'Notifications', icon: Bot, description: 'Dispatch queued notifications' },
-  { key: 'backfill', label: 'Backfill', icon: Database, description: 'Seed historical disaster archive' },
+  { key: 'backfill', label: 'Backfill', icon: Database, description: 'Seed missing curated historical disasters (creation-only)' },
+  { key: 'discovery', label: 'Discover Past', icon: Search, description: 'Automated multi-source research for disasters missing from the Past layer' },
 ] as const;
+
+/** Jobs legitimately take minutes — the default 30s api timeout aborts them client-side. */
+const JOB_TIMEOUT_MS = 10 * 60_000;
 
 const JOB_TONE: Record<string, string> = {
   COMPLETED: 'success', FAILED: 'danger', RUNNING: 'warning', TIMEOUT: 'danger',
@@ -110,6 +120,7 @@ export const AdminPage: React.FC = () => {
   const { toasts, push, dismiss } = useToasts();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [events, setEvents] = useState<AdminEventRow[]>([]);
+  const [pastEvents, setPastEvents] = useState<AdminPastEventRow[]>([]);
   const [reports, setReports] = useState<AdminReportRow[]>([]);
   const [sources, setSources] = useState<AdminSourceRow[]>([]);
   const [jobs, setJobs] = useState<AdminJobRow[]>([]);
@@ -118,7 +129,9 @@ export const AdminPage: React.FC = () => {
   const [insights, setInsights] = useState<InsightsPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [runningJob, setRunningJob] = useState<string | null>(null);
+  const [runningJobs, setRunningJob] = useState<Set<string>>(new Set());
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [wiping, setWiping] = useState(false);
   // Historical research console state.
   const [researchQuery, setResearchQuery] = useState('');
   const [researchForce, setResearchForce] = useState(false);
@@ -130,9 +143,10 @@ export const AdminPage: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const [ov, ev, rep, src, jb, emb, ai, ins] = await Promise.all([
+      const [ov, ev, pastEv, rep, src, jb, emb, ai, ins] = await Promise.all([
         api.get<Overview>('/api/admin/overview'),
         api.get<{ events: AdminEventRow[] }>('/api/admin/events'),
+        api.get<{ events: AdminPastEventRow[] }>('/api/admin/past-events'),
         api.get<{ reports: AdminReportRow[] }>('/api/admin/reports'),
         api.get<{ sources: AdminSourceRow[] }>('/api/admin/sources'),
         api.get<{ jobs: AdminJobRow[] }>('/api/admin/jobs'),
@@ -142,6 +156,7 @@ export const AdminPage: React.FC = () => {
       ]);
       setOverview(ov);
       setEvents(ev.events || []);
+      setPastEvents(pastEv.events || []);
       setReports(rep.reports || []);
       setSources(src.sources || []);
       setJobs(jb.jobs || []);
@@ -158,15 +173,40 @@ export const AdminPage: React.FC = () => {
   useEffect(() => { void loadAll(); }, [loadAll]);
 
   const runJob = async (jobKey: string, label: string) => {
-    setRunningJob(jobKey);
+    // Per-button busy state: other jobs stay clickable while this one runs.
+    setRunningJob((prev) => new Set(prev).add(jobKey));
+    push('info', `${label} started — running in the background, result toast follows on completion.`);
+    const startedAt = Date.now();
     try {
-      await api.post(`/api/admin/jobs/${jobKey}`);
-      push('success', `${label} job completed. Review the run below.`);
+      const result = await api.post<{ success: boolean; result: { status?: string; recordsCreated?: number; recordsUpdated?: number; recordsProcessed?: number; recordsRejected?: number; errorMessage?: string; createdEventKeys?: string[] } }>(
+        `/api/admin/jobs/${jobKey}`,
+        undefined,
+        { timeout: JOB_TIMEOUT_MS },
+      );
+      const r = result?.result;
+      const seconds = Math.round((Date.now() - startedAt) / 1000);
+      if (r?.status === 'FAILED') {
+        push('error', `${label} job failed after ${seconds}s: ${r.errorMessage || 'see job runs below'}`);
+      } else if (r?.status === 'PARTIAL') {
+        push('info', `${label} job partially succeeded (${seconds}s): ${r.errorMessage || 'some providers failed — see job runs'}`);
+      } else {
+        const created = r?.recordsCreated ?? 0;
+        const updated = r?.recordsUpdated ?? 0;
+        push('success', `${label} job completed in ${seconds}s — processed ${r?.recordsProcessed ?? 0}, created ${created}, updated ${updated}.`);
+      }
       await loadAll();
     } catch (err) {
-      push('error', `${label} job failed: ${(err as Error).message}`);
+      const seconds = Math.round((Date.now() - startedAt) / 1000);
+      const message = (err as Error).message || '';
+      push('error', `${label} job failed after ${seconds}s: ${message}`);
+      // The server may still be executing — surface the latest run state.
+      await loadAll().catch(() => undefined);
     } finally {
-      setRunningJob(null);
+      setRunningJob((prev) => {
+        const next = new Set(prev);
+        next.delete(jobKey);
+        return next;
+      });
     }
   };
 
@@ -242,6 +282,44 @@ export const AdminPage: React.FC = () => {
     }
   };
 
+  const deleteEvent = async (id: string, title: string) => {
+    // Native confirm keeps destructive actions deliberate; the API additionally
+    // refuses to delete live (active) events server-side.
+    if (!window.confirm(`Delete "${title}" permanently, including its sources, claims and documents?`)) return;
+    setDeletingId(id);
+    try {
+      await api.delete(`/api/admin/events/${id}`);
+      push('success', `Deleted "${title.slice(0, 60)}" and all attached records.`);
+      await loadAll();
+    } catch (err) {
+      push('error', `Delete failed: ${(err as Error).message}`);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const wipeAllData = async () => {
+    const phrase = window.prompt(
+      'This permanently deletes ALL disaster data (events, sources, observations, documents, job runs). User accounts and reports are kept.\n\nType DELETE ALL DISASTER DATA to confirm:',
+    );
+    if (phrase !== 'DELETE ALL DISASTER DATA') {
+      if (phrase !== null) push('error', 'Confirmation phrase did not match. Nothing was deleted.');
+      return;
+    }
+    setWiping(true);
+    try {
+      const result = await api.post<{ success: boolean; deleted: Record<string, number> }>('/api/admin/data/wipe-all', { confirm: phrase }, { timeout: JOB_TIMEOUT_MS });
+      const failed = Object.entries(result.deleted || {}).filter(([, n]) => n === -1).map(([t]) => t);
+      if (failed.length > 0) push('error', `Wipe completed with failures: ${failed.join(', ')}`);
+      else push('success', 'All disaster data wiped. Run Backfill + Ingest to rebuild.');
+      await loadAll();
+    } catch (err) {
+      push('error', `Wipe failed: ${(err as Error).message}`);
+    } finally {
+      setWiping(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-10 space-y-6" aria-busy="true">
@@ -308,26 +386,55 @@ export const AdminPage: React.FC = () => {
         title="Manual Job Execution"
         description="Admin-only triggers. Scheduled runs use CRON_SECRET endpoints; these run the same audited job bodies."
       >
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
-          {MANUAL_JOBS.map((job) => (
-            <button
-              key={job.key}
-              type="button"
-              onClick={() => runJob(job.key, job.label)}
-              disabled={runningJob !== null}
-              title={job.description}
-              className={cx(
-                'flex flex-col items-center gap-1.5 p-3.5 rounded-2xl border transition-all cursor-pointer text-center',
-                runningJob === job.key
-                  ? 'bg-[#0F1B29] text-[#ECF8F8] border-[#0F1B29]'
-                  : 'bg-white border-[#DDDDDD] hover:bg-[#F3F4F5] hover:border-[#B8BEC5]',
-                runningJob !== null && runningJob !== job.key && 'opacity-50',
-              )}
-            >
-              <job.icon className="w-4 h-4" />
-              <span className="text-[11px] font-bold">{job.label}</span>
-            </button>
-          ))}
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2">
+          {MANUAL_JOBS.map((job) => {
+            const busy = runningJobs.has(job.key);
+            return (
+              <button
+                key={job.key}
+                type="button"
+                onClick={() => runJob(job.key, job.label)}
+                disabled={busy}
+                title={job.description}
+                className={cx(
+                  'flex flex-col items-center gap-1.5 p-3.5 rounded-2xl border transition-all cursor-pointer text-center',
+                  busy
+                    ? 'bg-[#0F1B29] text-[#ECF8F8] border-[#0F1B29]'
+                    : 'bg-white border-[#DDDDDD] hover:bg-[#F3F4F5] hover:border-[#B8BEC5]',
+                )}
+              >
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <job.icon className="w-4 h-4" />}
+                <span className="text-[11px] font-bold">{busy ? 'Running…' : job.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        <p className="mt-3 text-[11px] text-[#747F8D]">
+          Jobs run independently — you can trigger another while one is running. All jobs also run automatically on intervals (ingest ~15min · notifications ~5min · lifecycle ~30min · reconcile ~1h · embeddings ~6h · past-discovery ~12h). Long-running jobs (Ingest, Backfill, Discover Past) take 1–3 minutes — the result toast confirms completion.
+        </p>
+      </PremiumPanel>
+
+      {/* Danger zone */}
+      <PremiumPanel
+        title="Danger Zone"
+        description="Destructive data operations. Live active disasters can never be deleted here — use Reject."
+      >
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-4 rounded-2xl border border-rose-200 bg-rose-50/50">
+          <div>
+            <p className="text-sm font-semibold text-[#0F1B29]">Wipe all disaster data</p>
+            <p className="text-xs text-[#747F8D] mt-0.5">
+              Deletes every canonical event, source observation, search document, embedding, job run and health record. Citizen reports, users and subscriptions are preserved.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={wipeAllData}
+            disabled={wiping}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-rose-700 text-white text-xs font-bold hover:bg-rose-800 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed shrink-0"
+          >
+            {wiping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+            {wiping ? 'Wiping...' : 'Wipe All Data'}
+          </button>
         </div>
       </PremiumPanel>
 
@@ -478,15 +585,67 @@ export const AdminPage: React.FC = () => {
             { key: 'state', label: 'State', render: (row) => <span className="text-xs text-[#747F8D]">{row.state || '—'}</span> },
             { key: 'updated', label: 'Updated', render: (row) => <span className="text-xs text-[#747F8D] whitespace-nowrap">{fmtTime(row.updated_at)}</span> },
             { key: 'actions', label: 'Actions', render: (row) => (
-              <button
-                type="button"
-                onClick={() => rejectEvent(row.id)}
-                disabled={row.verification_status === 'REJECTED'}
-                className="text-[11px] font-semibold text-[#0F1B29] hover:underline disabled:opacity-40 disabled:no-underline cursor-pointer disabled:cursor-not-allowed"
-                title="Reject this event and remove it from public surfaces"
-              >
-                Reject
-              </button>
+              <span className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => rejectEvent(row.id)}
+                  disabled={row.verification_status === 'REJECTED'}
+                  className="text-[11px] font-semibold text-[#0F1B29] hover:underline disabled:opacity-40 disabled:no-underline cursor-pointer disabled:cursor-not-allowed"
+                  title="Reject this event and remove it from public surfaces"
+                >
+                  Reject
+                </button>
+                {['ENDED', 'ARCHIVED', 'REJECTED'].includes(row.status) && (
+                  <button
+                    type="button"
+                    onClick={() => deleteEvent(row.id, row.title)}
+                    className="flex items-center gap-1 text-[11px] font-semibold text-rose-700 hover:underline cursor-pointer"
+                    title="Permanently delete this past disaster and all attached records"
+                  >
+                    <Trash2 className="w-3 h-3" /> Delete
+                  </button>
+                )}
+              </span>
+            ) },
+          ]}
+        />
+      </PremiumPanel>
+
+      {/* Past layer disasters — everything the Past layer serves, with delete control */}
+      <PremiumPanel
+        title="Past Layer Disasters"
+        description="Every ended/archived disaster the Past layer serves. Delete removes the event AND all its sources, claims, documents and embeddings — permanently."
+      >
+        <DataTable
+          rows={pastEvents}
+          keyOf={(row) => row.id}
+          dense
+          empty={<EmptyState icon={<Database className="w-6 h-6" />} title="Past layer is empty" description="Run Backfill or Discover Past to research and archive historical disasters." />}
+          columns={[
+            { key: 'title', label: 'Disaster', className: 'max-w-[300px]', render: (row) => <span className="block truncate font-medium" title={row.title}>{row.title}</span> },
+            { key: 'type', label: 'Type', render: (row) => <span className="text-xs text-[#747F8D]">{row.event_type}</span> },
+            { key: 'state', label: 'State', render: (row) => <span className="text-xs text-[#747F8D]">{row.state || '—'}</span> },
+            { key: 'date', label: 'Event Date', render: (row) => <span className="text-xs text-[#747F8D] whitespace-nowrap">{row.started_at ? fmtTime(row.started_at) : '—'}</span> },
+            { key: 'status', label: 'Status', render: (row) => <StatusBadge tone={row.status === 'ARCHIVED' ? 'neutral' : 'ink'}>{row.status}</StatusBadge> },
+            { key: 'verification', label: 'Verification', render: (row) => (
+              <span className="inline-flex items-center gap-2">
+                <StatusBadge tone={row.verification_status.includes('VERIFIED') ? 'success' : row.verification_status === 'REJECTED' ? 'danger' : 'warning'}>{row.verification_status.replace(/_/g, ' ')}</StatusBadge>
+                <span className="text-[10px] text-[#747F8D] tabular-nums">{Math.round((row.verification_score || 0) * 100)}%</span>
+              </span>
+            ) },
+            { key: 'actions', label: 'Actions', render: (row) => (
+              <span className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => deleteEvent(row.id, row.title)}
+                  disabled={deletingId === row.id}
+                  className="flex items-center gap-1 text-[11px] font-semibold text-rose-700 hover:underline disabled:opacity-40 disabled:no-underline cursor-pointer disabled:cursor-not-allowed"
+                  title="Permanently delete this past disaster and all attached records"
+                >
+                  {deletingId === row.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                  {deletingId === row.id ? 'Deleting…' : 'Delete'}
+                </button>
+              </span>
             ) },
           ]}
         />

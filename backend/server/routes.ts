@@ -44,7 +44,9 @@ import {
   unauthorized,
   unavailable,
 } from './lib/httpError';
-import { researchHistoricalDisaster, type PersistedResearch } from './lib/researchOrchestrator';
+import { researchHistoricalDisaster, titleCaseEventName, type PersistedResearch } from './lib/researchOrchestrator';
+import { runPastDiscoveryJob } from './jobs/pastDiscoveryJob';
+import { getSchedulerStatus } from './jobs/scheduler';
 import { scoreReportRisk } from './lib/reportRisk';
 import { computeInsights, type InsightsPayload } from './lib/insights';
 import type { SourceKey } from './lib/sourceRegistry';
@@ -218,32 +220,68 @@ function summarizeFromSources(
   return fragments.length ? fragments.join(' ') : fallback;
 }
 
+/**
+ * Timeline builder — strict rules so the incident timeline stays meaningful:
+ *  1. ONLY sources that actually belong to this event (no off-event junk:
+ *     unrelated Aila/Amphan/Bulbul articles leaking into an Amphan timeline).
+ *  2. True chronological order by the source's own publication date, falling
+ *     back to the event's date — never a fabricated index order.
+ *  3. Undated items go LAST (sorted after all dated milestones), not scattered.
+ *  4. One entry per distinct publisher story — syndicated duplicates collapse.
+ */
 function buildTimelineFromSources(
   sources: Array<{ id: string; title: string; summary: string; publishedAt: string }>,
   fallbackDate: string,
 ): EvidenceBundle['timeline'] {
-  const fallbackParsed = Date.parse(fallbackDate);
-  return sources
-    .map((source, index) => {
-      const parsed = Date.parse(source.publishedAt);
-      const isHistoricalYear = Number.isFinite(parsed) && new Date(parsed).getUTCFullYear() < 2026;
-      let date = source.publishedAt;
-      if (Number.isFinite(parsed)) {
+  const fallbackParsed = Number.isFinite(Date.parse(fallbackDate)) ? Date.parse(fallbackDate) : null;
+  const eventYear = fallbackParsed ? new Date(fallbackParsed).getUTCFullYear() : null;
+
+  const seenTitles = new Set<string>();
+  const entries: Array<EvidenceBundle['timeline'][number] & { sortTime: number }> = [];
+
+  for (const source of sources) {
+    const title = cleanSnippet(source.title).slice(0, 120);
+    if (!title || title.length < 8) continue;
+
+    // Collapse syndicated duplicates (same headline from different carriers).
+    const titleKey = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 80);
+    if (seenTitles.has(titleKey)) continue;
+    seenTitles.add(titleKey);
+
+    const parsed = Date.parse(source.publishedAt);
+    let sortTime: number;
+    let date: string;
+
+    if (Number.isFinite(parsed)) {
+      const year = new Date(parsed).getUTCFullYear();
+      // A published date wildly outside the event's year is suspect metadata
+      // (crawlers sometimes emit retrieval-time dates); clamp to event year
+      // rather than showing a 2026 item inside a 2009 disaster timeline.
+      if (eventYear && Math.abs(year - eventYear) > 1) {
+        sortTime = Date.UTC(eventYear, 11, 31);
+        date = new Date(fallbackParsed!).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      } else {
+        sortTime = parsed;
         date = new Date(parsed).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-      } else if (fallbackDate) {
-        date = Number.isFinite(fallbackParsed)
-          ? new Date(fallbackParsed).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
-          : fallbackDate;
       }
-      return {
-        date,
-        event: cleanSnippet(source.title).slice(0, 120) || `Milestone ${index + 1}`,
-        description: `${cleanSnippet(source.summary || source.title)} [${source.id}]`,
-        citations: [source.id],
-        sortTime: isHistoricalYear ? parsed : Number.isFinite(fallbackParsed) ? fallbackParsed + index : Number.MAX_SAFE_INTEGER,
-      };
-    })
-    .filter((step) => step.description.length > 8)
+    } else if (fallbackParsed) {
+      sortTime = fallbackParsed;
+      date = new Date(fallbackParsed).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+    } else {
+      sortTime = Number.MAX_SAFE_INTEGER; // undated: last, not scattered
+      date = 'Date unavailable';
+    }
+
+    entries.push({
+      date,
+      event: title,
+      description: `${cleanSnippet(source.summary || title)} [${source.id}]`,
+      citations: [source.id],
+      sortTime,
+    });
+  }
+
+  return entries
     .sort((a, b) => a.sortTime - b.sortTime)
     .slice(0, 12)
     .map(({ sortTime: _sortTime, ...step }) => step);
@@ -338,6 +376,8 @@ router.get('/events/:id/timeline', async (req: Request, res: Response) => {
 function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase().replace(/\s+/g, ' ');
 }
+
+const RICH_BUNDLE_DOCUMENT_TITLE = 'Rich Evidence Bundle';
 
 /**
  * Persistence is only considered succeeded when the canonical event AND at
@@ -516,7 +556,7 @@ async function persistExternalResearch(query: string, bundle: EvidenceBundle): P
         headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
         body: JSON.stringify({
           event_key: eventKey,
-          title: (bundle.eventName || query).slice(0, 500),
+          title: titleCaseEventName((bundle.eventName || query).slice(0, 120)),
           event_type: bundle.disasterType || 'General Alert',
           status: 'ARCHIVED',
           severity: 'Unknown',
@@ -1645,6 +1685,22 @@ router.get('/admin/events', requireAuth, requireAdmin, async (_req: Request, res
   }
 });
 
+/**
+ * Everything the Past layer serves (ended + archived disasters), including
+ * non-public records so admins can see and delete anything the archive holds.
+ */
+router.get('/admin/past-events', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const events = await supabaseRest<Array<Record<string, unknown>>>(
+      'canonical_events?status=in.(ENDED,ARCHIVED)&select=id,title,event_type,status,severity,verification_status,verification_score,state,started_at,updated_at&order=started_at.desc.nullslast&limit=500',
+      { method: 'GET' },
+    );
+    res.json({ events });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 router.get('/admin/reports', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const reports = await supabaseRest<Array<Record<string, unknown>>>(
@@ -1749,6 +1805,7 @@ const ADMIN_JOB_MAP: Record<string, () => Promise<unknown>> = {
   'verify-reports': runCitizenVerificationJob,
   notifications: runNotificationJob,
   backfill: runHistoricalBackfillJob,
+  discovery: runPastDiscoveryJob,
 };
 
 router.post('/admin/jobs/:job', requireAuth, requireAdmin, async (req: Request, res: Response) => {
@@ -1757,6 +1814,101 @@ router.post('/admin/jobs/:job', requireAuth, requireAdmin, async (req: Request, 
     if (!job) throw notFound(`Unknown job: ${req.params.job}`);
     const result = await job();
     res.json({ success: true, result });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+// Scheduler introspection for the admin panel.
+router.get('/admin/scheduler', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    res.json({ jobs: getSchedulerStatus() });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Admin: destructive data management (delete one past disaster / wipe all)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes a single canonical event and everything hanging off it. The event
+ * must be archived/ended/rejected — live active disasters cannot be deleted
+ * from here (use Reject instead) so a misclick cannot silence a real alert.
+ */
+router.delete('/admin/events/:id', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) throw badRequest('A valid event id is required');
+    if (!isSupabaseConfigured()) throw unavailable('Database not configured');
+
+    const rows = await supabaseRest<Array<{ id: string; status: string }>>(
+      `canonical_events?id=eq.${req.params.id}&select=id,status`,
+      { method: 'GET' },
+    );
+    const event = rows[0];
+    if (!event) throw notFound('Event not found');
+    if (['DEVELOPING', 'ACTIVE', 'UPDATING', 'ENDING'].includes(event.status)) {
+      throw badRequest('Live events cannot be deleted — use Reject to remove them from public surfaces.');
+    }
+
+    // Children first (defensive; most FKs cascade server-side too).
+    await supabaseRest(`search_documents?event_id=eq.${event.id}`, { method: 'DELETE' }).catch(() => undefined);
+    await supabaseRest(`canonical_event_claims?event_id=eq.${event.id}`, { method: 'DELETE' }).catch(() => undefined);
+    await supabaseRest(`event_sources?event_id=eq.${event.id}`, { method: 'DELETE' }).catch(() => undefined);
+    await supabaseRest(`event_observations?event_id=eq.${event.id}`, { method: 'DELETE' }).catch(() => undefined);
+    await supabaseRest(`event_updates?event_id=eq.${event.id}`, { method: 'DELETE' }).catch(() => undefined);
+    await supabaseRest(`event_embeddings?event_id=eq.${event.id}`, { method: 'DELETE' }).catch(() => undefined);
+    await supabaseRest(`canonical_events?id=eq.${event.id}`, { method: 'DELETE' });
+
+    res.json({ success: true, deleted: event.id });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/**
+ * Wipes ALL derived disaster data — canonical events, observations, links,
+ * claims, search documents, embeddings, job runs, health records. User data
+ * (profiles, subscriptions, phones, citizen reports, notifications) is NOT
+ * touched. Requires an explicit confirmation phrase in the body.
+ */
+router.post('/admin/data/wipe-all', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    if (!isSupabaseConfigured()) throw unavailable('Database not configured');
+    const confirm = typeof req.body?.confirm === 'string' ? req.body.confirm.trim() : '';
+    if (confirm !== 'DELETE ALL DISASTER DATA') {
+      throw badRequest('Confirmation required: pass confirm="DELETE ALL DISASTER DATA" exactly.');
+    }
+
+    const deleted: Record<string, number> = {};
+    // Tables with no user-data foreign keys, in safe order.
+    const targets: Array<[string, string]> = [
+      ['event_embeddings', 'event_embeddings'],
+      ['search_documents', 'search_documents'],
+      ['canonical_event_claims', 'canonical_event_claims'],
+      ['event_sources', 'event_sources'],
+      ['event_observations', 'event_observations'],
+      ['event_updates', 'event_updates'],
+      ['canonical_events', 'canonical_events'],
+      ['source_embeddings', 'source_embeddings'],
+      ['source_observations', 'source_observations'],
+      ['source_health', 'source_health'],
+      ['job_runs', 'job_runs'],
+    ];
+
+    for (const [label, table] of targets) {
+      try {
+        const countBefore = await supabaseRest<Array<{ n: number }>>(`${table}?select=id&limit=100000`, { method: 'GET' }).catch(() => []);
+        await supabaseRest(table, { method: 'DELETE' });
+        deleted[label] = Array.isArray(countBefore) ? countBefore.length : 0;
+      } catch (error) {
+        deleted[label] = -1; // deletion failed for this table
+        console.warn(`[admin:wipe] ${table} deletion failed:`, (error as Error).message.slice(0, 160));
+      }
+    }
+
+    res.json({ success: true, deleted });
   } catch (error) {
     sendError(res, error);
   }
