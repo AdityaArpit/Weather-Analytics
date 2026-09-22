@@ -69,12 +69,17 @@ const MANUAL_JOBS = [
   { key: 'embeddings', label: 'Embeddings', icon: Cpu, description: 'Backfill missing embeddings' },
   { key: 'verify-reports', label: 'Verify Reports', icon: ShieldCheck, description: 'Run citizen report verification' },
   { key: 'notifications', label: 'Notifications', icon: Bot, description: 'Dispatch queued notifications' },
-  { key: 'backfill', label: 'Backfill', icon: Database, description: 'Seed missing curated historical disasters (creation-only)' },
+  { key: 'backfill', label: 'Backfill', icon: Database, description: 'Fill the Past layer — seed curated catalog, then multi-source research for anything missing (creation-only)' },
   { key: 'discovery', label: 'Discover Past', icon: Search, description: 'Automated multi-source research for disasters missing from the Past layer' },
 ] as const;
 
-/** Jobs legitimately take minutes — the default 30s api timeout aborts them client-side. */
-const JOB_TIMEOUT_MS = 10 * 60_000;
+/** Admin job POSTs return as soon as the job is spawned (fire-and-forget); results come from the status poll. */
+const JOB_START_TIMEOUT_MS = 30_000;
+const JOB_POLL_INTERVAL_MS = 3_000;
+const JOB_POLL_CAP_MS = 15 * 60_000;
+
+/** The wipe-all endpoint is genuinely synchronous — give it room before the client aborts. */
+const WIPE_TIMEOUT_MS = 10 * 60_000;
 
 const JOB_TONE: Record<string, string> = {
   COMPLETED: 'success', FAILED: 'danger', RUNNING: 'warning', TIMEOUT: 'danger',
@@ -139,8 +144,27 @@ export const AdminPage: React.FC = () => {
   const [researchResult, setResearchResult] = useState<ResearchResult | null>(null);
   const [researchBatch, setResearchBatch] = useState<ResearchBatchResult | null>(null);
 
-  const loadAll = useCallback(async () => {
-    setLoading(true);
+interface ManualJobResult {
+  status?: string;
+  recordsCreated?: number;
+  recordsUpdated?: number;
+  recordsProcessed?: number;
+  recordsRejected?: number;
+  errorMessage?: string;
+  createdEventKeys?: string[];
+}
+
+interface ManualJobState {
+  running: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  result: ManualJobResult | null;
+  error: string | null;
+}
+
+const loadAll = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = options?.silent === true;
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const [ov, ev, pastEv, rep, src, jb, emb, ai, ins] = await Promise.all([
@@ -164,43 +188,69 @@ export const AdminPage: React.FC = () => {
       setEmbeddings(emb);
       setAiHealth(ai);
     } catch (err) {
-      setError((err as Error).message);
+      // Silent refreshes must never blank the console — keep the previous data.
+      if (!silent) setError((err as Error).message);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
   useEffect(() => { void loadAll(); }, [loadAll]);
 
   const runJob = async (jobKey: string, label: string) => {
-    // Per-button busy state: other jobs stay clickable while this one runs.
+    // Buttons are never disabled — a tracked click just re-surfaces status,
+    // so a long run can never wedge the console (the original bug).
+    if (runningJobs.has(jobKey)) {
+      push('info', `${label} is already running in the background — a result toast follows on completion.`);
+      return;
+    }
     setRunningJob((prev) => new Set(prev).add(jobKey));
-    push('info', `${label} started — running in the background, result toast follows on completion.`);
-    const startedAt = Date.now();
+    const triggerAt = Date.now();
     try {
-      const result = await api.post<{ success: boolean; result: { status?: string; recordsCreated?: number; recordsUpdated?: number; recordsProcessed?: number; recordsRejected?: number; errorMessage?: string; createdEventKeys?: string[] } }>(
+      const start = await api.post<{ success: boolean; started: boolean; alreadyRunning: boolean; state: ManualJobState }>(
         `/api/admin/jobs/${jobKey}`,
         undefined,
-        { timeout: JOB_TIMEOUT_MS },
+        { timeout: JOB_START_TIMEOUT_MS },
       );
-      const r = result?.result;
-      const seconds = Math.round((Date.now() - startedAt) / 1000);
-      if (r?.status === 'FAILED') {
-        push('error', `${label} job failed after ${seconds}s: ${r.errorMessage || 'see job runs below'}`);
-      } else if (r?.status === 'PARTIAL') {
-        push('info', `${label} job partially succeeded (${seconds}s): ${r.errorMessage || 'some providers failed — see job runs'}`);
-      } else {
-        const created = r?.recordsCreated ?? 0;
-        const updated = r?.recordsUpdated ?? 0;
-        push('success', `${label} job completed in ${seconds}s — processed ${r?.recordsProcessed ?? 0}, created ${created}, updated ${updated}.`);
+      push('info', start.alreadyRunning
+        ? `${label} was already running — tracking the in-flight run; a result toast follows.`
+        : `${label} started in the background — keep working, a result toast follows on completion.`);
+
+      // Poll the server-side job state until it finishes (bounded, so a
+      // wedged server can't pin the chip forever).
+      let state = start.state;
+      const deadline = Date.now() + JOB_POLL_CAP_MS;
+      while (state?.running && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, JOB_POLL_INTERVAL_MS));
+        try {
+          const polled = await api.get<{ state: ManualJobState }>(`/api/admin/jobs/${jobKey}/status`, { timeout: 15_000 });
+          state = polled.state;
+        } catch {
+          // Transient poll failure — keep trying until the deadline.
+        }
       }
-      await loadAll();
+
+      const seconds = Math.round((Date.now() - triggerAt) / 1000);
+      if (state?.running) {
+        push('info', `${label} is still running on the server after ${seconds}s — see Job Runs below shortly.`);
+      } else if (!state?.result && state?.error) {
+        push('error', `${label} job failed after ${seconds}s: ${state.error}`);
+      } else if (!state?.result && !state?.finishedAt) {
+        push('info', `${label} finished without a recorded result (server may have restarted) — see Job Runs below.`);
+      } else {
+        const r = state?.result ?? undefined;
+        if (r?.status === 'FAILED') {
+          push('error', `${label} job failed after ${seconds}s: ${r.errorMessage || 'see job runs below'}`);
+        } else if (r?.status === 'PARTIAL') {
+          push('info', `${label} job partially succeeded (${seconds}s): ${r.errorMessage || 'some providers failed — see job runs'}`);
+        } else {
+          push('success', `${label} job completed in ${seconds}s — processed ${r?.recordsProcessed ?? 0}, created ${r?.recordsCreated ?? 0}, updated ${r?.recordsUpdated ?? 0}.`);
+        }
+      }
+      await loadAll({ silent: true });
     } catch (err) {
-      const seconds = Math.round((Date.now() - startedAt) / 1000);
-      const message = (err as Error).message || '';
-      push('error', `${label} job failed after ${seconds}s: ${message}`);
-      // The server may still be executing — surface the latest run state.
-      await loadAll().catch(() => undefined);
+      push('error', `${label} failed to start: ${(err as Error).message}`);
+      await loadAll({ silent: true }).catch(() => undefined);
     } finally {
       setRunningJob((prev) => {
         const next = new Set(prev);
@@ -236,7 +286,7 @@ export const AdminPage: React.FC = () => {
         const persisted = result.results.filter((item) => item.persistence?.succeeded).length;
         const dbHits = result.results.filter((item) => item.source === 'database').length;
         push('success', `Analysis shift complete: ${persisted} persisted, ${dbHits} already in DB, ${result.count} total.`);
-        await loadAll();
+        await loadAll({ silent: true });
         return;
       }
       setResearchResult(result);
@@ -244,7 +294,7 @@ export const AdminPage: React.FC = () => {
       else if (result.source === 'none') push('error', 'No sufficiently reliable evidence was available.');
       else if (result.persistence?.succeeded) push('success', `Research complete and persisted (${result.persistence.observationsPersisted} sources).`);
       else push('info', 'Research retrieved but persistence was incomplete — see details.');
-      await loadAll();
+      await loadAll({ silent: true });
     } catch (err) {
       push('error', `Research failed: ${(err as Error).message}`);
     } finally {
@@ -256,7 +306,7 @@ export const AdminPage: React.FC = () => {
     try {
       await api.patch(`/api/admin/reports/${id}`, { action });
       push('success', `Report ${action === 'verify' ? 'verified' : action === 'reject' ? 'rejected' : 'marked duplicate'}.`);
-      await loadAll();
+      await loadAll({ silent: true });
     } catch (err) {
       push('error', `Moderation failed: ${(err as Error).message}`);
     }
@@ -266,7 +316,7 @@ export const AdminPage: React.FC = () => {
     try {
       await api.patch(`/api/admin/sources/${id}`, { enabled });
       push('success', `Source ${enabled ? 'enabled' : 'disabled'}.`);
-      await loadAll();
+      await loadAll({ silent: true });
     } catch (err) {
       push('error', `Update failed: ${(err as Error).message}`);
     }
@@ -276,7 +326,7 @@ export const AdminPage: React.FC = () => {
     try {
       await api.patch(`/api/admin/events/${id}`, { reject: true });
       push('success', 'Event rejected and removed from public surfaces.');
-      await loadAll();
+      await loadAll({ silent: true });
     } catch (err) {
       push('error', `Rejection failed: ${(err as Error).message}`);
     }
@@ -290,7 +340,7 @@ export const AdminPage: React.FC = () => {
     try {
       await api.delete(`/api/admin/events/${id}`);
       push('success', `Deleted "${title.slice(0, 60)}" and all attached records.`);
-      await loadAll();
+      await loadAll({ silent: true });
     } catch (err) {
       push('error', `Delete failed: ${(err as Error).message}`);
     } finally {
@@ -308,11 +358,11 @@ export const AdminPage: React.FC = () => {
     }
     setWiping(true);
     try {
-      const result = await api.post<{ success: boolean; deleted: Record<string, number> }>('/api/admin/data/wipe-all', { confirm: phrase }, { timeout: JOB_TIMEOUT_MS });
+      const result = await api.post<{ success: boolean; deleted: Record<string, number> }>('/api/admin/data/wipe-all', { confirm: phrase }, { timeout: WIPE_TIMEOUT_MS });
       const failed = Object.entries(result.deleted || {}).filter(([, n]) => n === -1).map(([t]) => t);
       if (failed.length > 0) push('error', `Wipe completed with failures: ${failed.join(', ')}`);
       else push('success', 'All disaster data wiped. Run Backfill + Ingest to rebuild.');
-      await loadAll();
+      await loadAll({ silent: true });
     } catch (err) {
       push('error', `Wipe failed: ${(err as Error).message}`);
     } finally {
@@ -350,7 +400,7 @@ export const AdminPage: React.FC = () => {
         eyebrow="Operations Console"
         title="System Monitoring & Control"
         description="Live operational view of ingestion, verification, embeddings, notifications, and all background jobs."
-        actions={<SecondaryButton onClick={loadAll}><RefreshCw className="w-3.5 h-3.5" /> Refresh</SecondaryButton>}
+        actions={<SecondaryButton onClick={() => loadAll()}><RefreshCw className="w-3.5 h-3.5" /> Refresh</SecondaryButton>}
       />
 
       {/* Overview metrics */}
@@ -394,8 +444,7 @@ export const AdminPage: React.FC = () => {
                 key={job.key}
                 type="button"
                 onClick={() => runJob(job.key, job.label)}
-                disabled={busy}
-                title={job.description}
+                title={busy ? `${job.description} (already running in background)` : job.description}
                 className={cx(
                   'flex flex-col items-center gap-1.5 p-3.5 rounded-2xl border transition-all cursor-pointer text-center',
                   busy
@@ -410,7 +459,7 @@ export const AdminPage: React.FC = () => {
           })}
         </div>
         <p className="mt-3 text-[11px] text-[#747F8D]">
-          Jobs run independently — you can trigger another while one is running. All jobs also run automatically on intervals (ingest ~15min · notifications ~5min · lifecycle ~30min · reconcile ~1h · embeddings ~6h · past-discovery ~12h). Long-running jobs (Ingest, Backfill, Discover Past) take 1–3 minutes — the result toast confirms completion.
+          Jobs run in the background and never block this console — a result toast and refreshed Job Runs follow completion (a Running… chip means the server is still working; click it for status). Scheduled runs: ingest ~15min · notifications ~5min · lifecycle ~30min · reconcile ~1h · embeddings ~6h · past-discovery ~12h · backfill weekly. Backfill and Discover Past fill the Past layer via curated catalog + DB-first multi-source research and typically finish in under two minutes.
         </p>
       </PremiumPanel>
 
@@ -614,7 +663,7 @@ export const AdminPage: React.FC = () => {
       {/* Past layer disasters — everything the Past layer serves, with delete control */}
       <PremiumPanel
         title="Past Layer Disasters"
-        description="Every ended/archived disaster the Past layer serves. Delete removes the event AND all its sources, claims, documents and embeddings — permanently."
+        description={`All ${pastEvents.length} ended/archived disasters the Past layer serves — a superset of the public view. Delete removes the event AND all its sources, claims, documents and embeddings — permanently.`}
       >
         <DataTable
           rows={pastEvents}

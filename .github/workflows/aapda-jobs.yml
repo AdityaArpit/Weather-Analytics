@@ -6,7 +6,8 @@
 #   5 * * * *     → verify-reports          (citizen report pipeline, hourly at :05)
 #   20 */6 * * *  → reconcile               (six-hour data reconciliation per architecture diagram)
 #   40 */6 * * *  → embeddings              (backfill vectors, six-hour)
-#   0 3 * * 0     → backfill                (weekly historical archive top-up)
+#   40 */12 * * * → discovery               (Past layer: DB-first multi-source research, twice daily)
+#   0 3 * * 0     → backfill                (weekly Past layer top-up: catalog seed + discovery)
 #
 # Requires repository secrets: API_BASE_URL (e.g. https://api.example.com) and
 # CRON_SECRET. Each step tolerates failure so one slow job never blocks the rest.
@@ -19,6 +20,7 @@ on:
     - cron: '5 * * * *'
     - cron: '20 */6 * * *'
     - cron: '40 */6 * * *'
+    - cron: '40 */12 * * *'
     - cron: '0 3 * * 0'
   workflow_dispatch: # manual trigger for testing
 
@@ -72,6 +74,17 @@ jobs:
         run: |
           curl -fsS --max-time 420 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/embeddings" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "embeddings failed (non-blocking)"
+
+  past-discovery:
+    # Past layer: checks what is already present, researches the rest.
+    if: github.event.schedule == '40 */12 * * *'
+    runs-on: ubuntu-latest
+    timeout_minutes: 10
+    steps:
+      - name: Discover missing Past layer events
+        run: |
+          curl -fsS --max-time 540 -X POST "${{ secrets.API_BASE_URL }}/api/jobs/discovery" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" || echo "discovery failed (non-blocking)"
 
   weekly:
     if: github.event.schedule == '0 3 * * 0'

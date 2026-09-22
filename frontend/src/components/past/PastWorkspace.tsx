@@ -81,13 +81,36 @@ function extractImpactNumber(item: ArchiveItem): number {
 function isMeaningfulEvidenceText(text?: string | null): boolean {
   if (!text) return false;
   const normalized = text.replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-  if (normalized.length < 5) return false;
-  return ![
-    'information unavailable',
-    'details were not clearly quantified',
-    'not available',
-    'none reported',
-  ].some((phrase) => normalized.includes(phrase));
+  if (normalized.length < 14) return false;
+  if (
+    [
+      'information unavailable',
+      'details were not clearly quantified',
+      'not available',
+      'none reported',
+      'documented in source citations',
+      'documented in verified citations',
+    ].some((phrase) => normalized.includes(phrase))
+  ) {
+    return false;
+  }
+  const stripped = normalized
+    .replace(/\[(?:S\d+)\]/g, ' ')
+    .replace(/\b(?:timesofindia|times of india|the indian express|indian express|ndtv|zee news|india today|hindustan times|the hindu)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const words = stripped.split(/\s+/).filter(Boolean);
+  if (words.length < 3) return false;
+  const substance = stripped.replace(/\b(?:damage(?:d)?|destroyed|collapsed|evacuated|evacuation|rescued|relief|infrastructure|loss|crore|lakh)\b/g, ' ').replace(/\s+/g, ' ').trim();
+  if (substance.split(/\s+/).filter(Boolean).length < 2) return false;
+  // Absurd casualty spreads like "2-3,00,000" are not publishable evidence.
+  const range = stripped.match(/(\d[\d,]*)\s*-\s*(\d[\d,]*)/);
+  if (range) {
+    const min = Number(range[1].replace(/,/g, ''));
+    const max = Number(range[2].replace(/,/g, ''));
+    if (min > 0 && max / min >= 10) return false;
+  }
+  return true;
 }
 
 function textMatchesQuery(item: ArchiveItem, query: string): boolean {

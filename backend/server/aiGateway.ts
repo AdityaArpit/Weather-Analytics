@@ -12,9 +12,14 @@ import {
   extractCasualtyNumericClaims,
   filterIncidentEvidenceArticles,
   filterSourcesForEvent,
+  isSubstantiveFact,
+  normalizeFactKey,
+  reconcileCasualtyNumericClaims,
   reconcileNumericClaims,
   scoreIncidentEvidence,
+  stripPublisherNoise,
   validateAndCleanCitations,
+  type FactTopic,
 } from './lib/evidenceUtils';
 import { coerceIsoDate, formatDisasterDate } from './lib/dateFormat';
 import { searchGoogleNews } from './googleNews';
@@ -498,6 +503,8 @@ function deriveYearFromBundle(bundle: EvidenceBundle): number {
 
 function formatCasualtyRange(range: ReturnType<typeof reconcileNumericClaims>): string | null {
   if (!range.rangeMin && !range.rangeMax) return null;
+  // Refuse absurd spreads (e.g. 2-300000) — no usable interval exists.
+  if (range.rangeMin > 0 && range.rangeMax / range.rangeMin >= 10) return null;
   const base = range.rangeMin === range.rangeMax
     ? `${range.rangeMin.toLocaleString('en-IN')} reported casualties/deaths in retrieved source claims.`
     : `${range.rangeMin.toLocaleString('en-IN')}-${range.rangeMax.toLocaleString('en-IN')} reported casualties/deaths across clustered source claims.`;
@@ -506,23 +513,33 @@ function formatCasualtyRange(range: ReturnType<typeof reconcileNumericClaims>): 
 }
 
 function extractCandidateFacts(sources: CitedSource[]): Record<string, string[]> {
-  const patterns: Record<string, RegExp> = {
-    casualties: /\b(?:\d[\d,]*\s+(?:people\s+)?(?:dead|deaths?|killed|fatalit(?:y|ies)|injured|missing)|(?:dead|deaths?|killed|injured|missing|casualties)[^.;]{0,80}\d[\d,]*)\b/gi,
-    damage: /\b(?:₹|rs\.?|inr|crore|lakh|damage(?:d)?|collapsed?|washed away|destroyed|houses?|roads?|bridges?|power|infrastructure)[^.;]{0,140}/gi,
-    response: /\b(?:ndrf|sdrf|evacuat(?:ed|ion)|rescued?|relief|shelter|army|navy|air force|government|administration)[^.;]{0,140}/gi,
-    location: /\b(?:district|village|state|coast|city|town|taluk|block|panchayat)[^.;]{0,120}/gi,
-    dates: /\b(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+(?:19|20)\d{2}|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(?:19|20)\d{2}|\b(?:19|20)\d{2}\b)/gi,
-  };
+  const patterns: Array<{ key: string; pattern: RegExp; topic: FactTopic }> = [
+    { key: 'casualties', pattern: /\b(?:\d[\d,]*\s+(?:people\s+)?(?:dead|deaths?|killed|fatalit(?:y|ies)|injured|missing)|(?:dead|deaths?|killed|injured|missing|casualties)[^.;]{0,80}\d[\d,]*)\b/gi, topic: 'casualties' },
+    { key: 'damage', pattern: /\b(?:₹|rs\.?|inr|crore|lakh|damage(?:d)?|collapsed?|washed away|destroyed|houses?|roads?|bridges?|power|infrastructure)[^.;]{0,140}/gi, topic: 'damage' },
+    { key: 'response', pattern: /\b(?:ndrf|sdrf|evacuat(?:ed|ion)|rescued?|relief|shelter|army|navy|air force|government|administration)[^.;]{0,140}/gi, topic: 'response' },
+    { key: 'location', pattern: /\b(?:district|village|state|coast|city|town|taluk|block|panchayat)[^.;]{0,120}/gi, topic: 'location' },
+    { key: 'dates', pattern: /\b(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+(?:19|20)\d{2}|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(?:19|20)\d{2}|\b(?:19|20)\d{2}\b)/gi, topic: 'dates' },
+  ];
 
-  return Object.fromEntries(Object.entries(patterns).map(([key, pattern]) => [
-    key,
-    sources.flatMap((source) => {
+  return Object.fromEntries(patterns.map(({ key, pattern, topic }) => {
+    const facts: string[] = [];
+    const seen = new Set<string>();
+    for (const source of sources) {
       const text = `${source.title}. ${source.summary}`;
-      return Array.from(text.matchAll(pattern))
-        .map((match) => `[${source.id}] ${match[0].replace(/\s+/g, ' ').trim()}`)
-        .slice(0, 3);
-    }).slice(0, 10),
-  ]));
+      pattern.lastIndex = 0;
+      for (const match of text.matchAll(pattern)) {
+        const snippet = stripPublisherNoise(match[0].replace(/\s+/g, ' ').trim());
+        if (!isSubstantiveFact(snippet, topic)) continue;
+        const factKey = normalizeFactKey(snippet);
+        if (!factKey || seen.has(factKey)) continue;
+        seen.add(factKey);
+        facts.push(`[${source.id}] ${snippet}`);
+        if (facts.length >= 10) break;
+      }
+      if (facts.length >= 10) break;
+    }
+    return [key, facts];
+  }));
 }
 
 function sanitizeUnavailableField(value: string, facts: string[], fallback: string): string {
@@ -534,6 +551,7 @@ function sanitizeUnavailableField(value: string, facts: string[], fallback: stri
 
 function buildNumericRangeObject(range: ReturnType<typeof reconcileNumericClaims>): EvidenceBundle['numericCasualtiesRange'] | undefined {
   if (!range.rangeMin && !range.rangeMax) return undefined;
+  if (range.rangeMin > 0 && range.rangeMax / range.rangeMin >= 10) return undefined;
   return {
     min: range.rangeMin,
     max: range.rangeMax,
@@ -1067,7 +1085,7 @@ export async function buildHistoricalEvidenceBundle(
   const sourcesText = citedSources
     .map((s) => `[${s.id}] Title: ${s.title}\nPublisher: ${s.publisher} (${s.publishedAt})\nSummary: ${s.summary}\nURL: ${s.url}`)
     .join('\n\n');
-  const casualtyReconciliation = reconcileNumericClaims(extractCasualtyNumericClaims(citedSources));
+  const casualtyReconciliation = reconcileCasualtyNumericClaims(extractCasualtyNumericClaims(citedSources));
   const casualtyRangeText = formatCasualtyRange(casualtyReconciliation);
   const candidateFacts = extractCandidateFacts(citedSources);
   const factsText = Object.entries(candidateFacts)

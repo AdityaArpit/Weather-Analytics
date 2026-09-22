@@ -37,6 +37,13 @@ import {
 } from './lib/searchRetrieval';
 import { rateLimit } from './lib/rateLimit';
 import {
+  isSubstantiveFact,
+  normalizeFactKey,
+  stripPublisherNoise,
+  validateAndCleanCitations,
+  type FactTopic,
+} from './lib/evidenceUtils';
+import {
   badRequest,
   forbidden,
   notFound,
@@ -105,24 +112,34 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Recor
   }));
 
   const sourceText = sources.map((source) => `${source.title}. ${source.summary}`).join(' ');
-  const casualtyFacts = extractSourceFacts(sources, /\b(?:\d[\d,]*(?:\s*-\s*\d[\d,]*)?\s+)?(?:dead|deaths?|killed|fatalit(?:y|ies)|injured|missing|casualt(?:y|ies)|evacuat(?:ed|ion)|displaced|affected)\b[^.;]{0,160}/gi, 3);
-  const damageFacts = extractSourceFacts(sources, /\b(?:rs\.?|₹|inr|crore|lakh|damage(?:d)?|destroyed|collapsed|washed away|houses?|roads?|bridges?|power|infrastructure|crop|loss)\b[^.;]{0,180}/gi, 3);
-  const responseFacts = extractSourceFacts(sources, /\b(?:rescue|relief|ndrf|sdrf|army|navy|government|administration|evacuat(?:ed|ion)|shelter|compensation|aid)\b[^.;]{0,180}/gi, 3);
-  const recoveryFacts = extractSourceFacts(sources, /\b(?:recovery|rehabilitation|reconstruction|restoration|relief camp|compensation|survivors?|aftermath)\b[^.;]{0,180}/gi, 3);
+  const casualtyFacts = extractSourceFacts(sources, /\b(?:\d[\d,]*(?:\s*-\s*\d[\d,]*)?\s+)?(?:dead|deaths?|killed|fatalit(?:y|ies)|injured|missing|casualt(?:y|ies)|evacuat(?:ed|ion)|displaced|affected)\b[^.;]{0,160}/gi, 3, 'casualties');
+  const damageFacts = extractSourceFacts(sources, /\b(?:rs\.?|₹|inr|crore|lakh|damage(?:d)?|destroyed|collapsed|washed away|houses?|roads?|bridges?|power|infrastructure|crop|loss)\b[^.;]{0,180}/gi, 3, 'damage');
+  const responseFacts = extractSourceFacts(sources, /\b(?:rescue|relief|ndrf|sdrf|army|navy|government|administration|evacuat(?:ed|ion)|shelter|compensation|aid)\b[^.;]{0,180}/gi, 3, 'response');
+  const recoveryFacts = extractSourceFacts(sources, /\b(?:recovery|rehabilitation|reconstruction|restoration|relief camp|compensation|survivors?|aftermath)\b[^.;]{0,180}/gi, 3, 'recovery');
   const timeline = buildTimelineFromSources(sources, event.startedAt || event.lastObservedAt || event.updatedAt);
   const sourceCount = Math.max(event.sourceCount, sources.length);
   const distinctPublishers = new Set(sources.map((source) => publisherKey(source))).size;
   const synthesizedSummary = summarizeFromSources(sources, event.description);
 
-  const casualties = claims?.['CASUALTIES']?.[0] || casualtyFacts.join('; ') || extractCasualtyFallback(sourceText, sources[0]?.id) || 'Casualty and human impact details documented in source citations.';
-  const damage = claims?.['DAMAGE']?.[0] || damageFacts.join('; ') || 'Damage and loss details documented in source citations.';
-  const humanImpact = claims?.['HUMAN_IMPACT']?.[0] || claims?.['CASUALTIES']?.[0] || casualtyFacts.join('; ') || 'Human impact documented in verified citations.';
-  const infrastructureDamage = claims?.['INFRASTRUCTURE_DAMAGE']?.[0] || claims?.['DAMAGE']?.[0] || damageFacts.join('; ') || 'Infrastructure impact documented in verified citations.';
-  const economicImpact = claims?.['ECONOMIC_IMPACT']?.[0] || damageFacts.filter((fact) => /rs\.?|₹|inr|crore|lakh|loss/i.test(fact)).join('; ') || '';
-  const governmentResponse = claims?.['GOVERNMENT_RESPONSE']?.[0] || responseFacts.join('; ') || event.verificationReason || '';
-  const rescueRelief = claims?.['RESCUE_RELIEF']?.[0] || responseFacts.join('; ') || event.instruction || '';
-  const recovery = claims?.['RECOVERY']?.[0] || (event.status === 'ARCHIVED' || event.status === 'ENDED' ? recoveryFacts.join('; ') : '');
-  const affectedAreas = claims?.['AFFECTED_AREAS']?.[0] || event.locationName;
+  const pickClaim = (types: string[], topic: FactTopic): string => {
+    for (const type of types) {
+      for (const value of claims?.[type] || []) {
+        const cleaned = validateAndCleanCitations(value, sources);
+        if (isSubstantiveFact(cleaned, topic)) return cleaned;
+      }
+    }
+    return '';
+  };
+
+  const casualties = pickClaim(['CASUALTIES'], 'casualties') || casualtyFacts.join('; ') || extractCasualtyFallback(sourceText, sources[0]?.id) || '';
+  const damage = pickClaim(['DAMAGE'], 'damage') || damageFacts.join('; ') || '';
+  const humanImpact = pickClaim(['HUMAN_IMPACT', 'CASUALTIES'], 'casualties') || casualtyFacts.join('; ') || '';
+  const infrastructureDamage = pickClaim(['INFRASTRUCTURE_DAMAGE', 'DAMAGE'], 'damage') || damageFacts.join('; ') || '';
+  const economicImpact = pickClaim(['ECONOMIC_IMPACT'], 'damage') || damageFacts.filter((fact) => /rs\.?|₹|inr|crore|lakh|loss/i.test(fact)).join('; ') || '';
+  const governmentResponse = pickClaim(['GOVERNMENT_RESPONSE'], 'response') || responseFacts.join('; ') || '';
+  const rescueRelief = pickClaim(['RESCUE_RELIEF'], 'response') || responseFacts.join('; ') || event.instruction || '';
+  const recovery = pickClaim(['RECOVERY'], 'recovery') || (event.status === 'ARCHIVED' || event.status === 'ENDED' ? recoveryFacts.join('; ') : '');
+  const affectedAreas = pickClaim(['AFFECTED_AREAS'], 'location') || event.locationName;
 
   const eventDateFormatted = event.startedAt
     ? new Date(event.startedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })
@@ -184,6 +201,7 @@ function extractSourceFacts(
   sources: Array<{ id: string; title: string; summary: string }>,
   pattern: RegExp,
   maxFacts: number,
+  topic: FactTopic,
 ): string[] {
   const facts: string[] = [];
   const seen = new Set<string>();
@@ -192,11 +210,11 @@ function extractSourceFacts(
     pattern.lastIndex = 0;
     const matches = Array.from(text.matchAll(pattern));
     for (const match of matches) {
-      const snippet = cleanSnippet(match[0]);
-      if (snippet.length < 12) continue;
-      const normalized = snippet.toLowerCase();
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
+      const snippet = cleanSnippet(stripPublisherNoise(match[0]));
+      if (!isSubstantiveFact(snippet, topic)) continue;
+      const factKey = normalizeFactKey(snippet);
+      if (!factKey || seen.has(factKey)) continue;
+      seen.add(factKey);
       facts.push(`[${source.id}] ${snippet}`);
       if (facts.length >= maxFacts) return facts;
     }
@@ -1808,12 +1826,71 @@ const ADMIN_JOB_MAP: Record<string, () => Promise<unknown>> = {
   discovery: runPastDiscoveryJob,
 };
 
-router.post('/admin/jobs/:job', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+/**
+ * In-memory state for manually triggered jobs. The POST returns as soon as the
+ * job is spawned; the frontend polls GET /admin/jobs/:job/status until
+ * `running` flips to false. Long jobs (Backfill/Discover take 1–3 minutes) no
+ * longer pin the HTTP request, so platform request timeouts can no longer kill
+ * them client-side and the admin buttons never wedge.
+ */
+interface ManualJobState {
+  running: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  result: unknown | null;
+  error: string | null;
+}
+
+const manualJobStates = new Map<string, ManualJobState>();
+
+function idleManualJobState(): ManualJobState {
+  return { running: false, startedAt: null, finishedAt: null, result: null, error: null };
+}
+
+router.post('/admin/jobs/:job', requireAuth, requireAdmin, (req: Request, res: Response) => {
   try {
-    const job = ADMIN_JOB_MAP[req.params.job];
-    if (!job) throw notFound(`Unknown job: ${req.params.job}`);
-    const result = await job();
-    res.json({ success: true, result });
+    const key = req.params.job;
+    const job = ADMIN_JOB_MAP[key];
+    if (!job) throw notFound(`Unknown job: ${key}`);
+
+    const existing = manualJobStates.get(key);
+    if (existing?.running) {
+      res.json({ success: true, started: true, alreadyRunning: true, state: existing });
+      return;
+    }
+
+    const state: ManualJobState = {
+      running: true,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      result: null,
+      error: null,
+    };
+    manualJobStates.set(key, state);
+
+    // Fire-and-forget: the job body owns its own lock and job_runs row. Node
+    // keeps executing after the response is sent, so completion is observed
+    // through the status endpoint instead of this request.
+    void Promise.resolve()
+      .then(() => job())
+      .then((result) => { state.result = result ?? null; })
+      .catch((error: Error) => { state.error = (error?.message || 'Job failed').slice(0, 500); })
+      .finally(() => {
+        state.running = false;
+        state.finishedAt = new Date().toISOString();
+      });
+
+    res.json({ success: true, started: true, alreadyRunning: false, state });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+router.get('/admin/jobs/:job/status', requireAuth, requireAdmin, (req: Request, res: Response) => {
+  try {
+    const key = req.params.job;
+    if (!ADMIN_JOB_MAP[key]) throw notFound(`Unknown job: ${key}`);
+    res.json({ job: key, state: manualJobStates.get(key) || idleManualJobState() });
   } catch (error) {
     sendError(res, error);
   }

@@ -22,6 +22,99 @@ export interface EventSourceFilterContext {
   approxDate?: string;
 }
 
+export type FactTopic = 'casualties' | 'damage' | 'response' | 'recovery' | 'location' | 'dates' | 'general';
+
+const PUBLISHER_NOISE_PATTERN =
+  /\b(?:timesofindia|times\s+of\s+india|the\s+indian\s+express|indian\s+express|ndtv|zee\s+news|abp\s+news|republic|india\s+today|hindustan\s+times|the\s+hindu|business\s+standard|news18|aaj\s+tak|dna|mid-?day|reuters|associated\s+press|ani|pti)\b/gi;
+
+/** Strips publisher/site tokens so "damage The Indian Express" collapses to "damage". */
+export function stripPublisherNoise(text: string): string {
+  return text
+    .replace(PUBLISHER_NOISE_PATTERN, ' ')
+    .replace(/\s*[\|–—]\s*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Normalized dedup key: citations, casing, punctuation, and publishers removed. */
+export function normalizeFactKey(text: string): string {
+  return stripPublisherNoise(text.replace(/\[(?:S\d+)\]/gi, ' '))
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasAbsurdNumericRange(text: string): boolean {
+  const match = text.match(/(\d[\d,]*)\s*[-–—]\s*(\d[\d,]*)/);
+  if (!match) return false;
+  const min = Number(match[1].replace(/,/g, ''));
+  const max = Number(match[2].replace(/,/g, ''));
+  return Number.isFinite(min) && Number.isFinite(max) && min > 0 && max / min >= 10;
+}
+
+/**
+ * Quality gate for extracted facts and stored claims. Rejects bare keyword
+ * matches ("damage", "evacuated"), publisher-polluted snippets, absurd ranges
+ * (2-300000), and cross-topic mismatches (money + evacuation under damage).
+ */
+export function isSubstantiveFact(rawText: string, topic: FactTopic): boolean {
+  if (!rawText) return false;
+  const cleaned = stripPublisherNoise(rawText.replace(/\[(?:S\d+)\]/gi, ' ')).trim();
+  const minLen = topic === 'dates' ? 8 : topic === 'location' ? 10 : 14;
+  if (cleaned.length < minLen) return false;
+  const words = cleaned.split(/\s+/).filter((word) => /[a-z0-9]/i.test(word));
+  const minWords = topic === 'dates' ? 2 : 3;
+  if (words.length < minWords) return false;
+
+  if ((topic === 'casualties' || topic === 'damage') && hasAbsurdNumericRange(cleaned)) return false;
+
+  const hasNumber = /\d/.test(cleaned);
+
+  switch (topic) {
+    case 'casualties': {
+      if (!hasNumber) return false;
+      return /\b(deaths?|dead|killed|fatalit|injured|missing|casualt|victims?|displaced|evacuat|affected|rescued?)\b/i.test(cleaned);
+    }
+    case 'damage': {
+      const hasMoney =
+        /(?:₹|rs\.?|inr)\s*\.?\s*\d/i.test(cleaned) ||
+        /\d[\d,.]*\s*(?:crore|lakh|billion|million)/i.test(cleaned);
+      const hasDamageObject =
+        /\b(houses?|buildings?|roads?|bridges?|crops?|trees?|vehicles?|shops?|schools?|hospitals?|infrastructure|power|electricity|poles?|telecom|airport|ports?|railways?|embankment|homes?|structures?|settlements?|villages?|properties?)\b/i.test(cleaned);
+      const hasDamageVerb =
+        /\b(damage(?:d)?|destroy(?:ed)?|collapse(?:d)?|washed\s+away|flatten(?:ed)?|inundat(?:ed)?|submerg(?:ed)?|breach(?:ed)?|saliniz(?:ed)?|loss|lost|ravag(?:ed)|smash(?:ed)?)\b/i.test(cleaned);
+      if (/\bevacuat/i.test(cleaned) && !hasDamageObject && !/\b(?:damag|destroy|collapse)/i.test(cleaned)) {
+        return false;
+      }
+      if (hasMoney) return true;
+      return Boolean(hasDamageObject && hasDamageVerb);
+    }
+    case 'response': {
+      const hasAction =
+        /\b(evacuat\w*|rescued?\b|relief\b|shelter\w*|camp\w*|distribut\w*|deploy\w*|compensation|aid\b|medical\b|ration\b|relocat\w*|shift\w*|saved?)\b/i.test(cleaned);
+      if (!hasAction) return false;
+      const hasActor =
+        /\b(ndrf|sdrf|army|navy|air\s+force|government|administration|authorities|officials|collector|firefighters?|coast\s+guard|reliefweb|nda|ndrf)\b/i.test(cleaned);
+      const hasObject =
+        hasNumber ||
+        /\b(people|persons|families|villagers|residents|victims|survivors|children|elderly|marooned|stranded|teams?|personnel|camps?)\b/i.test(cleaned);
+      // A lone verb or a bare evacuation headline without actor/quantified object
+      // is not rescue/relief evidence ("Evacuated as Cyclone Vayu Advances...").
+      if (!hasActor && !hasObject) return false;
+      return true;
+    }
+    case 'recovery':
+      return /\b(recovery|rehabilitation|reconstruction|restoration|relief\s+camp|compensation|rebuild\w*|aftermath|resumption|restored?)\b/i.test(cleaned);
+    case 'location':
+      return /\b(district|village|taluk|block|city|town|tehsil|panchayat|coast|region|area|division|state|municipality|ward)\b/i.test(cleaned) || hasNumber;
+    case 'dates':
+      return /\b(19|20)\d{2}\b/.test(cleaned) || /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(cleaned);
+    default:
+      return words.length >= 5;
+  }
+}
+
 /**
  * Validates and sanitizes citation references in text.
  * If text contains [S7] or [S99] but only [S1, S2, S3] exist in the evidence bundle,
@@ -226,6 +319,9 @@ function median(values: number[]): number {
  * Reconciles numeric claims by clustering around the median and separating
  * extreme values. For small news sets, a value at least 3x the median is a
  * clearer signal than IQR, which is unstable with only 3-5 sources.
+ *
+ * Additionally rejects order-of-magnitude splits (max/min >= 10) that the
+ * 3x-median rule misses on tiny bimodal sets like [2, 300000].
  */
 export function reconcileNumericClaims(values: number[] | NumericClaim[]): NumericReconciliationResult {
   const claims: NumericClaim[] = values
@@ -256,16 +352,68 @@ export function reconcileNumericClaims(values: number[] | NumericClaim[]): Numer
   });
 
   const outlierSet = new Set(outlierClaims);
-  const clustered = claims.filter((claim) => !outlierSet.has(claim));
+  let clustered = claims.filter((claim) => !outlierSet.has(claim));
+
+  // Order-of-magnitude guard: a cluster whose max/min >= 10 is not a usable
+  // interval (e.g. 2-300000). Keep the denser side of the largest multiplicative
+  // gap; on a tie keep the lower side (conservative for casualty undercounts
+  // is less harmful than inventing a 150000x range).
+  if (clustered.length >= 2) {
+    const sortedClaims = [...clustered].sort((a, b) => a.value - b.value);
+    const min = sortedClaims[0].value;
+    const max = sortedClaims[sortedClaims.length - 1].value;
+    if (min > 0 && max / min >= 10) {
+      let bestStart = 0;
+      let bestLen = 1;
+      let start = 0;
+      for (let end = 1; end < sortedClaims.length; end++) {
+        while (start < end && sortedClaims[end].value / sortedClaims[start].value >= 10) start++;
+        const len = end - start + 1;
+        if (len > bestLen) {
+          bestLen = len;
+          bestStart = start;
+        }
+      }
+      const keep = sortedClaims.slice(bestStart, bestStart + bestLen);
+      const keepSet = new Set(keep);
+      for (const claim of clustered) {
+        if (!keepSet.has(claim)) {
+          outlierSet.add(claim);
+        }
+      }
+      clustered = keep;
+    }
+  }
+
   const finalCluster = clustered.length ? clustered : claims;
   const clusterValues = finalCluster.map((claim) => claim.value);
+  const finalOutliers = claims.filter((claim) => outlierSet.has(claim));
 
   return {
     rangeMin: Math.min(...clusterValues),
     rangeMax: Math.max(...clusterValues),
-    outliers: outlierClaims.map((claim) => claim.value),
-    outlierClaims,
+    outliers: finalOutliers.map((claim) => claim.value),
+    outlierClaims: finalOutliers,
   };
+}
+
+const MORTALITY_METRICS: ReadonlySet<NonNullable<NumericClaim['metric']>> = new Set([
+  'deaths',
+  'injured',
+  'missing',
+]);
+
+/**
+ * Reconciles only mortality metrics (deaths/injured/missing) so evacuated or
+ * affected counts never widen the reported-casualty range (the 2-300000 bug).
+ * Returns an empty range when no mortality claims exist.
+ */
+export function reconcileCasualtyNumericClaims(claims: NumericClaim[]): NumericReconciliationResult {
+  const mortality = claims.filter((claim) => claim.metric && MORTALITY_METRICS.has(claim.metric));
+  if (!mortality.length) {
+    return { rangeMin: 0, rangeMax: 0, outliers: [], outlierClaims: [] };
+  }
+  return reconcileNumericClaims(mortality);
 }
 
 const incidentEvidencePattern =

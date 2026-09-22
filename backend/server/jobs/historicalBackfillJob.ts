@@ -1,10 +1,5 @@
 import { supabaseRest, isSupabaseConfigured } from '../db/supabase';
-import { runIngestionJob } from './ingestionJob';
-import { runReconciliationJob } from './reconciliationJob';
-import { runLifecycleJob } from './lifecycleJob';
-import { runEmbeddingJob } from './embeddingJob';
-import { runCitizenVerificationJob } from './citizenVerificationJob';
-import { runNotificationJob } from './notificationJob';
+import { runPastDiscoveryJob } from './pastDiscoveryJob';
 import { startJobRun, finishJobRun, type JobResult } from './jobRunner';
 import { HISTORICAL_DISASTERS_CATALOG } from '../data/historicalDisasters';
 import { resolveSource } from '../lib/sourceRegistry';
@@ -246,9 +241,13 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
 }
 
 /**
- * Full pipeline sweep: ingestion -> reconciliation -> citizen verification ->
- * lifecycle -> notifications -> embeddings. Used by the cron endpoint and the
- * admin manual trigger. Lock-protected against concurrent runs.
+ * Past-layer fill job: seed the curated historical catalog (creation-only),
+ * then run DB-first multi-source discovery for everything still missing from
+ * the Past layer. Maintenance sweeps (ingest/reconcile/lifecycle/notification/
+ * embeddings) run on their own cadence via the scheduler and workflow — they
+ * are deliberately excluded here so Backfill stays fast and purpose-aligned.
+ * Each phase is isolated: a throwing phase becomes a FAILED phase without
+ * aborting the phases that follow.
  */
 export async function runHistoricalBackfillJob(): Promise<JobResult> {
   if (!acquireLock('backfill')) {
@@ -272,52 +271,61 @@ export async function runHistoricalBackfillJob(): Promise<JobResult> {
     recordsUpdated: 0,
     recordsRejected: 0,
   };
+  const phaseMeta: Record<string, unknown> = {};
 
   try {
     if (!isSupabaseConfigured()) {
       result.status = 'FAILED';
       result.errorMessage = 'Supabase is not configured';
-      return result;
+    } else {
+      const phases: Array<{ name: string; run: () => Promise<JobResult> }> = [
+        { name: 'historical_catalog', run: seedHistoricalCatalog },
+        { name: 'past_discovery', run: () => runPastDiscoveryJob() },
+      ];
+
+      let failedPhases = 0;
+      let partialPhases = 0;
+
+      for (const phase of phases) {
+        try {
+          const phaseResult = await phase.run();
+          phaseMeta[phase.name] = {
+            status: phaseResult.status,
+            processed: phaseResult.recordsProcessed,
+            created: phaseResult.recordsCreated,
+            updated: phaseResult.recordsUpdated,
+            rejected: phaseResult.recordsRejected,
+            ...(phaseResult.errorMessage ? { error: phaseResult.errorMessage } : {}),
+          };
+          result.recordsProcessed += phaseResult.recordsProcessed;
+          result.recordsCreated += phaseResult.recordsCreated;
+          result.recordsUpdated += phaseResult.recordsUpdated;
+          result.recordsRejected += phaseResult.recordsRejected;
+          if (phaseResult.status === 'FAILED') {
+            failedPhases++;
+            result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'failed'}`;
+          } else if (phaseResult.status === 'PARTIAL') {
+            partialPhases++;
+            if (!result.errorMessage) result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'partial'}`;
+          }
+        } catch (err) {
+          failedPhases++;
+          phaseMeta[phase.name] = { status: 'FAILED', error: (err as Error).message };
+          result.errorMessage = `${phase.name}: ${(err as Error).message}`;
+        }
+      }
+
+      if (failedPhases === phases.length) result.status = 'FAILED';
+      else if (failedPhases > 0 || partialPhases > 0) result.status = 'PARTIAL';
     }
-
-    const phases: Array<{ name: string; run: () => Promise<JobResult> }> = [
-      { name: 'historical_catalog', run: seedHistoricalCatalog },
-      { name: 'ingestion', run: runIngestionJob },
-      { name: 'reconciliation', run: runReconciliationJob },
-      { name: 'citizen_verification', run: runCitizenVerificationJob },
-      { name: 'lifecycle', run: runLifecycleJob },
-      { name: 'notification', run: runNotificationJob },
-      { name: 'embedding', run: runEmbeddingJob },
-    ];
-
-    const phaseMeta: Record<string, unknown> = {};
-
-    for (const phase of phases) {
-      const phaseResult = await phase.run();
-      phaseMeta[phase.name] = {
-        status: phaseResult.status,
-        processed: phaseResult.recordsProcessed,
-        created: phaseResult.recordsCreated,
-        updated: phaseResult.recordsUpdated,
-        rejected: phaseResult.recordsRejected,
-      };
-      result.recordsProcessed += phaseResult.recordsProcessed;
-      result.recordsCreated += phaseResult.recordsCreated;
-      result.recordsUpdated += phaseResult.recordsUpdated;
-      result.recordsRejected += phaseResult.recordsRejected;
-      if (phaseResult.status === 'FAILED') result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'failed'}`;
-    }
-
-    const failedPhases = Object.entries(phaseMeta).filter(([, meta]) => (meta as { status: string }).status === 'FAILED');
-    if (failedPhases.length === phases.length) result.status = 'FAILED';
-    else if (failedPhases.length > 0 || result.errorMessage) result.status = 'PARTIAL';
   } catch (err) {
     result.status = 'FAILED';
     result.errorMessage = (err as Error).message;
+    phaseMeta.fatalError = result.errorMessage;
   } finally {
     releaseLock('backfill');
+    if (runId) await finishJobRun(runId, result, { phases: phaseMeta });
   }
 
-  if (runId) await finishJobRun(runId, result, { phases: 'see metadata' });
   return result;
 }

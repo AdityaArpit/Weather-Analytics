@@ -1,30 +1,25 @@
 import 'dotenv/config';
-import { supabaseRest, isSupabaseConfigured } from '../server/db/supabase';
-import { runPastDiscoveryJob } from '../server/jobs/pastDiscoveryJob';
+import { isSupabaseConfigured } from '../server/db/supabase';
 
 /**
- * Onboarding bootstrap: fills the Past layer automatically.
- *  - seeds the curated catalog (creation-only), then
- *  - runs discovery for anything missing.
- * Optional arg: number of discovery candidates (default 6).
+ * Onboarding bootstrap: fills the Past layer automatically via the Backfill
+ * job, which now runs both phases internally:
+ *  - seed the curated historical catalog (creation-only), then
+ *  - DB-first multi-source discovery for anything still missing.
  */
 async function main() {
   if (!isSupabaseConfigured()) {
     console.error('Supabase is not configured — nothing to bootstrap.');
     process.exit(1);
   }
-  console.log('[bootstrap] seeding curated historical catalog...');
+  console.log('[bootstrap] running past-layer backfill (catalog + discovery)...');
   const { runHistoricalBackfillJob } = await import('../server/jobs/historicalBackfillJob');
   const backfill = await runHistoricalBackfillJob();
-  console.log(`[bootstrap] backfill: ${backfill.status} created=${backfill.recordsCreated} present=${backfill.recordsUpdated}`);
-
-  console.log('[bootstrap] running past discovery...');
-  const max = Number(process.argv[2]) > 0 ? Number(process.argv[2]) : 6;
-  const discovery = await runPastDiscoveryJob(max);
-  console.log(`[bootstrap] discovery: ${discovery.status} created=${discovery.recordsCreated} candidates=${discovery.candidatesChecked} skipped=${discovery.skippedAlreadyPresent}`);
-  for (const key of discovery.createdEventKeys) console.log(`  + ${key}`);
-  for (const f of discovery.failedQueries) console.log(`  ! ${f.query}: ${f.error.slice(0, 100)}`);
-  process.exit(0);
+  console.log(
+    `[bootstrap] backfill: ${backfill.status} processed=${backfill.recordsProcessed} created=${backfill.recordsCreated} present=${backfill.recordsUpdated} rejected=${backfill.recordsRejected}`,
+  );
+  if (backfill.errorMessage) console.log(`[bootstrap] note: ${backfill.errorMessage}`);
+  process.exit(backfill.status === 'FAILED' ? 1 : 0);
 }
 
 main().catch((error) => { console.error(error); process.exit(1); });

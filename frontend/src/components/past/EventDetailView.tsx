@@ -80,9 +80,29 @@ export const EventDetailView: React.FC<EventDetailViewProps> = ({
       'were not clearly quantified',
       'coverage indicates',
       'not available',
+      'documented in source citations',
+      'documented in verified citations',
+      'documented in cited journalism',
     ];
     if (/^\s*(?:\[(?:S\d+)\]\s*)+$/i.test(normalized)) return false;
-    return !placeholders.some((phrase) => normalized.includes(phrase));
+    if (placeholders.some((phrase) => normalized.includes(phrase))) return false;
+    const stripped = normalized
+      .replace(/\[(?:S\d+)\]/g, ' ')
+      .replace(/\b(?:timesofindia|times of india|the indian express|indian express|ndtv|zee news|india today|hindustan times|the hindu)\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const words = stripped.split(/\s+/).filter(Boolean);
+    if (words.length < 3) return false;
+    // Bare keyword echoes ("damage", "evacuated") with no surrounding substance.
+    const substance = stripped.replace(/\b(?:damage(?:d)?|destroyed|collapsed|evacuated|evacuation|rescued|relief|infrastructure|loss|crore|lakh)\b/g, ' ').replace(/\s+/g, ' ').trim();
+    if (substance.split(/\s+/).filter(Boolean).length < 2) return false;
+    const range = stripped.match(/(\d[\d,]*)\s*-\s*(\d[\d,]*)/);
+    if (range) {
+      const min = Number(range[1].replace(/,/g, ''));
+      const max = Number(range[2].replace(/,/g, ''));
+      if (min > 0 && max / min >= 10) return false;
+    }
+    return true;
   };
 
   const handleCopySummary = async () => {
