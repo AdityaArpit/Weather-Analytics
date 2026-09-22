@@ -2216,4 +2216,12 @@ router.get('/health', async (_req: Request, res: Response) => {
   });
 });
 
+router.get('/health', async (_req: Request, res: Response) => {
+  return res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: '2.1.0'
+  });
+});
+
 export default router;
