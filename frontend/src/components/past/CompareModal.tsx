@@ -88,9 +88,9 @@ export const CompareModal: React.FC<CompareModalProps> = ({
           <button
             type="button"
             onClick={onClose}
-            className="p-1.5 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+            className="p-1.5 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100 cursor-pointer transition-colors"
           >
-            <X className="w-4 h-4" />
+            <X className="w-8 h-8" />
           </button>
         </div>
 
