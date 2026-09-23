@@ -1,5 +1,7 @@
 import { isSupabaseConfigured, supabaseRest } from '../db/supabase';
 import type { CanonicalEventDto, CanonicalEventListResponse, EventCitationDto } from '../types/canonicalEvent';
+import { validateEventGeo } from '../lib/geoValidation';
+import { INDIAN_STATE_CENTROIDS } from '../lib/geocoding';
 
 type CanonicalEventRow = {
   id: string;
@@ -44,7 +46,26 @@ function publicVerificationFilter(): string {
 }
 
 function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
+  // PostGIS/GeoJSON stores coordinates as [lng, lat]; the DTO wants lat/lng.
   const coordinates = row.centroid?.coordinates;
+  const rawLongitude = row.longitude ?? coordinates?.[0];
+  const rawLatitude = row.latitude ?? coordinates?.[1];
+
+  // One shared validation pass resolves the authoritative point: raw coords
+  // when sane, else the state/district-implied centroid. The DTO therefore
+  // always carries coordinates that AGREE with its state field — the Odisha
+  // point with Tamil Nadu details class of bug cannot survive this.
+  const geo = validateEventGeo({
+    latitude: rawLatitude,
+    longitude: rawLongitude,
+    state: row.state,
+    country: row.country,
+    locationName: row.location_name,
+    title: row.title,
+  });
+  const latitude = geo.point?.[0];
+  const longitude = geo.point?.[1];
+
   return {
     id: row.id,
     eventKey: row.event_key,
@@ -59,10 +80,13 @@ function rowToDto(row: CanonicalEventRow): CanonicalEventDto {
     locationName: row.location_name || [row.district, row.state].filter(Boolean).join(', ') || 'India',
     city: row.city || undefined,
     district: row.district || undefined,
-    state: row.state || undefined,
+    // Prefer the validator's resolved state: it is the explicit column value
+    // when present, else the state inferred from district/location text —
+    // so displayed details always match the plotted coordinates.
+    state: geo.resolvedState || row.state || undefined,
     country: row.country || 'India',
-    longitude: row.longitude ?? coordinates?.[0],
-    latitude: row.latitude ?? coordinates?.[1],
+    longitude,
+    latitude,
     startedAt: row.started_at || undefined,
     lastObservedAt: row.last_observed_at || undefined,
     lastVerifiedAt: row.last_verified_at || undefined,
@@ -86,7 +110,17 @@ function toDtoList(rows: CanonicalEventRow[]): CanonicalEventDto[] {
     const letters = [...materialText].filter((char) => /\p{L}/u.test(char));
     if (letters.length < 12) return true;
     const latinLetters = letters.filter((char) => /\p{Script=Latin}/u.test(char));
-    return latinLetters.length / letters.length >= 0.85;
+    if (latinLetters.length / letters.length < 0.85) return false;
+    // Shared geo-validation: events whose coordinates are missing, sit outside
+    // India, or contradict their textual state are excluded from EVERY public
+    // count and listing, so the admin dashboard, the page badge, and the map
+    // markers all agree on one number.
+    return validateEventGeo({
+      latitude: event.latitude,
+      longitude: event.longitude,
+      state: event.state,
+      country: event.country,
+    }).valid;
   });
 }
 

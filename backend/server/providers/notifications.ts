@@ -1,3 +1,4 @@
+import { createTransport } from 'nodemailer';
 import { supabaseRest } from '../db/supabase';
 
 export interface EmailProvider {
@@ -8,32 +9,57 @@ export interface SmsProvider {
   send(params: { to: string; body: string }): Promise<{ success: boolean; messageId?: string; error?: string }>;
 }
 
-class ResendEmailProvider implements EmailProvider {
-  constructor(private apiKey: string, private from: string) {}
+/**
+ * Brevo email provider (warning emails).
+ *
+ * ONE transport: Brevo SMTP via Nodemailer (STARTTLS on port 587). No Brevo
+ * HTTP API, no API keys — the SMTP key (xsmtpsib-…) is used purely as the
+ * SMTP password. All credentials come from environment variables:
+ *
+ *   BREVO_SMTP_HOST  (default smtp-relay.brevo.com)
+ *   BREVO_SMTP_PORT  (default 587)
+ *   BREVO_SMTP_LOGIN (SMTP username)
+ *   BREVO_SMTP_KEY   (SMTP password — never logged)
+ *   EMAIL_FROM       (validated sender, "Name <mail@host>" or plain address)
+ */
+class BrevoEmailProvider implements EmailProvider {
+  private transport: ReturnType<typeof createTransport> | null = null;
+
+  constructor(
+    private host: string,
+    private port: number,
+    private user: string,
+    private pass: string,
+    private from: string,
+  ) {
+    this.transport = createTransport({
+      host: this.host,
+      port: this.port,
+      secure: false, // 587 uses STARTTLS
+      auth: { user: this.user, pass: this.pass },
+    });
+  }
 
   async send(params: { to: string; subject: string; html: string }) {
+    if (!this.transport) {
+      return { success: false, error: 'Brevo SMTP transport is not initialized' };
+    }
     try {
-      const response = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from: this.from,
-          to: params.to,
-          subject: params.subject,
-          html: params.html,
-        }),
+      const info = await this.transport.sendMail({
+        from: this.from,
+        to: params.to,
+        subject: params.subject,
+        html: params.html,
       });
-      if (!response.ok) {
-        const text = await response.text().catch(() => '');
-        return { success: false, error: `Resend HTTP ${response.status}: ${text.slice(0, 300)}` };
-      }
-      const data = (await response.json()) as { id?: string };
-      return { success: true, messageId: data.id };
+      return { success: true, messageId: info.messageId };
     } catch (err) {
-      return { success: false, error: (err as Error).message };
+      // Nodemailer surfaces auth failures (EAUTH), connection failures
+      // (ECONREFUSED/ETIMEDOUT), and SMTP rejections here — all are failures,
+      // never reported as sent.
+      const code = (err as { code?: string }).code;
+      const message = (err as Error).message?.split('\n')[0]?.slice(0, 300) || 'unknown SMTP error';
+      console.error(`[email] Brevo SMTP send failed${code ? ` (${code})` : ''}: ${message}`);
+      return { success: false, error: `Brevo SMTP${code ? ` ${code}` : ''}: ${message}` };
     }
   }
 }
@@ -153,14 +179,28 @@ let smsProvider: SmsProvider | null = null;
 export function getEmailProvider(): EmailProvider | null {
   if (emailProvider) return emailProvider;
   const providerType = process.env.EMAIL_PROVIDER?.trim().toLowerCase();
-  const apiKey = process.env.EMAIL_API_KEY?.trim();
+  const host = process.env.BREVO_SMTP_HOST?.trim() || 'smtp-relay.brevo.com';
+  const port = Number(process.env.BREVO_SMTP_PORT || 587);
+  const user = process.env.BREVO_SMTP_LOGIN?.trim();
+  const pass = process.env.BREVO_SMTP_KEY?.trim();
   const from = process.env.EMAIL_FROM?.trim();
 
-  if (providerType === 'resend' && apiKey && from) {
-    emailProvider = new ResendEmailProvider(apiKey, from);
-    return emailProvider;
+  if (providerType !== 'brevo') {
+    if (providerType) console.warn(`[email] Unknown EMAIL_PROVIDER "${providerType}" — expected "brevo"`);
+    return null;
   }
-  return null;
+  // Required: login, key, sender. Host/port have sane defaults above.
+  const missing = [
+    !user && 'BREVO_SMTP_LOGIN',
+    !pass && 'BREVO_SMTP_KEY',
+    !from && 'EMAIL_FROM',
+  ].filter(Boolean) as string[];
+  if (missing.length) {
+    console.error(`[email] Brevo SMTP not configured — missing env: ${missing.join(', ')}`);
+    return null;
+  }
+  emailProvider = new BrevoEmailProvider(host, port, user!, pass!, from!);
+  return emailProvider;
 }
 
 export function getSmsProvider(): SmsProvider | null {

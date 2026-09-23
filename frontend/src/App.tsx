@@ -6,7 +6,7 @@ import { TeamPage } from './components/TeamPage';
 import { HeroPage } from './components/HeroPage';
 import { AIAssistantDrawer } from './components/past/AIAssistantDrawer';
 import { prefetchPastArchive } from './lib/pastCache';
-import { AuthProvider } from './lib/AuthContext';
+import { AuthProvider, useAuth } from './lib/AuthContext';
 import { ProfilePage } from './components/auth/ProfilePage';
 import { ReportIncidentPage } from './components/reports/ReportIncidentPage';
 import { AdminPage } from './components/admin/AdminPage';
@@ -14,6 +14,19 @@ import { AdminRoute } from './components/auth/AdminRoute';
 import { AdminLoginPage } from './components/auth/AdminLoginPage';
 
 export function App() {
+  return (
+    <AuthProvider>
+      <AppShell />
+    </AuthProvider>
+  );
+}
+
+/**
+ * All chrome + routing lives here, inside AuthProvider, so the navbar can
+ * react to auth state (Sign up button vs. profile avatar) without prop drilling.
+ */
+function AppShell() {
+  const { user } = useAuth();
   const [currentRoute, setCurrentRoute] = useState<string>(() =>
     typeof window === 'undefined' ? '/' : window.location.pathname
   );
@@ -44,6 +57,14 @@ export function App() {
     setCurrentRoute(route);
   };
 
+  // Admin is gated: signed-out visitors land on the auth page instead.
+  useEffect(() => {
+    if (!user && currentRoute === '/admin') {
+      setCurrentRoute('/profile');
+      window.history.replaceState({}, '', '/profile');
+    }
+  }, [user, currentRoute]);
+
   const isKnownRoute = ['/', '/present', '/past', '/report', '/profile', '/admin', '/admin/login', '/team'].includes(currentRoute);
 
   if (!isKnownRoute) {
@@ -72,7 +93,6 @@ export function App() {
   }
 
   return (
-    <AuthProvider>
     <div className="h-screen bg-[#ECF8F8] text-[#0F1B29] flex flex-col selection:bg-[#747F8D] selection:text-white font-sans overflow-hidden">
       {/* Top Navigation Bar */}
       <Navbar
@@ -126,9 +146,7 @@ export function App() {
         isOpen={isVoiceAssistantOpen}
         onClose={() => setIsVoiceAssistantOpen(false)}
       />
-
     </div>
-    </AuthProvider>
   );
 }
 

@@ -5,6 +5,7 @@ import { HISTORICAL_DISASTERS_CATALOG } from '../data/historicalDisasters';
 import { resolveSource } from '../lib/sourceRegistry';
 import { contentHash } from '../lib/contentHash';
 import { upsertSearchDocument, embedAndStoreSearchDocument } from '../lib/searchRetrieval';
+import { findFuzzyDuplicate } from '../lib/researchOrchestrator';
 
 const jobLocks = new Set<string>();
 
@@ -60,6 +61,20 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
       ).catch(() => []);
       if (existing.length > 0) {
         result.recordsUpdated++; // counted as "already present, skipped"
+        continue;
+      }
+
+      // Fuzzy duplicate guard: an item whose title matches an existing event
+      // under a different name is the SAME disaster — skip, never repopulate.
+      const fuzzy = await findFuzzyDuplicate({
+        eventKey,
+        title: item.eventName,
+        disasterType: item.disasterType,
+        state: item.state || null,
+        year,
+      }).catch(() => null);
+      if (fuzzy) {
+        result.recordsUpdated++; // already present under a near-identical name
         continue;
       }
 
@@ -246,10 +261,89 @@ async function seedHistoricalCatalog(): Promise<JobResult> {
  * the Past layer. Maintenance sweeps (ingest/reconcile/lifecycle/notification/
  * embeddings) run on their own cadence via the scheduler and workflow — they
  * are deliberately excluded here so Backfill stays fast and purpose-aligned.
- * Each phase is isolated: a throwing phase becomes a FAILED phase without
- * aborting the phases that follow.
+ *
+ * CRITICAL RELIABILITY FIX (the "signal failed" bug): the two phases run in a
+ * detached background task and the caller-resolved promise carries only a
+ * queued acknowledgment. HTTP triggers (cron / admin console) return in
+ * milliseconds, so platform request timeouts can never abort the phases
+ * mid-flight. Progress is observable through job_runs and the admin status
+ * endpoint (background:backfill.state).
  */
+const backgroundJobs = new Map<string, { startedAt: string; finishedAt: string | null; result: JobResult | null; error: string | null }>();
+
+export function getBackfillBackgroundState(): { running: boolean; startedAt: string | null; finishedAt: string | null; result: JobResult | null; error: string | null } {
+  const state = backgroundJobs.get('backfill');
+  if (!state) return { running: false, startedAt: null, finishedAt: null, result: null, error: null };
+  return { running: state.finishedAt === null, ...state };
+}
+
+async function runBackfillPhases(): Promise<JobResult> {
+  const result: JobResult = {
+    jobType: 'backfill',
+    status: 'COMPLETED',
+    recordsProcessed: 0,
+    recordsCreated: 0,
+    recordsUpdated: 0,
+    recordsRejected: 0,
+  };
+  const phaseMeta: Record<string, unknown> = {};
+
+  const phases: Array<{ name: string; run: () => Promise<JobResult> }> = [
+    { name: 'historical_catalog', run: seedHistoricalCatalog },
+    { name: 'past_discovery', run: () => runPastDiscoveryJob() },
+  ];
+
+  let failedPhases = 0;
+  let partialPhases = 0;
+
+  for (const phase of phases) {
+    try {
+      const phaseResult = await phase.run();
+      phaseMeta[phase.name] = {
+        status: phaseResult.status,
+        processed: phaseResult.recordsProcessed,
+        created: phaseResult.recordsCreated,
+        updated: phaseResult.recordsUpdated,
+        rejected: phaseResult.recordsRejected,
+        ...(phaseResult.errorMessage ? { error: phaseResult.errorMessage } : {}),
+      };
+      result.recordsProcessed += phaseResult.recordsProcessed;
+      result.recordsCreated += phaseResult.recordsCreated;
+      result.recordsUpdated += phaseResult.recordsUpdated;
+      result.recordsRejected += phaseResult.recordsRejected;
+      if (phaseResult.status === 'FAILED') {
+        failedPhases++;
+        result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'failed'}`;
+      } else if (phaseResult.status === 'PARTIAL') {
+        partialPhases++;
+        if (!result.errorMessage) result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'partial'}`;
+      }
+    } catch (err) {
+      failedPhases++;
+      phaseMeta[phase.name] = { status: 'FAILED', error: (err as Error).message };
+      result.errorMessage = `${phase.name}: ${(err as Error).message}`;
+    }
+  }
+
+  if (failedPhases === phases.length) result.status = 'FAILED';
+  else if (failedPhases > 0 || partialPhases > 0) result.status = 'PARTIAL';
+
+  return result;
+}
+
 export async function runHistoricalBackfillJob(): Promise<JobResult> {
+  if (!isSupabaseConfigured()) {
+    return {
+      jobType: 'backfill',
+      status: 'FAILED',
+      recordsProcessed: 0,
+      recordsCreated: 0,
+      recordsUpdated: 0,
+      recordsRejected: 0,
+      errorMessage: 'Supabase is not configured',
+    };
+  }
+
   if (!acquireLock('backfill')) {
     return {
       jobType: 'backfill',
@@ -262,8 +356,56 @@ export async function runHistoricalBackfillJob(): Promise<JobResult> {
     };
   }
 
+  const existingState = backgroundJobs.get('backfill');
+  if (existingState && existingState.finishedAt === null) {
+    releaseLock('backfill');
+    return {
+      jobType: 'backfill',
+      status: 'PARTIAL',
+      recordsProcessed: 0,
+      recordsCreated: 0,
+      recordsUpdated: 0,
+      recordsRejected: 0,
+      errorMessage: 'A backfill run is already in progress',
+    };
+  }
+
   const runId = await startJobRun('backfill');
-  const result: JobResult = {
+  backgroundJobs.set('backfill', { startedAt: new Date().toISOString(), finishedAt: null, result: null, error: null });
+
+  // Detached execution: the caller's promise resolves immediately with a
+  // QUEUED acknowledgment; the phases continue regardless of HTTP lifetime.
+  const background = (async () => {
+    let finalResult: JobResult;
+    try {
+      finalResult = await runBackfillPhases();
+    } catch (err) {
+      finalResult = {
+        jobType: 'backfill',
+        status: 'FAILED',
+        recordsProcessed: 0,
+        recordsCreated: 0,
+        recordsUpdated: 0,
+        recordsRejected: 0,
+        errorMessage: (err as Error).message,
+      };
+    }
+    if (runId) await finishJobRun(runId, finalResult, { background: true });
+    const state = backgroundJobs.get('backfill');
+    if (state) {
+      state.result = finalResult;
+      state.error = finalResult.errorMessage || null;
+      state.finishedAt = new Date().toISOString();
+    }
+    releaseLock('backfill');
+  })();
+
+  // Swallow any asynchronous escape so the detached task can never produce an
+  // unhandled rejection that kills the server process.
+  background.catch(() => undefined);
+
+  // QUEUED acknowledgment — returned to cron/admin callers instantly.
+  return {
     jobType: 'backfill',
     status: 'COMPLETED',
     recordsProcessed: 0,
@@ -271,61 +413,4 @@ export async function runHistoricalBackfillJob(): Promise<JobResult> {
     recordsUpdated: 0,
     recordsRejected: 0,
   };
-  const phaseMeta: Record<string, unknown> = {};
-
-  try {
-    if (!isSupabaseConfigured()) {
-      result.status = 'FAILED';
-      result.errorMessage = 'Supabase is not configured';
-    } else {
-      const phases: Array<{ name: string; run: () => Promise<JobResult> }> = [
-        { name: 'historical_catalog', run: seedHistoricalCatalog },
-        { name: 'past_discovery', run: () => runPastDiscoveryJob() },
-      ];
-
-      let failedPhases = 0;
-      let partialPhases = 0;
-
-      for (const phase of phases) {
-        try {
-          const phaseResult = await phase.run();
-          phaseMeta[phase.name] = {
-            status: phaseResult.status,
-            processed: phaseResult.recordsProcessed,
-            created: phaseResult.recordsCreated,
-            updated: phaseResult.recordsUpdated,
-            rejected: phaseResult.recordsRejected,
-            ...(phaseResult.errorMessage ? { error: phaseResult.errorMessage } : {}),
-          };
-          result.recordsProcessed += phaseResult.recordsProcessed;
-          result.recordsCreated += phaseResult.recordsCreated;
-          result.recordsUpdated += phaseResult.recordsUpdated;
-          result.recordsRejected += phaseResult.recordsRejected;
-          if (phaseResult.status === 'FAILED') {
-            failedPhases++;
-            result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'failed'}`;
-          } else if (phaseResult.status === 'PARTIAL') {
-            partialPhases++;
-            if (!result.errorMessage) result.errorMessage = `${phase.name}: ${phaseResult.errorMessage || 'partial'}`;
-          }
-        } catch (err) {
-          failedPhases++;
-          phaseMeta[phase.name] = { status: 'FAILED', error: (err as Error).message };
-          result.errorMessage = `${phase.name}: ${(err as Error).message}`;
-        }
-      }
-
-      if (failedPhases === phases.length) result.status = 'FAILED';
-      else if (failedPhases > 0 || partialPhases > 0) result.status = 'PARTIAL';
-    }
-  } catch (err) {
-    result.status = 'FAILED';
-    result.errorMessage = (err as Error).message;
-    phaseMeta.fatalError = result.errorMessage;
-  } finally {
-    releaseLock('backfill');
-    if (runId) await finishJobRun(runId, result, { phases: phaseMeta });
-  }
-
-  return result;
 }

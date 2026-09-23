@@ -39,10 +39,13 @@ import { rateLimit } from './lib/rateLimit';
 import {
   isSubstantiveFact,
   normalizeFactKey,
+  reconcileCasualtyNumericClaims,
+  extractCasualtyNumericClaims,
   stripPublisherNoise,
   validateAndCleanCitations,
   type FactTopic,
 } from './lib/evidenceUtils';
+import { isIndiaRelevantEvidence } from './lib/researchOrchestrator';
 import {
   badRequest,
   forbidden,
@@ -95,7 +98,8 @@ async function getEventClaims(eventId: string): Promise<Record<string, string[]>
   const claims: Record<string, string[]> = {};
   for (const row of rows) {
     if (!claims[row.claim_type]) claims[row.claim_type] = [];
-    claims[row.claim_type].push(row.claim_value);
+    const value = cleanLegacyField(row.claim_value);
+    if (value) claims[row.claim_type].push(value);
   }
   return claims;
 }
@@ -116,7 +120,7 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Recor
   const damageFacts = extractSourceFacts(sources, /\b(?:rs\.?|₹|inr|crore|lakh|damage(?:d)?|destroyed|collapsed|washed away|houses?|roads?|bridges?|power|infrastructure|crop|loss)\b[^.;]{0,180}/gi, 3, 'damage');
   const responseFacts = extractSourceFacts(sources, /\b(?:rescue|relief|ndrf|sdrf|army|navy|government|administration|evacuat(?:ed|ion)|shelter|compensation|aid)\b[^.;]{0,180}/gi, 3, 'response');
   const recoveryFacts = extractSourceFacts(sources, /\b(?:recovery|rehabilitation|reconstruction|restoration|relief camp|compensation|survivors?|aftermath)\b[^.;]{0,180}/gi, 3, 'recovery');
-  const timeline = buildTimelineFromSources(sources, event.startedAt || event.lastObservedAt || event.updatedAt);
+  const timeline = buildTimelineFromSources(sources, event.startedAt || event.lastObservedAt || event.updatedAt, event.country);
   const sourceCount = Math.max(event.sourceCount, sources.length);
   const distinctPublishers = new Set(sources.map((source) => publisherKey(source))).size;
   const synthesizedSummary = summarizeFromSources(sources, event.description);
@@ -131,9 +135,29 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Recor
     return '';
   };
 
-  const casualties = pickClaim(['CASUALTIES'], 'casualties') || casualtyFacts.join('; ') || extractCasualtyFallback(sourceText, sources[0]?.id) || '';
+  // ------------------------------------------------------------------
+  // Numeric interval reconciliation: merge clustered claims into a compact
+  // range and EXCLUDE outliers (the 5/7/10 vs 1000 problem). The range text
+  // is produced only from real, mortality-scoped numeric claims — never a
+  // bogus "2-3,00,000" spread.
+  // ------------------------------------------------------------------
+  const numericClaims = extractCasualtyNumericClaims(sources);
+  const reconciled = reconcileCasualtyNumericClaims(numericClaims);
+  let reportedCasualties = pickClaim(['CASUALTIES'], 'casualties');
+  if (!reportedCasualties && reconciled.rangeMax > 0 && reconciled.rangeMax / Math.max(1, reconciled.rangeMin) < 10) {
+    const outliersSuffix = reconciled.outliers.length
+      ? ` (outlier claims of ${reconciled.outliers.map((v) => v.toLocaleString('en-IN')).join(', ')} excluded)`
+      : '';
+    reportedCasualties = reconciled.rangeMin === reconciled.rangeMax
+      ? `${reconciled.rangeMin.toLocaleString('en-IN')} reported in retrieved source coverage.${outliersSuffix}`
+      : `${reconciled.rangeMin.toLocaleString('en-IN')}-${reconciled.rangeMax.toLocaleString('en-IN')} reported in retrieved source coverage.${outliersSuffix}`;
+  }
+  // No usable mortality numbers at all: fall back to quantified fact snippets  // (already quality-gated) or leave EMPTY — a placeholder sentence is worse  // than nothing because the UI hides empty fields.
+  if (!reportedCasualties) reportedCasualties = casualtyFacts.join('; ');
+  if (!reportedCasualties) reportedCasualties = extractCasualtyFallback(sourceText, sources[0]?.id) || '';
+
   const damage = pickClaim(['DAMAGE'], 'damage') || damageFacts.join('; ') || '';
-  const humanImpact = pickClaim(['HUMAN_IMPACT', 'CASUALTIES'], 'casualties') || casualtyFacts.join('; ') || '';
+  const humanImpact = pickClaim(['HUMAN_IMPACT', 'CASUALTIES'], 'casualties') || (isSubstantiveFact(reportedCasualties, 'casualties') ? reportedCasualties : '');
   const infrastructureDamage = pickClaim(['INFRASTRUCTURE_DAMAGE', 'DAMAGE'], 'damage') || damageFacts.join('; ') || '';
   const economicImpact = pickClaim(['ECONOMIC_IMPACT'], 'damage') || damageFacts.filter((fact) => /rs\.?|₹|inr|crore|lakh|loss/i.test(fact)).join('; ') || '';
   const governmentResponse = pickClaim(['GOVERNMENT_RESPONSE'], 'response') || responseFacts.join('; ') || '';
@@ -154,8 +178,11 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Recor
     country: event.country,
     eventDate: event.startedAt,
     dateRange: eventDateFormatted,
-    reportedCasualties: casualties,
+    reportedCasualties,
     reportedDamage: damage,
+    numericCasualtiesRange: reconciled.rangeMax > 0
+      ? { min: reconciled.rangeMin, max: reconciled.rangeMax, outliers: reconciled.outliers }
+      : undefined,
     sources,
     timeline,
     whatHappened: synthesizedSummary,
@@ -167,7 +194,11 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Recor
     rescueRelief,
     recovery,
     sourceAssessment: `${event.verificationStatus} via ${event.verificationMethod}. Verification score ${Math.round(event.verificationScore * 100)}%. Coverage: ${sourceCount} source(s), ${distinctPublishers} distinct publisher(s), ${timeline.length} timeline milestone(s).`,
-    conflictingReports: [],
+    conflictingReports: reconciled.outlierClaims.map((claim) => ({
+      topic: 'Reconciled numeric outlier',
+      details: `${claim.value.toLocaleString('en-IN')} was reported [${claim.sourceId || 'source'}] but excluded from the reported interval as a statistical outlier.`,
+      sources: claim.sourceId ? [claim.sourceId] : [],
+    })),
     synthesizedAt: event.updatedAt,
     evidenceStatus: event.verificationScore >= 0.8 ? 'High Confidence' : event.verificationScore >= 0.55 ? 'Moderate Evidence' : 'Limited Coverage',
     retrievalMetadata: {
@@ -250,6 +281,7 @@ function summarizeFromSources(
 function buildTimelineFromSources(
   sources: Array<{ id: string; title: string; summary: string; publishedAt: string }>,
   fallbackDate: string,
+  eventCountry?: string,
 ): EvidenceBundle['timeline'] {
   const fallbackParsed = Number.isFinite(Date.parse(fallbackDate)) ? Date.parse(fallbackDate) : null;
   const eventYear = fallbackParsed ? new Date(fallbackParsed).getUTCFullYear() : null;
@@ -258,6 +290,19 @@ function buildTimelineFromSources(
   const entries: Array<EvidenceBundle['timeline'][number] & { sortTime: number }> = [];
 
   for (const source of sources) {
+    // ----------------------------------------------------------
+    // India gate: a source whose text never anchors to India (or, for a
+    // non-India event, never anchors to the event's own country) describes a
+    // DIFFERENT disaster ("Indonesia Earthquake… Flores" carried by an    // India-branded outlet). Such items must never appear in this event's    // chronological timeline.
+    // ----------------------------------------------------------
+    const anchorCountry = (eventCountry && eventCountry !== 'India' && eventCountry !== ''
+      ? eventCountry
+      : 'India').toLowerCase();
+    const text = `${source.title}. ${source.summary}`.toLowerCase();
+    if (!text.includes(anchorCountry) && !isIndiaRelevantEvidence(source.title, source.summary)) {
+      continue;
+    }
+
     const title = cleanSnippet(source.title).slice(0, 120);
     if (!title || title.length < 8) continue;
 
@@ -529,6 +574,37 @@ async function persistRichEvidenceBundle(eventId: string | null | undefined, bun
   if (docId) await embedAndStoreSearchDocument(docId, `${bundle.eventName}. ${bundle.whatHappened}`).catch(() => undefined);
 }
 
+/**
+ * Legacy research snapshots and pre-fix claim rows can carry filler phrases
+ * ("across clustered source claims", "documented in source citations") or
+ * citation-fragment junk ("[S1] damage"). Clean on read so legacy rows render
+ * like live projections.
+ */
+export function cleanLegacyField(value: string | undefined): string {
+  const text = String(value || '');
+  if (/^\[S\d+\]\s+\S+;/.test(text) && !/\d{2,}/.test(text)) return ''; // "[S1] damage; [S3] evacuated" style junk
+  return text
+    .replace(/\s+reported across clustered source claims/gi, ' reported')
+    .replace(/\s+across clustered source claims\.?/gi, '')
+    .replace(/\s+documented in (?:source|verified) citations\.?/gi, '')
+    .trim();
+}
+
+function sanitizeLegacyBundle(bundle: EvidenceBundle): EvidenceBundle {
+  const cleanField = cleanLegacyField;
+  return {
+    ...bundle,
+    reportedCasualties: cleanField(bundle.reportedCasualties),
+    reportedDamage: cleanField(bundle.reportedDamage),
+    humanImpact: cleanField(bundle.humanImpact),
+    infrastructureDamage: cleanField(bundle.infrastructureDamage),
+    economicImpact: cleanField(bundle.economicImpact),
+    governmentResponse: cleanField(bundle.governmentResponse),
+    rescueRelief: cleanField(bundle.rescueRelief),
+    recovery: cleanField(bundle.recovery),
+  };
+}
+
 async function getPersistedEvidenceBundle(eventId: string): Promise<EvidenceBundle | null> {
   if (!isSupabaseConfigured()) return null;
   const rows = await supabaseRest<Array<{ content: string }>>(
@@ -541,17 +617,25 @@ async function getPersistedEvidenceBundle(eventId: string): Promise<EvidenceBund
   try {
     const parsed = JSON.parse(raw) as EvidenceBundle;
     if (!parsed?.eventName || !Array.isArray(parsed.sources)) return null;
-    return { ...parsed, id: eventId };
+    return sanitizeLegacyBundle({ ...parsed, id: eventId });
   } catch {
     return null;
   }
 }
 
 async function bundleForCanonicalEvent(event: CanonicalEventDto): Promise<EvidenceBundle> {
+  // Curated claims are the primary projection source: they are verified,
+  // numeric-reconciled, and citation-backed. The persisted rich bundle (an
+  // older AI-research snapshot) is only used when no claims exist — stale
+  // snapshots from earlier runs otherwise resurface junk like "documented in
+  // source citations" and empty casualty fields.
+  const claims = await getEventClaims(event.id);
+  if (Object.keys(claims).length > 0) {
+    return canonicalEventToEvidenceBundle(event, claims);
+  }
   const stored = await getPersistedEvidenceBundle(event.id);
   if (stored) return stored;
-  const claims = await getEventClaims(event.id);
-  return canonicalEventToEvidenceBundle(event, claims);
+  return canonicalEventToEvidenceBundle(event);
 }
 
 async function persistExternalResearch(query: string, bundle: EvidenceBundle): Promise<void> {
@@ -1653,8 +1737,12 @@ router.get('/admin/overview', requireAuth, requireAdmin, async (_req: Request, r
     };
 
     const [activeEvents, archivedEvents, totalReports, pendingReports, recentJobs, failedJobs] = await Promise.all([
-      countOf('canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING,ENDING)'),
-      countOf('canonical_events?status=in.(ENDED,ARCHIVED)'),
+      // Admin event counts deliberately reuse the PUBLIC listing pipeline
+      // (verification filter + shared geo-validation) instead of raw table
+      // counts, so the dashboard, the Present page badge, and the map markers
+      // can never disagree again.
+      listActiveCanonicalEvents().then((r) => r.items.length),
+      listArchivedCanonicalEvents().then((r) => r.items.length),
       countOf('citizen_reports?select=id'),
       countOf('citizen_reports?status=in.(PENDING,VERIFYING)&select=id'),
       countOf(`job_runs?started_at=gte.${encodeURIComponent(new Date(Date.now() - 24 * 3600 * 1000).toISOString())}&select=id`),

@@ -4,6 +4,7 @@ import {
   Loader2, Play, RefreshCw, Rss, Search, Server, ShieldCheck, Trash2, XCircle,
 } from 'lucide-react';
 import { api } from '../../lib/api';
+import { DonutChart, HBarChart, FunnelChart } from './charts';
 import {
   PremiumPanel, SectionHeader, MetricCard, StatusBadge, HealthDot, DataTable, LoadingSkeleton,
   EmptyState, ErrorState, PrimaryButton, SecondaryButton, ToastStack, useToasts, cx,
@@ -785,6 +786,61 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
               <MetricCard label="Officially verified" value={insights.overview.officialVerified} hint={`${insights.overview.crossSourceVerified} cross-source`} icon={<ShieldCheck className="w-4 h-4" />} />
             </div>
 
+            <div className="grid lg:grid-cols-2 gap-4">
+              {/* Verification status mix as a donut. */}
+              <DonutChart
+                title="Verification mix"
+                subtitle="How every canonical event earned its trust level"
+                slices={[
+                  { label: 'Official verified', value: insights.overview.officialVerified, color: '#0F1B29' },
+                  { label: 'Cross-source verified', value: insights.overview.crossSourceVerified, color: '#3B82F6' },
+                  { label: 'Provisional', value: insights.overview.provisional, color: '#F59E0B' },
+                  {
+                    label: 'Unverified',
+                    value: Math.max(0, insights.overview.totalEvents - insights.overview.officialVerified - insights.overview.crossSourceVerified - insights.overview.provisional),
+                    color: '#DDDDDD',
+                  },
+                ]}
+              />
+
+              {/* Citizen report funnel. */}
+              <FunnelChart
+                title="Citizen report funnel"
+                subtitle="From submission to verified on-map evidence"
+                steps={[
+                  { label: 'Submitted', value: overview?.totalReports ?? 0, color: '#0F1B29' },
+                  { label: 'Awaiting verification', value: overview?.pendingReports ?? 0, color: '#F59E0B' },
+                  {
+                    label: 'Linked to events',
+                    value: (reports || []).filter((r) => r.linked_event_id).length,
+                    color: '#3B82F6',
+                  },
+                  {
+                    label: 'Verified',
+                    value: (reports || []).filter((r) => r.status === 'VERIFIED').length,
+                    color: '#10B981',
+                  },
+                ]}
+              />
+            </div>
+
+            <div className="grid lg:grid-cols-2 gap-4">
+              {/* Events by type with severe segment. */}
+              <HBarChart
+                title="Events by type"
+                subtitle="Red segment = severe or extreme share"
+                rows={insights.byType.map((type) => ({ label: type.eventType, value: type.count, secondary: type.severeCount }))}
+              />
+
+              {/* Top states by event count. */}
+              <HBarChart
+                title="Top states"
+                subtitle="Red segment = severe or extreme share"
+                rows={insights.byState.map((row) => ({ label: row.state, value: row.count, secondary: row.severeCount }))}
+                maxRows={8}
+              />
+            </div>
+
             <div className="grid lg:grid-cols-2 gap-5">
               <div>
                 <p className="text-[10px] uppercase tracking-wider font-bold text-[#747F8D] mb-2">30-day event trend</p>
@@ -818,14 +874,26 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
               </div>
             </div>
 
-            <div>
-              <p className="text-[10px] uppercase tracking-wider font-bold text-[#747F8D] mb-2">By event type</p>
-              <div className="flex flex-wrap gap-1.5">
-                {insights.byType.slice(0, 10).map((type) => (
-                  <StatusBadge key={type.eventType} tone={type.severeCount > 0 ? 'warning' : 'neutral'}>
-                    {type.eventType} · {type.count}{type.severeCount > 0 ? ` (${type.severeCount} severe)` : ''}
-                  </StatusBadge>
-                ))}
+            <div className="grid lg:grid-cols-2 gap-4">
+              <DonutChart
+                title="Background job outcomes"
+                subtitle="Recent pipeline runs by final status"
+                slices={[
+                  { label: 'Completed', value: (jobs || []).filter((j) => j.status === 'COMPLETED').length, color: '#10B981' },
+                  { label: 'Running', value: (jobs || []).filter((j) => j.status === 'RUNNING').length, color: '#3B82F6' },
+                  { label: 'Failed', value: (jobs || []).filter((j) => j.status === 'FAILED').length, color: '#E11D48' },
+                  { label: 'Timeout', value: (jobs || []).filter((j) => j.status === 'TIMEOUT').length, color: '#F59E0B' },
+                ]}
+              />
+              <div>
+                <p className="text-[10px] uppercase tracking-wider font-bold text-[#747F8D] mb-2">By event type</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {insights.byType.slice(0, 10).map((type) => (
+                    <StatusBadge key={type.eventType} tone={type.severeCount > 0 ? 'warning' : 'neutral'}>
+                      {type.eventType} · {type.count}{type.severeCount > 0 ? ` (${type.severeCount} severe)` : ''}
+                    </StatusBadge>
+                  ))}
+                </div>
               </div>
             </div>
           </div>

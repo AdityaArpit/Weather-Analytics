@@ -13,7 +13,7 @@ interface GeocodeResult {
   country: string;
 }
 
-const INDIAN_STATE_CENTROIDS: Record<string, { lat: number; lng: number }> = {
+export const INDIAN_STATE_CENTROIDS: Record<string, { lat: number; lng: number }> = {
   'andhra pradesh': { lat: 15.9129, lng: 79.7400 },
   'arunachal pradesh': { lat: 28.2180, lng: 97.1330 },
   'assam': { lat: 26.2006, lng: 92.9376 },

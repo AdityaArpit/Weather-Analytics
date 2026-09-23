@@ -5,6 +5,7 @@ import { runLifecycleJob } from './lifecycleJob';
 import { runEmbeddingJob } from './embeddingJob';
 import { runNotificationJob } from './notificationJob';
 import { runPastDiscoveryJob } from './pastDiscoveryJob';
+import { runCitizenVerificationJob } from './citizenVerificationJob';
 
 /**
  * In-process job scheduler.
@@ -35,6 +36,8 @@ const LIFECYCLE_INTERVAL = minutes(Number(process.env.LIFECYCLE_INTERVAL_MIN), 3
 const EMBEDDING_INTERVAL = minutes(Number(process.env.EMBEDDING_INTERVAL_MIN), 360) * 60_000;
 const NOTIFICATION_INTERVAL = minutes(Number(process.env.NOTIFICATION_INTERVAL_MIN), 5) * 60_000;
 const DISCOVERY_INTERVAL = minutes(Number(process.env.PAST_DISCOVERY_INTERVAL_MIN), 720) * 60_000;
+/** Citizen reports are time-sensitive: verify quickly so warnings reach users. */
+const CITIZEN_INTERVAL = minutes(Number(process.env.CITIZEN_VERIFICATION_INTERVAL_MIN), 2) * 60_000;
 
 const SCHEDULED_JOBS: ScheduledJob[] = [
   { name: 'ingestion', intervalMs: INGEST_INTERVAL, run: () => runIngestionJob() },
@@ -43,6 +46,7 @@ const SCHEDULED_JOBS: ScheduledJob[] = [
   { name: 'reconciliation', intervalMs: RECONCILE_INTERVAL, run: () => runReconciliationJob() },
   { name: 'embedding', intervalMs: EMBEDDING_INTERVAL, run: () => runEmbeddingJob() },
   { name: 'past_discovery', intervalMs: DISCOVERY_INTERVAL, run: () => runPastDiscoveryJob() },
+  { name: 'citizen_verification', intervalMs: CITIZEN_INTERVAL, run: () => runCitizenVerificationJob() },
 ];
 
 let schedulerTimer: ReturnType<typeof setInterval> | null = null;
@@ -81,7 +85,7 @@ const STARTUP_DELAY_MS = 8_000;
 export function startJobScheduler(): void {
   if (schedulerTimer) return; // idempotent
   console.log(
-    `[scheduler] started: ingest ${INGEST_INTERVAL / 60000}min · reconcile ${RECONCILE_INTERVAL / 60000}min · lifecycle ${LIFECYCLE_INTERVAL / 60000}min · notifications ${NOTIFICATION_INTERVAL / 60000}min · embeddings ${EMBEDDING_INTERVAL / 60000}min · past-discovery ${DISCOVERY_INTERVAL / 60000}min`,
+    `[scheduler] started: ingest ${INGEST_INTERVAL / 60000}min · reconcile ${RECONCILE_INTERVAL / 60000}min · lifecycle ${LIFECYCLE_INTERVAL / 60000}min · notifications ${NOTIFICATION_INTERVAL / 60000}min · embeddings ${EMBEDDING_INTERVAL / 60000}min  · past-discovery ${DISCOVERY_INTERVAL / 60000}min · citizen ${CITIZEN_INTERVAL / 60000}min`,
   );
 
   setTimeout(tick, STARTUP_DELAY_MS);

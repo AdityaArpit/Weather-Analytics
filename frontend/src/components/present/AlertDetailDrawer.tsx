@@ -28,13 +28,13 @@ import { formatDisasterDate } from '../../lib/dateFormat';
 interface AlertDetailDrawerProps {
   alert: SachetAlert | null;
   onClose: () => void;
-  onShare: (alert: SachetAlert) => void;
+  onShare: (alert: SachetAlert) => void;
 }
 
 export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
   alert,
   onClose,
-  onShare,
+  onShare,
 }) => {
   const [hasCopiedInstruction, setHasCopiedInstruction] = useState(false);
   const [activeTab, setActiveTab] = useState<'info' | 'measures' | 'helplines'>('info');
@@ -73,6 +73,19 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
     )
     : null;
   const portalUrl = alert.officialPortalUrl || alert.webUrl || null;
+
+  // Tabs with no substantive content are hidden entirely instead of rendering
+  // empty/crashing states. guidance is null whenever the alert has no usable
+  // geometry, so both dependent tabs must degrade gracefully.
+  const hasMeasures = Boolean(
+    guidance &&
+      (guidance.actionableMeasures.length > 0 || guidance.dos.length > 0 || guidance.donts.length > 0),
+  );
+  const hasHelplines = Boolean(guidance && guidance.emergencyContacts.length > 0);
+  const safeTab =
+    (activeTab === 'measures' && !hasMeasures) || (activeTab === 'helplines' && !hasHelplines)
+      ? 'info'
+      : activeTab;
   const presentationEntries = useMemo(() => [
     { id: 'event', text: alert.event }, { id: 'headline', text: alert.headline },
     { id: 'description', text: alert.description }, { id: 'instruction', text: alert.instruction },
@@ -131,29 +144,33 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
         >
           {uiText('alerts.overview')}
         </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('measures')}
-          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-            activeTab === 'measures'
-              ? 'bg-slate-900 text-white'
-              : 'text-slate-600 hover:bg-slate-100'
-          }`}
-        >
-          {uiText('alerts.protectiveMeasures')}
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('helplines')}
-          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
-            activeTab === 'helplines'
-              ? 'bg-rose-600 text-white'
-              : 'text-slate-600 hover:bg-slate-100'
-          }`}
-        >
-          <PhoneCall className="w-3 h-3" />
-          <span>{uiText('alerts.helplines')}</span>
-        </button>
+        {hasMeasures && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('measures')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+              safeTab === 'measures'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            {uiText('alerts.protectiveMeasures')}
+          </button>
+        )}
+        {hasHelplines && (
+          <button
+            type="button"
+            onClick={() => setActiveTab('helplines')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
+              safeTab === 'helplines'
+                ? 'bg-rose-600 text-white'
+                : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <PhoneCall className="w-3 h-3" />
+            <span>{uiText('alerts.helplines')}</span>
+          </button>
+        )}
       </div>
 
       {/* Drawer Scrollable Body */}
@@ -221,7 +238,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
         )}
 
         {/* Tab 2: Measures & Evacuation Guidelines */}
-        {activeTab === 'measures' && (
+        {safeTab === 'measures' && hasMeasures && (
           <div className="space-y-4 animate-in fade-in">
             {guidance ? (
               <>
@@ -289,7 +306,7 @@ export const AlertDetailDrawer: React.FC<AlertDetailDrawerProps> = ({
         )}
 
         {/* Tab 3: Helplines */}
-        {activeTab === 'helplines' && (
+        {safeTab === 'helplines' && guidance && (
           <div className="space-y-3 animate-in fade-in">
             <div className="flex items-center justify-between text-xs font-bold text-slate-900">
               <span className="flex items-center gap-1.5">

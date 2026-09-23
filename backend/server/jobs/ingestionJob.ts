@@ -1,8 +1,9 @@
 import { getConfiguredSourceAdapters, type RawObservation } from '../ingestion/sourceAdapters';
 import { supabaseRest, isSupabaseConfigured } from '../db/supabase';
 import { contentHash } from '../lib/contentHash';
-import { geocodeLocation, extractLocationsFromText } from '../lib/geocoding';
+import { geocodeLocation, extractLocationsFromText, INDIAN_STATE_CENTROIDS } from '../lib/geocoding';
 import { resolveSource, type SourceKey } from '../lib/sourceRegistry';
+import { translateToEnglish, isMostlyLatinText } from '../lib/translation';
 import { findBestCorrelation, CORRELATION_MATCH_THRESHOLD, type CorrelationCandidate } from '../lib/correlation';
 import { verificationFromSignals, type VerificationStatus } from '../lib/verification';
 import { upsertSearchDocument, embedAndStoreEvent, embedAndStoreSourceObservation, embedAndStoreSearchDocument } from '../lib/searchRetrieval';
@@ -71,12 +72,64 @@ function buildEventKey(eventType: string, location: string, dateStr: string, ext
   return `${normalize(eventType)}-${locPart}${extPart}-${dateStr}`.slice(0, 120);
 }
 
+/**
+ * India-only relevance gate. Sources whose names merely contain "India"
+ * (India Today, The Indian Express, News18 India…) still publish stories about
+ * disasters abroad (Java, Flores, Hindu Kush…). An article is India-relevant
+ * only when the TEXT itself names India or an Indian state/union territory —
+ * foreign place mentions without any India anchor are rejected.
+ */
+function isIndiaRelevantText(...parts: Array<string | undefined>): boolean {
+  const text = parts.filter(Boolean).join(' ').toLowerCase();
+  if (!text) return false;
+
+  if (/\bindia\b|\bindian\b/.test(text)) return true;
+  for (const state of Object.keys(INDIAN_STATE_CENTROIDS)) {
+    if (text.includes(state)) return true;
+  }
+  // Major Indian cities and common location aliases.
+  const cityHints = [
+    'mumbai', 'delhi', 'bengaluru', 'bangalore', 'chennai', 'kolkata', 'hyderabad',
+    'ahmedabad', 'pune', 'jaipur', 'lucknow', 'kanpur', 'patna', 'bhopal', 'indore',
+    'nagpur', 'surat', 'kochi', 'coimbatore', 'guwahati', 'shimla', 'dehradun',
+    'srinagar', 'kolkata', 'vizag', 'visakhapatnam', 'vijayawada', 'kozhikode',
+    'thiruvananthapuram', 'bhubaneswar', 'cuttack', 'puri', 'noida', 'gurugram', 'ncr',
+  ];
+  if (cityHints.some((city) => text.includes(city))) return true;
+
+  // Explicit foreign-disaster markers with NO India anchor above -> reject.
+  return false;
+}
+
+function haversineKmApprox(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 async function normalizeObservation(
   raw: RawObservation,
   source: { id: string; sourceType: string; trustWeight: number },
-): Promise<NormalizedObservation> {
-  const title = raw.title || 'Untitled';
-  const description = raw.rawContent || '';
+): Promise<NormalizedObservation | null> {
+  let title = raw.title || 'Untitled';
+  let description = raw.rawContent || '';
+
+  // ---- India relevance gate (before any DB work) ----
+  if (!isIndiaRelevantText(title, description, raw.locationText)) {
+    return null;
+  }
+
+  // ---- Language normalization: translate non-English content to English so    // the whole store (and every downstream surface) stays English. If the
+    // translator is unavailable, non-Latin content is dropped rather than
+    // stored in a mixed-language corpus.
+  if (!isMostlyLatinText(`${title} ${description}`)) {
+    const translated = await translateToEnglish(`${title}\n${description}`.slice(0, 4000));
+    if (!translated) return null;
+    const [t, ...rest] = translated.split('\n');
+    title = t.trim() || title;
+    description = rest.join('\n').trim() || description;
+  }
   const locationText = raw.locationText || description.slice(0, 400);
   const { city, district, state } = extractLocationsFromText(locationText);
   const eventType = raw.eventCategory && raw.eventCategory !== 'Met' && raw.eventCategory !== 'Safety'
@@ -98,9 +151,29 @@ async function normalizeObservation(
 
   if (lat === undefined || lng === undefined) {
     const geocoded = await geocodeLocation(locationText);
-    if (geocoded) {
+    if (geocoded && geocoded.country === 'India') {
       lat = geocoded.lat;
       lng = geocoded.lng;
+      // Cross-check: a geocoded state that contradicts the text-derived state      // means ambiguous/incorrect resolution — drop the coordinates rather      // than draw a mismatched point on the map.
+      if (state && geocoded.state) {
+        const a = state.toLowerCase().trim();
+        const b = geocoded.state.toLowerCase().trim();
+        const compatible = a === b || a.includes(b) || b.includes(a);
+        if (!compatible) {
+          lat = undefined;
+          lng = undefined;
+        }
+      }
+    }
+  }
+
+  // Coordinate/state plausibility guard: stored coords must sit within ~600 km
+  // of the named state's centroid, otherwise the point is unreliable and is  // dropped (the map only renders events whose geometry matches their labels).
+  if (lat !== undefined && lng !== undefined && state) {
+    const centroid = INDIAN_STATE_CENTROIDS[state.toLowerCase()];
+    if (centroid && haversineKmApprox(lat, lng, centroid.lat, centroid.lng) > 600) {
+      lat = undefined;
+      lng = undefined;
     }
   }
 
@@ -336,6 +409,12 @@ export async function runIngestionJob(): Promise<JobResult> {
           sourceType: sourceDef.source_type,
           trustWeight: sourceDef.trust_weight,
         });
+        if (!obs) {
+          // Rejected by the India-relevance gate or language normalization.
+          recordsRejected++;
+          result.recordsRejected++;
+          continue;
+        }
 
         if (await isDuplicateObservation(obs)) {
           recordsRejected++;

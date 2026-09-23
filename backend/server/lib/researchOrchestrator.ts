@@ -17,6 +17,8 @@
 import { supabaseRest, isSupabaseConfigured } from '../db/supabase';
 import { contentHash, normalizeUrl } from './contentHash';
 import { resolveSource, type SourceKey } from './sourceRegistry';
+import { translateToEnglish, isMostlyLatinText } from './translation';
+import { INDIAN_STATE_CENTROIDS } from './geocoding';
 import {
   lexicalSearch,
   vectorEventSearch,
@@ -467,6 +469,59 @@ export function decideVerification(evidence: RawHistoricalEvidence[]): Verificat
 }
 
 // ---------------------------------------------------------------------------
+// India relevance gating for external research evidence.
+//
+// India-branded outlets (India Today, The Indian Express, News18 India…)
+// regularly publish foreign-disaster coverage. An "India Today" byline never
+// makes a Java earthquake an Indian event: an item is India-relevant only when
+// its text names India, an Indian state, or a major Indian city, AND names no
+// foreign disaster location that dominates it.
+// ---------------------------------------------------------------------------
+
+const FOREIGN_DISASTER_PLACES = [
+  'indonesia', 'java', 'flores', 'sumatra', 'bali', 'sulawesi', 'jawa',
+  'afghanistan', 'hindu kush', 'pakistan', 'nepal', 'tibet', 'china',
+  'myanmar', 'bangladesh', 'sri lanka', 'iran', 'turkey', 'japan', 'philippines',
+  'taiwan', 'chile', 'peru', 'mexico', 'california', 'nepal glacier', 'kathmandu',
+  'colombo', 'kabul', 'karachi', 'lahore', 'jakarta', 'kuala lumpur', 'doha', 'dubai',
+];
+
+const INDIA_ANCHOR_CITIES = [
+  'mumbai', 'delhi', 'new delhi', 'bengaluru', 'bangalore', 'chennai', 'kolkata',
+  'hyderabad', 'ahmedabad', 'pune', 'jaipur', 'lucknow', 'kanpur', 'patna', 'bhopal',
+  'indore', 'nagpur', 'surat', 'kochi', 'coimbatore', 'guwahati', 'shimla', 'dehradun',
+  'srinagar', 'visakhapatnam', 'vizag', 'vijayawada', 'kozhikode', 'thiruvananthapuram',
+  'bhubaneswar', 'cuttack', 'puri', 'noida', 'gurugram', 'ncr', 'wayanad', 'chooralmala',
+  'mundakkai', 'kedarnath', 'bhuj', 'paradip', 'kolkata', 'nagapattinam', 'idukki',
+];
+
+/**
+ * Deterministic India-relevance check for a piece of evidence. Priority rules:
+ *  1. Foreign place named WITHOUT any India anchor (India/state/Indian city)
+ *     -> not India evidence ("6.2-magnitude earthquake strikes Java" from
+ *     India Today is an Indonesia event).
+ *  2. India/state/Indian city named -> India evidence.
+ *  3. Nothing recognizable -> not confidently India -> reject.
+ */
+export function isIndiaRelevantEvidence(...parts: Array<string | null | undefined>): boolean {
+  const text = parts.filter(Boolean).join(' ').toLowerCase();
+  if (!text) return false;
+
+  const hasIndiaAnchor =
+    /\bindia\b|\bindian\b/.test(text) ||
+    Object.keys(INDIAN_STATE_CENTROIDS).some((state) => text.includes(state)) ||
+    INDIA_ANCHOR_CITIES.some((city) => text.includes(city));
+
+  const foreignHits = FOREIGN_DISASTER_PLACES.filter((place) => text.includes(place));
+  const hasForeignPlace = foreignHits.length > 0;
+
+  // The "India Today"-style trap: foreign disaster covered by an Indian outlet.
+  if (hasForeignPlace && !hasIndiaAnchor) return false;
+
+  return hasIndiaAnchor;
+}
+
+// ---------------------------------------------------------------------------
 // Canonical event upsert: deterministic event_key, no duplicate identities.
 // ---------------------------------------------------------------------------
 
@@ -495,8 +550,12 @@ function isRelevantDatabaseHit(
   nq: NormalizedQuery,
   hit: { title?: string | null; event_type?: string | null; state?: string | null; location_name?: string | null },
 ): boolean {
-  const queryTokens = meaningfulTokens(nq.normalized);
+  // India gate applies to database hits too: a foreign-disaster record must
+  // never answer an India query, and vice versa.
   const hitText = `${hit.title || ''} ${hit.event_type || ''} ${hit.state || ''} ${hit.location_name || ''}`;
+  if (!isIndiaRelevantEvidence(hitText)) return false;
+
+  const queryTokens = meaningfulTokens(nq.normalized);
   const hitTokens = meaningfulTokens(hitText);
   const overlap = [...queryTokens].filter((token) => hitTokens.has(token));
   const typeOk = !nq.disasterType || (hit.event_type || '').toLowerCase().includes(nq.disasterType.toLowerCase());
@@ -589,6 +648,99 @@ function inferTypeFromHeadline(title: string): string | null {
 function eventKeyFromTitle(title: string, year: number | null): string {
   const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 70);
   return `${slug || 'disaster'}${year ? `-${year}` : ''}`;
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy duplicate guard: prevents the classic "same disaster, different name"
+// bug where backfill/discovery repopulates an event that already exists under
+// a slightly different title ("2024 Wayanad Landslides" vs "Landslide — Kerala
+// 2024"). Compares type + year + state + title-token Jaccard similarity.
+// ---------------------------------------------------------------------------
+
+const FUZZY_DUP_MIN_TOKENS = 2;
+const FUZZY_DUP_JACCARD = 0.55;
+
+function titleTokenSet(title: string): Set<string> {
+  const stop = new Set([
+    'the', 'and', 'of', 'in', 'a', 'an', 'at', 'on', 'near', 'over', 'india', 'indian',
+    'disaster', 'event', 'reported', 'hits', 'strike', 'strikes', 'struck', 'kill',
+    'kills', 'killed', 'dead', 'deaths', 'death', 'toll', 'new', 'magnitude', 'quake',
+    'earthquake', 'flood', 'floods', 'landslide', 'landslides', 'cyclone', 'storm',
+  ]);
+  return new Set(
+    title.toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length >= 4 && !stop.has(token)),
+  );
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const token of a) if (b.has(token)) inter += 1;
+  const union = new Set([...a, ...b]).size;
+  return union === 0 ? 0 : inter / union;
+}
+
+export async function findFuzzyDuplicate(params: {
+  eventKey: string;
+  title: string;
+  disasterType: string;
+  state: string | null;
+  year: number | null;
+}): Promise<{ id: string; title: string; event_key: string } | null> {
+  if (!isSupabaseConfigured()) return null;
+  try {
+    // Cheap pre-filter: same state (or India-wide) events around the same year.
+    const yearClause = params.year
+      ? `&or=(started_at.gte.${params.year - 1}-01-01T00:00:00Z,started_at.is.null)`
+      : '';
+    const stateClause = params.state
+      ? `&or=(state.ilike.${encodeURIComponent(`%${params.state}%`)},state.is.null)`
+      : '';
+    const rows = await supabaseRest<Array<{ id: string; title: string; event_key: string; event_type: string }>>(
+      `canonical_events?select=id,title,event_key,event_type&limit=300${yearClause}${stateClause}`,
+      { method: 'GET' },
+    );
+
+    const newTokens = titleTokenSet(params.title);
+    for (const row of rows) {
+      if (row.event_key === params.eventKey) return row; // exact key match
+      // Type must be compatible (same hazard or General Alert).
+      const typeCompatible =
+        !row.event_type ||
+        row.event_type === 'General Alert' ||
+        params.disasterType === 'General Alert' ||
+        row.event_type.toLowerCase().includes(params.disasterType.toLowerCase()) ||
+        params.disasterType.toLowerCase().includes(row.event_type.toLowerCase());
+      if (!typeCompatible) continue;
+
+      const sim = jaccard(newTokens, titleTokenSet(row.title));
+      if (newTokens.size >= FUZZY_DUP_MIN_TOKENS && sim >= FUZZY_DUP_JACCARD) {
+        return { id: row.id, title: row.title, event_key: row.event_key };
+      }
+      // State+type+year match with no title overlap is still the same event
+      // when the year is exact ("2020 Cyclone Amphan" vs "Cyclone — West Bengal 2020").
+      // sim must merely have FAILED the Jaccard threshold (not be exactly 0):
+      // "2024 Wayanad Landslides" vs "Landslide — Kerala 2024" share the year
+      // token (sim 0.33) yet are the same disaster.
+      if (
+        params.state &&
+        params.year &&
+        row.title &&
+        sim < FUZZY_DUP_JACCARD &&
+        row.event_type.toLowerCase().includes(params.disasterType.toLowerCase())
+      ) {
+        const rowYear = row.event_key.match(/(19|20)\d{2}/)?.[0];
+        if (rowYear === String(params.year) && row.title.toLowerCase().includes(params.state.toLowerCase())) {
+          return { id: row.id, title: row.title, event_key: row.event_key };
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -805,6 +957,36 @@ export async function persistResearchResult(
 
   const eventTitle = deriveEventTitleFromEvidence(evidence, nq);
   const eventKey = eventKeyFromTitle(eventTitle, nq.year);
+
+  // ---- Fuzzy duplicate guard: "same disaster, different name" must never
+  // create a second row. If an existing event matches the same type + state +
+  // year + title, attach this evidence to it instead of creating a duplicate.
+  const fuzzy = await findFuzzyDuplicate({
+    eventKey,
+    title: eventTitle,
+    disasterType: nq.disasterType || inferTypeFromHeadline(eventTitle) || 'General Alert',
+    state: nq.state,
+    year: nq.year,
+  });
+  if (fuzzy) {
+    out.eventId = fuzzy.id;
+    out.eventKey = fuzzy.event_key;
+    out.eventTitle = fuzzy.title;
+    out.enrichedExistingEvent = true;
+    await enrichExistingEvent(fuzzy.id, evidence, verification, out);
+    const docId = await upsertSearchDocument({
+      documentType: 'canonical_event',
+      eventId: fuzzy.id,
+      title: fuzzy.title,
+      content: evidence.slice(0, 5).map((item) => `${item.title}. ${item.content}`).join(' ').slice(0, 4000),
+      sourceUrl: evidence.find((item) => item.url)?.url || null,
+    });
+    if (docId) {
+      out.documentsPersisted += 1;
+      out.embedded = await embedAndStoreSearchDocument(docId, `${fuzzy.title} ${evidence[0]?.content || ''}`);
+    }
+    return out;
+  }
 
   try {
     // 1. Canonical event upsert by deterministic event_key — single idempotent
@@ -1108,7 +1290,24 @@ export async function researchHistoricalDisaster(
     retrieval.sourcesQueried.push(provider.sourceKey);
     const outcome = settled[i];
     if (outcome.status === 'fulfilled') {
-      evidence.push(...outcome.value.items);
+      // India gate + language normalization on every raw item.
+      const accepted: RawHistoricalEvidence[] = [];
+      for (const item of outcome.value.items) {
+        if (!isIndiaRelevantEvidence(item.title, item.content, item.locationText, item.state)) continue;
+        if (!isMostlyLatinText(`${item.title} ${item.content}`)) {
+          const translated = await translateToEnglish(`${item.title}\n${item.content}`.slice(0, 4000));
+          if (!translated) continue;
+          const [t, ...rest] = translated.split('\n');
+          evidence.push({
+            ...item,
+            title: (t.trim() || item.title).slice(0, 500),
+            content: rest.join('\n').trim() || item.content,
+          });
+        } else {
+          accepted.push(item);
+        }
+      }
+      evidence.push(...accepted);
       retrieval.sourcesSucceeded.push(provider.sourceKey);
     } else {
       retrieval.sourcesFailed.push({
