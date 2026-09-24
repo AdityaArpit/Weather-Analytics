@@ -1,0 +1,1 @@
+function o(e){if(!e)return"Not available";const t=new Date(e);if(Number.isNaN(t.getTime()))return e;const a=String(t.getDate()).padStart(2,"0"),r=String(t.getMonth()+1).padStart(2,"0"),n=t.getFullYear();return`${a}/${r}/${n}`}export{o as f};

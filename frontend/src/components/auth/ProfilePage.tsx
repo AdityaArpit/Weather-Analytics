@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Bell, LogOut, MapPin, MessageSquare, Navigation, Phone, Save, ShieldCheck, UserRound, Crosshair, Loader2, Plus, Trash2, RefreshCw,
+  Bell, LogOut, MapPin, MessageSquare, Navigation, Phone, Save, ShieldCheck, UserRound, Crosshair, Loader2, Plus, Trash2, RefreshCw, X, Info,
 } from 'lucide-react';
 import { api, ApiError } from '../../lib/api';
 import { useAuth } from '../../lib/AuthContext';
@@ -29,6 +29,56 @@ const SEVERITY_OPTIONS = [
   { value: 'Severe', label: 'Severe and above' },
   { value: 'Extreme', label: 'Extreme only' },
 ];
+
+/**
+ * Indian mobile input rule (spec 4): the user-facing field holds EXACTLY 10
+ * numeric digits. Backend normalizes to +91XXXXXXXXXX independently.
+ */
+const INDIAN_MOBILE_RE = /^[6-9]\d{9}$/;
+
+/**
+ * SMS production gate mirror (spec 4). The backend answers OTP sends with
+ * code SMS_REGISTRATION_REQUIRED while Fast2SMS business registration is
+ * pending; this modal explains the situation instead of attempting delivery.
+ */
+function SmsRegistrationModal({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="SMS unavailable">
+      <div className="absolute inset-0 bg-[#0F1B29]/50 backdrop-blur-[2px]" onClick={onClose} aria-hidden="true" />
+      <div className="relative w-full max-w-md bg-white border border-[#DDDDDD] rounded-3xl shadow-2xl p-6 space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="w-11 h-11 rounded-2xl bg-[#F3F4F5] border border-[#DDDDDD] flex items-center justify-center shrink-0">
+            <MessageSquare className="w-5 h-5 text-[#0F1B29]" />
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="w-8 h-8 rounded-xl border border-[#DDDDDD] bg-white flex items-center justify-center text-[#0F1B29] hover:bg-[#F3F4F5] transition-colors cursor-pointer shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="space-y-2">
+          <h3 className="text-base font-bold text-[#0F1B29]">SMS alerts are temporarily unavailable</h3>
+          <p className="text-xs text-[#747F8D] leading-relaxed">
+            Fast2SMS integration has been implemented, but production SMS delivery requires
+            business registration with the provider and the associated approved sender
+            configuration. SMS functionality is therefore currently unavailable for actual
+            delivery.
+          </p>
+          <p className="text-xs text-[#747F8D] leading-relaxed">
+            You can still add your number — it will be verified automatically once SMS is
+            activated. Email and in-app alerts are unaffected.
+          </p>
+        </div>
+        <div className="flex justify-end">
+          <SecondaryButton onClick={onClose}>Close</SecondaryButton>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 interface GeocodePlace { name: string; lat: number; lng: number; state?: string; district?: string }
 
@@ -60,6 +110,7 @@ export const ProfilePage: React.FC = () => {
   const [otpSentId, setOtpSentId] = useState<string | null>(null);
   const [otpCode, setOtpCode] = useState('');
   const [otpBusyId, setOtpBusyId] = useState<string | null>(null);
+  const [showSmsModal, setShowSmsModal] = useState(false);
 
   const loadProfile = useCallback(async () => {
     if (!user) {
@@ -172,10 +223,14 @@ export const ProfilePage: React.FC = () => {
   };
 
   const addPhone = async () => {
-    if (!phone.trim()) return;
+    const digits = phone.trim();
+    if (!INDIAN_MOBILE_RE.test(digits)) {
+      push('error', 'Enter exactly 10 digits for your Indian mobile number (starting 6-9).');
+      return;
+    }
     setSavingPhone(true);
     try {
-      await api.post('/api/phone-numbers', { phoneNumber: phone.trim() });
+      await api.post('/api/phone-numbers', { phoneNumber: digits });
       setPhone('');
       push('info', 'Number added. Use “Send code” to verify it for SMS alerts.');
       await loadProfile();
@@ -187,6 +242,13 @@ export const ProfilePage: React.FC = () => {
   };
 
   const sendOtp = async (rowId: string) => {
+    // Registration gate (spec 4): the backend enforces SMS_B2B_REGISTRATION_REQUIRED
+    // authoritatively; this pre-check keeps the honest UX inline.
+    const target = data?.phoneNumbers?.find((row) => row.id === rowId);
+    if (target && !target.verified) {
+      setShowSmsModal(true);
+      return;
+    }
     setOtpBusyId(rowId);
     try {
       await api.post(`/api/phone-numbers/${rowId}/send-otp`);
@@ -194,7 +256,12 @@ export const ProfilePage: React.FC = () => {
       setOtpCode('');
       push('success', 'Verification code sent by SMS. It expires in 10 minutes.');
     } catch (err) {
-      push('error', (err as Error).message);
+      const apiErr = err as { code?: string; message?: string };
+      if (apiErr?.code === 'SMS_REGISTRATION_REQUIRED') {
+        setShowSmsModal(true);
+      } else {
+        push('error', apiErr?.message || 'Could not send the verification code.');
+      }
     } finally {
       setOtpBusyId(null);
     }
@@ -277,6 +344,7 @@ export const ProfilePage: React.FC = () => {
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 space-y-6">
       <ToastStack toasts={toasts} onDismiss={dismiss} />
+      {showSmsModal && <SmsRegistrationModal onClose={() => setShowSmsModal(false)} />}
 
       <SectionHeader
         eyebrow="Your Account"
@@ -483,15 +551,23 @@ export const ProfilePage: React.FC = () => {
           <div className="flex gap-2 mt-4">
             <input
               value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              placeholder="+91 98765 43210"
+              onChange={(e) => setPhone(e.target.value.replace(/\D/g, '').slice(0, 10))}
+              inputMode="numeric"
+              pattern="[0-9]{10}"
+              maxLength={10}
+              placeholder="10-digit mobile number"
               aria-label="Phone number"
               className="flex-1 px-4 py-2.5 rounded-xl border border-[#DDDDDD] bg-white text-sm text-[#0F1B29] placeholder:text-[#747F8D]/60 focus:outline-none focus:ring-2 focus:ring-[#0F1B29]/20"
             />
-            <PrimaryButton onClick={addPhone} loading={savingPhone} disabled={!phone.trim()}>
+            <PrimaryButton onClick={addPhone} loading={savingPhone} disabled={!INDIAN_MOBILE_RE.test(phone)}>
               <Plus className="w-3.5 h-3.5" /> Add
             </PrimaryButton>
           </div>
+          {phone.length > 0 && !INDIAN_MOBILE_RE.test(phone) && (
+            <p role="alert" className="mt-2 text-[11px] font-medium text-[#0F1B29] flex items-center gap-1">
+              <Info className="w-3 h-3" /> Enter exactly 10 digits (Indian mobile numbers start with 6-9). Do not include +91 or spaces.
+            </p>
+          )}
         </PremiumPanel>
 
         {/* Security */}
@@ -532,22 +608,47 @@ export const ProfilePage: React.FC = () => {
 // ---------------------------------------------------------------------------
 
 function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 'success' | 'error' | 'info', text: string) => void }) {
-  const { login, signup } = useAuth();
-  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const { login, signup, requestPasswordReset } = useAuth();
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [resetSent, setResetSent] = useState(false);
+
+  const validEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value.trim());
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setNotice(null);
+    if (mode === 'forgot') {
+      if (!validEmail(email)) {
+        setError('Enter a valid email address.');
+        return;
+      }
+      setSubmitting(true);
+      try {
+        const result = await requestPasswordReset(email.trim());
+        setResetSent(true);
+        setNotice(result.message);
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     setSubmitting(true);
     try {
       if (mode === 'register') {
+        if (password.length < 8) {
+          setError('Password must be at least 8 characters.');
+          setSubmitting(false);
+          return;
+        }
         const result = await signup(name.trim(), email.trim(), password);
         if (result.needsEmailConfirmation) {
           setNotice('Check your inbox to confirm your account, then sign in.');
@@ -565,6 +666,13 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
     }
   };
 
+  const switchMode = (next: 'login' | 'register' | 'forgot') => {
+    setMode(next);
+    setError(null);
+    setNotice(null);
+    setResetSent(false);
+  };
+
   return (
     <div className="bg-white border border-[#DDDDDD] rounded-3xl shadow-sm overflow-hidden">
       <div className="px-7 pt-7 pb-6 border-b border-[#DDDDDD]/70 bg-[#F3F4F5]/50 text-center space-y-2">
@@ -577,36 +685,71 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
         </p>
       </div>
 
-      <div className="flex border-b border-[#DDDDDD]">
-        {(['login', 'register'] as const).map((m) => (
-          <button
-            key={m}
-            type="button"
-            onClick={() => setMode(m)}
-            className={cxToggle(m === mode)}
-          >
-            {m === 'login' ? 'Sign in' : 'Create account'}
-          </button>
-        ))}
-      </div>
+      {mode !== 'forgot' && (
+        <div className="flex border-b border-[#DDDDDD]">
+          {(['login', 'register'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => switchMode(m)}
+              className={cxToggle(m === mode)}
+            >
+              {m === 'login' ? 'Sign in' : 'Create account'}
+            </button>
+          ))}
+        </div>
+      )}
 
       <form onSubmit={submit} className="px-7 py-6 space-y-4">
-        {mode === 'register' && (
-          <InputField label="Full name" id="auth-name" value={name} onChange={(e) => setName(e.target.value)} required autoComplete="name" placeholder="As it should appear in the console" />
-        )}
-        <InputField label="Email" id="auth-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" placeholder="you@example.in" />
-        <InputField label="Password" id="auth-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete={mode === 'register' ? 'new-password' : 'current-password'} placeholder="••••••••••••" minLength={6} />
+        {mode === 'forgot' ? (
+          <>
+            <InputField label="Email" id="auth-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" placeholder="you@example.in" />
+            {resetSent && notice && (
+              <div role="status" className="p-3.5 rounded-xl bg-[#ECF8F8] border border-[#B8BEC5]/60 text-xs text-[#0F1B29] leading-relaxed">{notice}</div>
+            )}
+            {error && (
+              <div role="alert" className="p-3.5 rounded-xl bg-[#F3F4F5] border border-[#DDDDDD] text-xs text-[#0F1B29] leading-relaxed">{error}</div>
+            )}
+            <PrimaryButton type="submit" loading={submitting} className="w-full">
+              Send reset link
+            </PrimaryButton>
+            <button
+              type="button"
+              onClick={() => switchMode('login')}
+              className="w-full text-center text-xs font-semibold text-[#747F8D] hover:text-[#0F1B29] transition-colors cursor-pointer"
+            >
+              Back to sign in
+            </button>
+          </>
+        ) : (
+          <>
+            {mode === 'register' && (
+              <InputField label="Full name" id="auth-name" value={name} onChange={(e) => setName(e.target.value)} required autoComplete="name" placeholder="As it should appear in the console" />
+            )}
+            <InputField label="Email" id="auth-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" placeholder="you@example.in" />
+            <InputField label="Password" id="auth-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete={mode === 'register' ? 'new-password' : 'current-password'} placeholder="••••••••••••" minLength={mode === 'register' ? 8 : 6} />
 
-        {notice && (
-          <div role="status" className="p-3.5 rounded-xl bg-[#ECF8F8] border border-[#B8BEC5]/60 text-xs text-[#0F1B29] leading-relaxed">{notice}</div>
-        )}
-        {error && (
-          <div role="alert" className="p-3.5 rounded-xl bg-[#F3F4F5] border border-[#DDDDDD] text-xs text-[#0F1B29] leading-relaxed">{error}</div>
-        )}
+            {notice && (
+              <div role="status" className="p-3.5 rounded-xl bg-[#ECF8F8] border border-[#B8BEC5]/60 text-xs text-[#0F1B29] leading-relaxed">{notice}</div>
+            )}
+            {error && (
+              <div role="alert" className="p-3.5 rounded-xl bg-[#F3F4F5] border border-[#DDDDDD] text-xs text-[#0F1B29] leading-relaxed">{error}</div>
+            )}
 
-        <PrimaryButton type="submit" loading={submitting} className="w-full">
-          {mode === 'login' ? 'Sign in' : 'Create account'}
-        </PrimaryButton>
+            <PrimaryButton type="submit" loading={submitting} className="w-full">
+              {mode === 'login' ? 'Sign in' : 'Create account'}
+            </PrimaryButton>
+            {mode === 'login' && (
+              <button
+                type="button"
+                onClick={() => switchMode('forgot')}
+                className="w-full text-center text-xs font-semibold text-[#747F8D] hover:text-[#0F1B29] transition-colors cursor-pointer"
+              >
+                Forgot password?
+              </button>
+            )}
+          </>
+        )}
         <p className="text-[11px] text-[#747F8D] text-center leading-relaxed">
           Aapda Drishti stores the minimum data required to alert you. Roles are provisioned only by administrators.
         </p>

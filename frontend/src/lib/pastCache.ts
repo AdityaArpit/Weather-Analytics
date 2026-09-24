@@ -132,5 +132,10 @@ export async function searchPastArchive(query: string, forceResearch = false): P
     pastSearchCache.put(cacheKey, data);
     upsertArchiveItem(data.bundle);
   }
+  // Typo-tolerance (spec 9.2): pass through backend similarity suggestions
+  // ("aamphun" → "Amphan") so the UI can offer the likely match.
+  if (Array.isArray(data?.suggestions) && data.suggestions.length > 0) {
+    return data;
+  }
   return data;
 }

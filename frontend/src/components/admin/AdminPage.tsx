@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Activity, AlertTriangle, Bot, CheckCircle2, Clock, Cpu, Database, FileWarning, Layers,
   Loader2, Play, RefreshCw, Rss, Search, Server, ShieldCheck, Trash2, XCircle,
@@ -40,6 +40,8 @@ interface AdminReportRow {
 interface AdminSourceRow {
   id: string; source_key: string; name: string; source_type: string; enabled: boolean; priority: number;
   trust_weight: number; last_success_at: string | null; last_failure_at: string | null; health_status: string | null;
+  integration_status: 'integrated' | 'integrated-seed' | 'key-gated' | 'not-integrated';
+  integration_detail: string;
   source_health: Array<{ status: string; last_run: string | null; records_received: number | null; records_accepted: number | null; records_rejected: number | null; message: string | null }>;
 }
 
@@ -139,6 +141,9 @@ export const AdminPage: React.FC = () => {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [wiping, setWiping] = useState(false);
   // Historical research console state.
+  const [eventTypeFilter, setEventTypeFilter] = useState<string | null>(null);
+  const eventTypeFilterRef = useRef<string | null>(null);
+  eventTypeFilterRef.current = eventTypeFilter;
   const [researchQuery, setResearchQuery] = useState('');
   const [researchForce, setResearchForce] = useState(false);
   const [researchBusy, setResearchBusy] = useState(false);
@@ -163,8 +168,9 @@ interface ManualJobState {
   error: string | null;
 }
 
-const loadAll = useCallback(async (options?: { silent?: boolean }) => {
+const loadAll = useCallback(async (options?: { silent?: boolean; eventType?: string | null }) => {
     const silent = options?.silent === true;
+    const eventType = options?.eventType !== undefined ? options.eventType : eventTypeFilterRef.current;
     if (!silent) setLoading(true);
     setError(null);
     try {
@@ -177,7 +183,9 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
         api.get<{ jobs: AdminJobRow[] }>('/api/admin/jobs'),
         api.get<EmbeddingsHealth>('/api/admin/embeddings-health'),
         api.get<AiHealth>('/api/admin/ai-health'),
-        api.get<InsightsPayload>('/api/insights'),
+        // Event-type filter is applied SERVER-SIDE (spec 6): the API narrows
+        // the dataset so every graph genuinely reflects the selection.
+        api.get<InsightsPayload>(`/api/insights${eventType ? `?eventType=${encodeURIComponent(eventType)}` : ''}`),
       ]);
       setOverview(ov);
       setEvents(ev.events || []);
@@ -620,6 +628,7 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
           rows={events}
           keyOf={(row) => row.id}
           dense
+          maxHeight="360px"
           empty={<EmptyState icon={<Database className="w-6 h-6" />} title="No events yet" description="Run the ingestion job to fetch SACHET and Google News observations." />}
           columns={[
             { key: 'title', label: 'Event', className: 'max-w-[280px]', render: (row) => <span className="block truncate font-medium" title={row.title}>{row.title}</span> },
@@ -670,6 +679,7 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
           rows={pastEvents}
           keyOf={(row) => row.id}
           dense
+          maxHeight="360px"
           empty={<EmptyState icon={<Database className="w-6 h-6" />} title="Past layer is empty" description="Run Backfill or Discover Past to research and archive historical disasters." />}
           columns={[
             { key: 'title', label: 'Disaster', className: 'max-w-[300px]', render: (row) => <span className="block truncate font-medium" title={row.title}>{row.title}</span> },
@@ -707,6 +717,7 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
           rows={reports}
           keyOf={(row) => row.id}
           dense
+          maxHeight="360px"
           empty={<EmptyState icon={<FileWarning className="w-6 h-6" />} title="No reports" description="Citizen submissions appear here as they arrive." />}
           columns={[
             { key: 'text', label: 'Report', className: 'max-w-[320px]', render: (row) => <span className="block truncate" title={row.report_text}>{row.report_text}</span> },
@@ -729,23 +740,45 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
       </PremiumPanel>
 
       {/* Sources */}
-      <PremiumPanel title="Source Health" description="Per-source ingestion outcomes from the latest job runs.">
+      <PremiumPanel
+        title="Source Health"
+        description="Every operational source is backed by a real adapter; health reflects the latest ingestion outcome — not a configured guess. Sources marked “not integrated” have no pipeline adapter yet."
+      >
         <DataTable
           rows={sources}
           keyOf={(row) => row.id}
           dense
+          maxHeight="420px"
           empty={<EmptyState icon={<Rss className="w-6 h-6" />} title="No sources" description="Source definitions are seeded by migration." />}
           columns={[
             { key: 'name', label: 'Source', render: (row) => (
               <span className="flex items-center gap-2">
-                <HealthDot status={row.health_status || 'unknown'} />
+                {row.integration_status === 'integrated' || row.integration_status === 'integrated-seed' ? (
+                  <HealthDot status={row.health_status || 'unknown'} />
+                ) : (
+                  <HealthDot status="not_integrated" />
+                )}
                 <span className="font-medium">{row.name}</span>
               </span>
             ) },
             { key: 'key', label: 'Key', render: (row) => <span className="text-[11px] font-mono text-[#747F8D]">{row.source_key}</span> },
             { key: 'type', label: 'Type', render: (row) => <StatusBadge tone={row.source_type === 'OFFICIAL' ? 'ink' : 'neutral'}>{row.source_type}</StatusBadge> },
+            { key: 'integration', label: 'Integration', render: (row) => (
+              <span className="inline-flex items-center gap-1.5" title={row.integration_detail}>
+                <StatusBadge tone={
+                  row.integration_status === 'integrated' ? 'success'
+                  : row.integration_status === 'integrated-seed' ? 'neutral'
+                  : row.integration_status === 'key-gated' ? 'warning'
+                  : 'neutral'
+                }>
+                  {row.integration_status === 'integrated' ? 'Integrated'
+                    : row.integration_status === 'integrated-seed' ? 'Seed catalog'
+                    : row.integration_status === 'key-gated' ? 'Needs API key'
+                    : 'Not integrated'}
+                </StatusBadge>
+              </span>
+            ) },
             { key: 'enabled', label: 'Enabled', render: (row) => row.enabled ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <XCircle className="w-4 h-4 text-[#747F8D]" /> },
-            { key: 'trust', label: 'Trust', render: (row) => <span className="text-xs tabular-nums">{Number(row.trust_weight).toFixed(2)}</span> },
             { key: 'received', label: 'Received', render: (row) => <span className="text-xs tabular-nums">{row.source_health?.[0]?.records_received ?? '—'}</span> },
             { key: 'accepted', label: 'Accepted', render: (row) => <span className="text-xs tabular-nums">{row.source_health?.[0]?.records_accepted ?? '—'}</span> },
             { key: 'rejected', label: 'Rejected', render: (row) => <span className="text-xs tabular-nums">{row.source_health?.[0]?.records_rejected ?? '—'}</span> },
@@ -771,11 +804,63 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
         title="Analytics & Insights"
         description="Trend analysis, pattern detection and risk hotspots computed from the canonical store — no AI on the read path."
       >
+        {/* Event-type filter (spec 6): the selection drives the server-side
+            /api/insights?eventType=… query, so every chart below is genuinely
+            recomputed from the filtered dataset — never a client-side mask. */}
+        <div className="flex flex-wrap items-center gap-2 mb-5 p-3 rounded-2xl border border-[#DDDDDD] bg-[#F3F4F5]/30">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[#747F8D] mr-1">Filter by event type</span>
+          {insights?.byType?.length ? (
+            insights.byType.slice(0, 10).map((type) => {
+              const active = eventTypeFilter === type.eventType;
+              return (
+                <button
+                  key={type.eventType}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => {
+                    const next = active ? null : type.eventType;
+                    setEventTypeFilter(next);
+                    void loadAll({ silent: true, eventType: next });
+                  }}
+                  className={cx(
+                    'px-3 py-1.5 rounded-full text-[11px] font-bold border transition-all cursor-pointer',
+                    active
+                      ? 'bg-[#0F1B29] text-[#ECF8F8] border-[#0F1B29] shadow-sm'
+                      : 'bg-white text-[#0F1B29] border-[#DDDDDD] hover:bg-[#ECF8F8]',
+                  )}
+                >
+                  {type.eventType} · {type.count}
+                </button>
+              );
+            })
+          ) : (
+            <span className="text-[11px] text-[#747F8D]">No event types available yet.</span>
+          )}
+          {eventTypeFilter && (
+            <button
+              type="button"
+              onClick={() => {
+                setEventTypeFilter(null);
+                void loadAll({ silent: true, eventType: null });
+              }}
+              className="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 transition-all cursor-pointer"
+            >
+              <XCircle className="w-3.5 h-3.5" />
+              Clear Filter
+            </button>
+          )}
+          {eventTypeFilter && (
+            <span className="sr-only" aria-live="polite">Filtered to {eventTypeFilter}</span>
+          )}
+        </div>
+
         {!insights || insights.overview.totalEvents === 0 ? (
           <EmptyState
             icon={<Activity className="w-6 h-6" />}
-            title="No analytics yet"
-            description="Trends and risk hotspots appear once verified events exist in the database."
+            title={eventTypeFilter ? `No ${eventTypeFilter} events found` : 'No analytics yet'}
+            description={eventTypeFilter
+              ? 'The selected event type has no verified events in the database. Clear the filter to see all types.'
+              : 'Trends and risk hotspots appear once verified events exist in the database.'}
           />
         ) : (
           <div className="space-y-5">
@@ -828,7 +913,9 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
               {/* Events by type with severe segment. */}
               <HBarChart
                 title="Events by type"
-                subtitle="Red segment = severe or extreme share"
+                subtitle={eventTypeFilter
+                  ? `Filtered to ${eventTypeFilter} — red segment = severe or extreme share`
+                  : 'Red segment = severe or extreme share'}
                 rows={insights.byType.map((type) => ({ label: type.eventType, value: type.count, secondary: type.severeCount }))}
               />
 
@@ -964,6 +1051,7 @@ const loadAll = useCallback(async (options?: { silent?: boolean }) => {
           rows={jobs}
           keyOf={(row) => row.id}
           dense
+          maxHeight="360px"
           empty={<EmptyState icon={<Clock className="w-6 h-6" />} title="No job runs recorded" description="Trigger a job above to create the first run record." />}
           columns={[
             { key: 'type', label: 'Job', render: (row) => <span className="font-medium capitalize">{row.job_type}</span> },

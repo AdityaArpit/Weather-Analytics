@@ -66,6 +66,14 @@ export function isSubstantiveFact(rawText: string, topic: FactTopic): boolean {
   const words = cleaned.split(/\s+/).filter((word) => /[a-z0-9]/i.test(word));
   const minWords = topic === 'dates' ? 2 : 3;
   if (words.length < minWords) return false;
+  // Truncation guard: a fact cut off mid-token ("evacuation prep in 11",
+  // "in 1") is a regex-boundary artifact, not evidence. The last word must
+  // not be a bare 1-2 char fragment and the snippet must not end mid-number.
+  const lastWord = words[words.length - 1];
+  if (lastWord.length <= 2 && /^\d+$/.test(lastWord)) return false;
+  if (/\d\s*$/.test(cleaned) && /\b(in|to|at|of|by|for|from|over|with|near)\s+\d+\s*$/i.test(cleaned)) return false;
+  // A dangling connective means the snippet was cut mid-clause.
+  if (/\b(and|or|the|with|for|from|in|at|of|to|by|on|after|before)\s*$/i.test(cleaned)) return false;
 
   if ((topic === 'casualties' || topic === 'damage') && hasAbsurdNumericRange(cleaned)) return false;
 

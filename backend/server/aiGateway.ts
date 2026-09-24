@@ -965,6 +965,61 @@ function evidenceStatusFromCoverage(coverage: EvidenceCoverage): EvidenceBundle[
   return 'Limited Coverage';
 }
 
+/**
+ * Publication window of the retrieved evidence: [earliest, latest] valid
+ * publishedAt across sources. Corrupt/absent timestamps are skipped so one
+ * bad date cannot poison the window.
+ */
+function evidencePublicationWindow(sources: CitedSource[]): { earliest: number; latest: number } | null {
+  let earliest = Number.POSITIVE_INFINITY;
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const source of sources) {
+    const time = Date.parse(String(source.publishedAt || ''));
+    if (!Number.isFinite(time)) continue;
+    // Reject obviously bogus years (<1990 or >now+1d) — provider glitches.
+    const year = new Date(time).getUTCFullYear();
+    if (year < 1990 || time > Date.now() + 24 * 3600 * 1000) continue;
+    if (time < earliest) earliest = time;
+    if (time > latest) latest = time;
+  }
+  return earliest <= latest ? { earliest, latest } : null;
+}
+
+/**
+ * Clamps a synthesized event date to the evidence publication window.
+ * Rules (in order):
+ *  1. No window or no candidate date -> return as-is (nothing to check).
+ *  2. Candidate year appears VERBATIM in the user's own query ("2024 Wayanad
+ *     landslide") -> keep it: an explicit user assertion outranks heuristics.
+ *  3. Candidate before the earliest publication or more than 1 year before it
+ *     -> fabricated (news cannot report an event a year before writing about
+ *     it); fall back to the latest publication date as the event date.
+ *  4. Candidate after the latest publication -> fabricated (future event);
+ *     fall back to the latest publication date.
+ */
+function clampEventDateToEvidenceWindow(candidate: string | undefined, sources: CitedSource[], userQuery: string): string | undefined {
+  if (!candidate) return candidate;
+  const window = evidencePublicationWindow(sources);
+  if (!window) return candidate;
+  const time = Date.parse(candidate);
+  if (!Number.isFinite(time)) return candidate;
+
+  const year = candidate.match(/\b(19\d\d|20\d\d)\b/)?.[0];
+  if (year && userQuery.includes(year)) return candidate;
+
+  if (time < window.earliest) {
+    // >1 year before the oldest source is fabrication, not pre-coverage.
+    if (window.earliest - time > 365 * 24 * 3600 * 1000) {
+      return new Date(window.latest).toISOString();
+    }
+    return candidate;
+  }
+  if (time > window.latest) {
+    return new Date(window.latest).toISOString();
+  }
+  return candidate;
+}
+
 function makeEvidenceTimeline(sources: CitedSource[], eventDate?: string): TimelineEvent[] {
   const datePattern = /\b(?:\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(?:19|20)\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+(?:19|20)\d{2}|\d{4}-\d{2}-\d{2})\b/gi;
   const steps: TimelineEvent[] = [];
@@ -1174,7 +1229,20 @@ Produce a structured historical evidence synthesis in JSON format:
   );
   const reportedDamage = validateAndCleanCitations(synthesizedData.reportedDamage || '', citedSources);
 
-  const cleanTimeline: TimelineEvent[] = (synthesizedData.timeline || []).map((t: any) => ({
+  const evidenceWindow = evidencePublicationWindow(citedSources);
+  const cleanTimeline: TimelineEvent[] = (synthesizedData.timeline || [])
+    // Hallucinated-chronology guard: a timeline entry dated before the oldest
+    // retrieved source cannot describe this event's milestones (news has not
+    // been written yet). Drops the "2024/2025 steps on a September 2026
+    // cyclone" class of junk chronology at synthesis time.
+    .filter((t: any) => {
+      const stepTime = Date.parse(String(t?.date || ''));
+      if (!Number.isFinite(stepTime) || !evidenceWindow) return true;
+      const stepYear = new Date(stepTime).getUTCFullYear();
+      if (stepYear < 1990 || stepTime > Date.now() + 24 * 3600 * 1000) return false;
+      return stepTime >= evidenceWindow.earliest - 24 * 3600 * 1000;
+    })
+    .map((t: any) => ({
     date: t.date || 'Recorded Period',
     event: t.event || 'Incident Milestone',
     description: validateAndCleanCitations(t.description || '', citedSources),
@@ -1189,9 +1257,15 @@ Produce a structured historical evidence synthesis in JSON format:
       sources: (c.sources || []).filter((sId: string) => citedSources.some((s) => s.id === sId)),
     })),
   ];
-  const eventDate = normalizedEvent.eventDate
+  const synthesizedEventDate = normalizedEvent.eventDate
     || coerceIsoDate(synthesizedData.eventDate || synthesizedData.dateRange)
     || coerceIsoDate([eventFilterQuery, ...candidateFacts.dates].join(' '));
+  // Evidence-window guard: the event date MUST fall inside the publication
+  // window of the retrieved sources (news cannot describe an event before it
+  // was published, and a synthesis predating its own evidence is fabricated).
+  // This kills the "Cyclone Arnab (2026) occurred 2024" class of bug where a
+  // stray year in query text or a hallucinated LLM date wins over the sources.
+  const eventDate = clampEventDateToEvidenceWindow(synthesizedEventDate, citedSources, baseQuery);
   const evidenceTimeline = makeEvidenceTimeline(citedSources, eventDate);
 
   const draftBundle: EvidenceBundle = {

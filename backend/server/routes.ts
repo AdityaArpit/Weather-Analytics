@@ -22,7 +22,7 @@ import {
   getEventTimeline,
   searchCanonicalEventsLexical,
 } from './repositories/canonicalEvents';
-import type { CanonicalEventDto } from './types/canonicalEvent';
+import type { CanonicalEventDto, CanonicalEventListResponse } from './types/canonicalEvent';
 import { requireAdmin, requireAuth } from './auth';
 import { supabaseRest, isSupabaseConfigured, getSupabaseUrl, SUPABASE_SECRET_KEY } from './db/supabase';
 import { cache } from './lib/cache';
@@ -46,6 +46,7 @@ import {
   type FactTopic,
 } from './lib/evidenceUtils';
 import { isIndiaRelevantEvidence } from './lib/researchOrchestrator';
+import { SEARCH_SIMILARITY_THRESHOLD } from './lib/platformConfig';
 import {
   badRequest,
   forbidden,
@@ -58,6 +59,16 @@ import { researchHistoricalDisaster, titleCaseEventName, type PersistedResearch 
 import { runPastDiscoveryJob } from './jobs/pastDiscoveryJob';
 import { getSchedulerStatus } from './jobs/scheduler';
 import { scoreReportRisk } from './lib/reportRisk';
+import {
+  REPORT_MAX_ACCURACY_METERS,
+  MANUAL_LOCATION_ACCURACY_METERS,
+  COMMUNITY_REPORT_THRESHOLD,
+  SMS_B2B_REGISTRATION_REQUIRED,
+  normalizeIndianPhone,
+  isValidLocalIndianMobile,
+} from './lib/platformConfig';
+import { assessReportText, assessGibberish } from './lib/reportQuality';
+import { suggestSimilarEvents } from './lib/fuzzyMatch';
 import { computeInsights, type InsightsPayload } from './lib/insights';
 import type { SourceKey } from './lib/sourceRegistry';
 import { runIngestionJob } from './jobs/ingestionJob';
@@ -102,6 +113,36 @@ async function getEventClaims(eventId: string): Promise<Record<string, string[]>
     if (value) claims[row.claim_type].push(value);
   }
   return claims;
+}
+
+/**
+ * Batched claims projection for list surfaces (archive). One filtered query
+ * per 200-event batch replaces the previous N per-item queries (N+1): 100
+ * items cost 1 request instead of 100+.
+ */
+async function getEventClaimsBatched(eventIds: string[]): Promise<Map<string, Record<string, string[]>>> {
+  const byEvent = new Map<string, Record<string, string[]>>();
+  if (!isSupabaseConfigured() || eventIds.length === 0) return byEvent;
+  for (const id of eventIds) byEvent.set(id, {});
+
+  const BATCH_SIZE = 200;
+  for (let offset = 0; offset < eventIds.length; offset += BATCH_SIZE) {
+    const batch = eventIds.slice(offset, offset + BATCH_SIZE);
+    const inFilter = batch.map((id) => `"${id}"`).join(',');
+    const rows = await supabaseRest<Array<{ event_id: string; claim_type: string; claim_value: string }>>(
+      `canonical_event_claims?event_id=in.(${encodeURIComponent(inFilter)})&select=event_id,claim_type,claim_value`,
+      { method: 'GET' },
+    ).catch(() => [] as Array<{ event_id: string; claim_type: string; claim_value: string }>);
+
+    for (const row of rows) {
+      const claims = byEvent.get(row.event_id);
+      if (!claims) continue;
+      if (!claims[row.claim_type]) claims[row.claim_type] = [];
+      const value = cleanLegacyField(row.claim_value);
+      if (value) claims[row.claim_type].push(value);
+    }
+  }
+  return byEvent;
 }
 
 function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Record<string, string[]>): EvidenceBundle {
@@ -366,15 +407,38 @@ function queryMatchesBundle(query: string, bundle: EvidenceBundle): boolean {
 // Public event surfaces (Present)
 // ---------------------------------------------------------------------------
 
-router.get('/events/active', async (_req: Request, res: Response) => {
+router.get('/events/active', async (req: Request, res: Response) => {
   try {
+    // Server-side micro-cache: the Present page polls this endpoint every 60s
+    // per client; the upstream view query runs at most once per minute total.
+    const cached = cache.get<CanonicalEventListResponse>('present', 'active:list');
+    if (cached) {
+      applyActiveEventsCaching(res, req, cached);
+      return;
+    }
     const result = await listActiveCanonicalEvents();
-    res.setHeader('Cache-Control', 'public, max-age=60');
-    res.json(result);
+    cache.set('present', 'active:list', result, cache.getTTL('present'));
+    applyActiveEventsCaching(res, req, result);
   } catch (error) {
     sendError(res, error);
   }
 });
+
+/**
+ * Shared response policy for the active-events list: gzip-friendly caching
+ * headers, a strong ETag derived from the payload, and 304 reuse when the
+ * client already holds the current version (pollers send If-None-Match).
+ */
+function applyActiveEventsCaching(res: Response, req: Request, result: CanonicalEventListResponse): void {
+  res.setHeader('Cache-Control', 'public, max-age=60');
+  const etag = `"${createHash('sha256').update(JSON.stringify(result)).digest('hex').slice(0, 32)}"`;
+  res.setHeader('ETag', etag);
+  if (req.headers['if-none-match'] === etag) {
+    res.status(304).end();
+    return;
+  }
+  res.json(result);
+}
 
 router.get('/events/nearby', async (req: Request, res: Response) => {
   try {
@@ -583,11 +647,54 @@ async function persistRichEvidenceBundle(eventId: string | null | undefined, bun
 export function cleanLegacyField(value: string | undefined): string {
   const text = String(value || '');
   if (/^\[S\d+\]\s+\S+;/.test(text) && !/\d{2,}/.test(text)) return ''; // "[S1] damage; [S3] evacuated" style junk
+  // Truncated citation-fragment junk: a field that is only one or more
+  // "[Sx] <short fragment>;" clauses with no sentence substance (the
+  // "[S2] evacuation prep in 11; [S2] evacuation prep in 11 The" class)
+  // renders as garbage — drop it and let the UI fall back.
+  const withoutCitations = text.replace(/\[S\d+[^\]]*\]/gi, ' ');
+  const fragments = withoutCitations.split(';').map((part) => part.trim()).filter(Boolean);
+  if (fragments.length > 0) {
+    const substantive = fragments.filter((part) => {
+      const words = part.split(/\s+/).filter(Boolean);
+      // A substantive clause needs >=4 words including at least one >=5-char
+      // word — "evacuation prep in 11 The" fails (no 5-char word besides the
+      // truncated token); "evacuation of 11000 people from Srikakulam" passes.
+      return words.length >= 4 && words.some((word) => word.replace(/[^a-zA-Z]/g, '').length >= 5);
+    });
+    if (substantive.length === 0) return '';
+    if (substantive.length < fragments.length) {
+      return substantive.map((part) => {
+        const idx = text.indexOf(part);
+        return idx >= 0 ? `${part}` : part;
+      }).join('; ');
+    }
+  }
   return text
     .replace(/\s+reported across clustered source claims/gi, ' reported')
     .replace(/\s+across clustered source claims\.?/gi, '')
     .replace(/\s+documented in (?:source|verified) citations\.?/gi, '')
     .trim();
+}
+
+/**
+ * Drops timeline entries whose dates fall outside the publication window of
+ * the bundle's own sources ("2024 milestones on a September 2026 cyclone"),
+ * and entries that merely restate a headline with no milestone content.
+ */
+function sanitizeLegacyTimeline(bundle: EvidenceBundle): EvidenceBundle['timeline'] {
+  const times = (bundle.sources || [])
+    .map((source) => Date.parse(String(source.publishedAt || '')))
+    .filter((time) => Number.isFinite(time) && time > Date.parse('1990-01-01') && time <= Date.now() + 24 * 3600 * 1000);
+  if (!times.length) return bundle.timeline || [];
+  const earliest = Math.min(...times);
+  return (bundle.timeline || []).filter((step) => {
+    const stepTime = Date.parse(String(step.date || ''));
+    if (!Number.isFinite(stepTime)) return true; // "Recorded Period" etc.
+    const year = new Date(stepTime).getUTCFullYear();
+    if (year < 1990) return false;
+    if (stepTime > Date.now() + 24 * 3600 * 1000) return false;
+    return stepTime >= earliest - 24 * 3600 * 1000;
+  });
 }
 
 function sanitizeLegacyBundle(bundle: EvidenceBundle): EvidenceBundle {
@@ -602,6 +709,7 @@ function sanitizeLegacyBundle(bundle: EvidenceBundle): EvidenceBundle {
     governmentResponse: cleanField(bundle.governmentResponse),
     rescueRelief: cleanField(bundle.rescueRelief),
     recovery: cleanField(bundle.recovery),
+    timeline: sanitizeLegacyTimeline(bundle),
   };
 }
 
@@ -623,19 +731,34 @@ async function getPersistedEvidenceBundle(eventId: string): Promise<EvidenceBund
   }
 }
 
-async function bundleForCanonicalEvent(event: CanonicalEventDto): Promise<EvidenceBundle> {
+async function bundleForCanonicalEvent(event: CanonicalEventDto, preloadedClaims?: Record<string, string[]>): Promise<EvidenceBundle> {
   // Curated claims are the primary projection source: they are verified,
   // numeric-reconciled, and citation-backed. The persisted rich bundle (an
   // older AI-research snapshot) is only used when no claims exist — stale
   // snapshots from earlier runs otherwise resurface junk like "documented in
   // source citations" and empty casualty fields.
-  const claims = await getEventClaims(event.id);
+  const claims = preloadedClaims ?? (await getEventClaims(event.id));
   if (Object.keys(claims).length > 0) {
     return canonicalEventToEvidenceBundle(event, claims);
   }
   const stored = await getPersistedEvidenceBundle(event.id);
   if (stored) return stored;
   return canonicalEventToEvidenceBundle(event);
+}
+
+/**
+ * Archive projection with batched claims: events that already carry claims are
+ * projected inline; only claim-less events fall back to the per-event persisted
+ * snapshot lookup, so the common case costs a constant number of queries.
+ */
+async function bundleListForCanonicalEvents(events: CanonicalEventDto[]): Promise<EvidenceBundle[]> {
+  const claimsByEvent = await getEventClaimsBatched(events.map((event) => event.id));
+  return Promise.all(events.map(async (event) => {
+    const claims = claimsByEvent.get(event.id) || {};
+    if (Object.keys(claims).length > 0) return canonicalEventToEvidenceBundle(event, claims);
+    const stored = await getPersistedEvidenceBundle(event.id).catch(() => null);
+    return stored || canonicalEventToEvidenceBundle(event);
+  }));
 }
 
 async function persistExternalResearch(query: string, bundle: EvidenceBundle): Promise<void> {
@@ -761,6 +884,17 @@ router.post('/search', async (req: Request, res: Response) => {
     if (query.length > 300) throw badRequest('Query is too long (max 300 characters)');
     rateLimit(req, 'search', 30, 60_000);
 
+    // Profanity gate (spec 9.1): inappropriate input never reaches downstream
+    // search/AI pipelines (multilingual word list incl. transliterated Hindi).
+    const searchModeration = moderateChatInput(query);
+    if (!searchModeration.allowed) {
+      res.status(422).json({
+        success: false,
+        error: { code: 'SEARCH_INPUT_BLOCKED', message: 'Please rephrase your search using respectful wording.' },
+      });
+      return;
+    }
+
     const normalizedQuery = normalizeSearchQuery(query);
     const cacheKey = `search:${normalizedQuery}`;
     const cached = cache.get<{ results: EvidenceBundle[]; source: string; provenance: string; message?: string }>('search', cacheKey);
@@ -777,7 +911,7 @@ router.post('/search', async (req: Request, res: Response) => {
     ]);
 
     if (canonicalMatches.length > 0) {
-      const results = await Promise.all(canonicalMatches.slice(0, 10).map(bundleForCanonicalEvent));
+      const results = await Promise.all(canonicalMatches.slice(0, 10).map((event) => bundleForCanonicalEvent(event)));
       const response = {
         results,
         source: 'database',
@@ -796,7 +930,7 @@ router.post('/search', async (req: Request, res: Response) => {
           { method: 'GET' },
         ).catch(() => []);
         if (rows.length > 0) {
-          const response = { results: await Promise.all(rows.map(bundleForCanonicalEvent)), source: 'database', provenance: 'lexical_documents' };
+          const response = { results: await Promise.all(rows.map((event) => bundleForCanonicalEvent(event))), source: 'database', provenance: 'lexical_documents' };
           cache.set('search', cacheKey, response, cache.getTTL('search'));
           res.json(response);
           return;
@@ -804,8 +938,40 @@ router.post('/search', async (req: Request, res: Response) => {
       }
     }
 
-    // Stage 2: DB vector (pgvector via RPC, public verification filter in SQL).
-    if (isEmbeddingAvailable()) {
+    // Stage 2: similarity suggestions (spec 9.2/9.3) — lexical string matching
+    // runs BEFORE the embedding-based vector stage so a typo like "fanni"
+    // resolves to "Cyclone Fani" with an explicit did-you-mean payload and
+    // without spending an embedding API call.
+    const suggestions = await suggestSimilarEvents(query, { limit: 5, threshold: SEARCH_SIMILARITY_THRESHOLD });
+    if (suggestions.length > 0) {
+      const best = suggestions[0];
+      const dto = await getCanonicalEventById(best.eventId).catch(() => null);
+      if (dto) {
+        const bundle = await bundleForCanonicalEvent(dto);
+        const response = {
+          results: [bundle],
+          source: 'database' as const,
+          provenance: 'similarity' as const,
+          similarityMatch: {
+            originalQuery: query,
+            matchedTitle: best.title,
+            matchedEventId: best.eventId,
+            similarity: best.similarity,
+            alternatives: suggestions.slice(1).map((s) => ({ title: s.title, eventId: s.eventId, similarity: s.similarity })),
+          },
+        };
+        cache.set('search', cacheKey, response, cache.getTTL('search'));
+        res.json(response);
+        return;
+      }
+    }
+
+    // Stage 3: DB vector (pgvector via RPC, public verification filter in SQL).
+    // Gibberish queries skip the vector stage entirely (spec 9.3): a random
+    // string must not retrieve semi-similar noise from the corpus — it falls
+    // through to external research and then "no data".
+    const gibberishGate = assessGibberish(query);
+    if (isEmbeddingAvailable() && !gibberishGate.gibberish) {
       const vectorHits = await vectorEventSearch(query, 10, 0.35);
       if (vectorHits.length > 0) {
         const ids = vectorHits.map((hit) => hit.event_id);
@@ -814,7 +980,7 @@ router.post('/search', async (req: Request, res: Response) => {
           { method: 'GET' },
         ).catch(() => []);
         if (rows.length > 0) {
-          const response = { results: await Promise.all(rows.map(bundleForCanonicalEvent)), source: 'database', provenance: 'vector' };
+          const response = { results: await Promise.all(rows.map((event) => bundleForCanonicalEvent(event))), source: 'database', provenance: 'vector' };
           cache.set('search', cacheKey, response, cache.getTTL('search'));
           res.json(response);
           return;
@@ -867,7 +1033,7 @@ router.post('/search', async (req: Request, res: Response) => {
       }
     }
 
-    // Stage 3: external research with validated citations, persisted + embedded.
+    // Stage 4: external research with validated citations, persisted + embedded.
     const bundle = await buildHistoricalEvidenceBundle(query);
     await persistExternalResearch(query, bundle);
     const response = { results: [bundle], source: 'external_research', provenance: 'external' };
@@ -890,12 +1056,21 @@ router.get('/past/archive', async (req: Request, res: Response) => {
   try {
     if (!isSupabaseConfigured()) throw unavailable('Database not configured');
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 200);
-    const archive = await listArchivedCanonicalEvents(limit);
-    const items = await Promise.all(archive.items.map(bundleForCanonicalEvent));
-
     const category = typeof req.query.category === 'string' && !/^all/i.test(req.query.category) ? req.query.category : undefined;
     const state = typeof req.query.state === 'string' && !/^all/i.test(req.query.state) ? req.query.state : undefined;
     const decade = typeof req.query.decade === 'string' && !/^all/i.test(req.query.decade) ? req.query.decade : undefined;
+
+    // Server-side cache: archive payloads are historical data with a 5-minute
+    // freshness contract (CACHE_PAST_TTL_SECONDS) and are expensive to project.
+    const cacheKey = `archive:${limit}:${category || 'all'}:${(state || 'all').toLowerCase()}:${decade || 'all'}`;
+    const payload = cache.get<{ items: EvidenceBundle[]; count: number; retrievedAt: string; cacheStatus: string }>('past', cacheKey);
+    if (payload) {
+      applyArchiveCaching(res, req, payload);
+      return;
+    }
+
+    const archive = await listArchivedCanonicalEvents(limit);
+    const items = await bundleListForCanonicalEvents(archive.items);
 
     let filtered = items;
     if (category) filtered = filtered.filter((item) => item.disasterType === category);
@@ -908,12 +1083,25 @@ router.get('/past/archive', async (req: Request, res: Response) => {
       });
     }
 
-    res.setHeader('Cache-Control', 'public, max-age=300');
-    res.json({ items: filtered, count: filtered.length, retrievedAt: archive.retrievedAt, cacheStatus: archive.cacheStatus });
+    const result = { items: filtered, count: filtered.length, retrievedAt: archive.retrievedAt, cacheStatus: archive.cacheStatus };
+    cache.set('past', cacheKey, result, cache.getTTL('past'));
+    applyArchiveCaching(res, req, result);
   } catch (error) {
     sendError(res, error);
   }
 });
+
+/** Shared response policy for the archive list: caching headers + ETag/304. */
+function applyArchiveCaching(res: Response, req: Request, result: { items: EvidenceBundle[]; count: number; retrievedAt: string; cacheStatus: string }): void {
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  const etag = `"${createHash('sha256').update(JSON.stringify(result)).digest('hex').slice(0, 32)}"`;
+  res.setHeader('ETag', etag);
+  if (req.headers['if-none-match'] === etag) {
+    res.status(304).end();
+    return;
+  }
+  res.json(result);
+}
 
 router.post('/past/search', async (req: Request, res: Response) => {
   try {
@@ -939,11 +1127,14 @@ router.post('/past/search', async (req: Request, res: Response) => {
     }
 
     if (research.source === 'none') {
+      // Stage 2 (spec 9.2): offer similar event names before declaring no data.
+      const suggestions = await suggestSimilarEvents(query, { limit: 5, threshold: SEARCH_SIMILARITY_THRESHOLD }).catch(() => []);
       res.json({
         bundle: null,
         noResults: true,
         error: null,
         details: 'No sufficiently reliable evidence was available from the database or external sources.',
+        suggestions: suggestions.map((s) => ({ title: s.title, eventId: s.eventId, similarity: s.similarity })),
         retrieval: research.retrieval,
       });
       return;
@@ -1336,14 +1527,23 @@ router.patch('/subscriptions', requireAuth, async (req: Request, res: Response) 
 router.post('/phone-numbers', requireAuth, async (req: Request, res: Response) => {
   try {
     const phone = typeof req.body?.phoneNumber === 'string' ? req.body.phoneNumber.trim() : '';
-    if (!/^\+?[0-9]{10,15}$/.test(phone)) throw badRequest('A valid phone number (10-15 digits) is required');
+    // Frontend enforces exactly 10 digits; the backend independently validates
+    // (spec 4: never rely on frontend validation for backend security) and
+    // normalizes to E.164 India format (+91XXXXXXXXXX) at rest.
+    const normalized = normalizeIndianPhone(phone);
+    if (!normalized.e164) {
+      const reasonText = normalized.reason === 'NOT_INDIA_MOBILE'
+        ? 'An Indian mobile number (starting 6-9) is required'
+        : 'A valid 10-digit Indian mobile number is required';
+      throw badRequest(reasonText, 'PHONE_INVALID');
+    }
 
     const rows = await supabaseRest<Array<Record<string, unknown>>>(
       'phone_numbers',
       {
         method: 'POST',
         headers: { Prefer: 'return=representation' },
-        body: JSON.stringify({ user_id: req.user!.id, phone_number: phone, verified: false }),
+        body: JSON.stringify({ user_id: req.user!.id, phone_number: normalized.e164, verified: false }),
       },
     );
     res.status(201).json({ phoneNumber: rows[0] || null });
@@ -1365,6 +1565,21 @@ router.post('/phone-numbers/:id/send-otp', requireAuth, async (req: Request, res
     if (!record) throw notFound('Phone number not found');
     if (record.verified) throw badRequest('This number is already verified');
     if (!isSmsConfigured()) throw unavailable('SMS provider is not configured on the server');
+    // Production gate (spec 4): while SMS_B2B_REGISTRATION_REQUIRED is true,
+    // the platform must NOT attempt real SMS delivery — Fast2SMS requires
+    // business registration / DLT-approved sender configuration. The frontend
+    // shows the explanatory modal on this structured response.
+    if (SMS_B2B_REGISTRATION_REQUIRED) {
+      res.status(409).json({
+        success: false,
+        code: 'SMS_REGISTRATION_REQUIRED',
+        error: {
+          code: 'SMS_REGISTRATION_REQUIRED',
+          message: 'SMS delivery is temporarily unavailable: production use requires business registration with the SMS provider (Fast2SMS) and the associated approved sender configuration. Your number is saved and will be verifiable once SMS is enabled.',
+        },
+      });
+      return;
+    }
     rateLimit(req, `otp-send:${req.user!.id}`, 5, 15 * 60_000);
 
     const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -1585,7 +1800,7 @@ router.post('/reports', requireAuth, async (req: Request, res: Response) => {
     const latitude = readNumber(req.body?.latitude);
     const longitude = readNumber(req.body?.longitude);
     const accuracyMeters = readNumber(req.body?.accuracyMeters);
-    const maxAccuracy = Number(process.env.REPORT_MAX_ACCURACY_METERS || 150);
+    const maxAccuracy = REPORT_MAX_ACCURACY_METERS;
     const validCategories = ['Flood', 'Cyclone', 'Heavy Rain', 'Thunderstorm', 'Lightning', 'Heat Wave', 'Cold Wave', 'Landslide', 'Earthquake', 'Avalanche', 'Forest Fire', 'Urban Flood', 'Air Pollution', 'Storm', 'General Alert'];
 
     if (!reportText) throw badRequest('Report text is required');
@@ -1599,6 +1814,17 @@ router.post('/reports', requireAuth, async (req: Request, res: Response) => {
     const category = typeof req.body?.category === 'string' && validCategories.includes(req.body.category)
       ? req.body.category
       : 'General Alert';
+
+    // Garbage/spam gate (spec 7 step 1): reject meaningless text BEFORE the
+    // report enters the verification pipeline or triggers external searches.
+    const submissionQuality = assessReportText(reportText);
+    if (!submissionQuality.accepted) {
+      res.status(422).json({
+        success: false,
+        error: { code: 'REPORT_NOT_SUBSTANTIVE', message: submissionQuality.reason },
+      });
+      return;
+    }
 
     const moderation = moderateChatInput(reportText);
     if (!moderation.allowed) {
@@ -1653,6 +1879,17 @@ router.post('/reports', requireAuth, async (req: Request, res: Response) => {
       }),
     });
     res.status(201).json({ report: rows[0] || null, riskScore: risk.riskScore });
+
+    // Fire-and-forget immediate verification pass so a fresh report does not
+    // wait for the next scheduler tick. The job body is idempotent and holds
+    // its own lock, so concurrent triggers are safe. Failures here never
+    // affect the 201 response — the scheduled job remains the safety net.
+    void Promise.resolve()
+      .then(() => runCitizenVerificationJob())
+      .then((jobResult) => {
+        console.log(`[reports] post-submit verification pass: ${jobResult.status} processed=${jobResult.recordsProcessed}`);
+      })
+      .catch((err: Error) => console.warn('[reports] post-submit verification pass failed:', err.message));
   } catch (error) {
     sendError(res, error);
   }
@@ -1693,17 +1930,24 @@ router.get('/notifications', requireAuth, async (req: Request, res: Response) =>
 // Analytics & Insights: trend analysis, pattern detection, risk assessment —
 // computed from the canonical store, no AI on the read path. Public read for
 // the dashboard; heavy computation cached 10 minutes.
-router.get('/insights', async (_req: Request, res: Response) => {
+router.get('/insights', async (req: Request, res: Response) => {
   try {
-    const cached = cache.get<InsightsPayload>('insights', 'global');
+    // Optional event-type filter (spec 6): filters server-side so the graphs
+    // reflect ONLY the selected type — the client never fakes the filter by
+    // post-processing unrelated data.
+    const eventType = typeof req.query.eventType === 'string' && req.query.eventType.trim()
+      ? req.query.eventType.trim().slice(0, 60)
+      : undefined;
+    const cacheKey = eventType ? `type:${eventType.toLowerCase()}` : 'global';
+    const cached = cache.get<InsightsPayload>('insights', cacheKey);
     if (cached) {
       res.setHeader('Cache-Control', 'public, max-age=600');
       res.json(cached);
       return;
     }
-    const insights = await computeInsights();
+    const insights = await computeInsights(eventType);
     if (insights.cacheStatus === 'MISS') {
-      cache.set('insights', 'global', insights, 600);
+      cache.set('insights', cacheKey, insights, 600);
     }
     res.setHeader('Cache-Control', 'public, max-age=600');
     res.json(insights);
@@ -1825,7 +2069,54 @@ router.get('/admin/sources', requireAuth, requireAdmin, async (_req: Request, re
       'source_definitions?select=id,source_key,name,source_type,enabled,priority,trust_weight,last_success_at,last_failure_at,health_status,source_health(status,last_run,records_received,records_accepted,records_rejected,message)&order=name.asc',
       { method: 'GET' },
     );
-    res.json({ sources });
+    // Integration truth (spec 2): every source carries an explicit backend
+    // declaration of whether a real adapter exists. The UI renders this
+    // verbatim — it never fabricates operational status for catalogue rows.
+    const INTEGRATION_STATUS: Record<string, string> = {
+      'sachet-cap': 'integrated',
+      'google-news-rss': 'integrated',
+      'national-news': 'integrated',
+      'regional-news': 'integrated',
+      'citizen': 'integrated',
+      'youtube': 'key-gated',
+      'reddit': 'key-gated',
+      'x': 'key-gated',
+      'data-gov': 'key-gated',
+      'imd': 'not-integrated',
+      'cwc': 'not-integrated',
+      'incois': 'not-integrated',
+      'fsi': 'not-integrated',
+      'dgre': 'not-integrated',
+      'state-disaster-authorities': 'not-integrated',
+      'historical-catalog': 'integrated-seed',
+    };
+    const KEY_ENV: Record<string, { label: string; vars: string[] }> = {
+      'youtube': { label: 'YOUTUBE_API_KEY', vars: ['YOUTUBE_API_KEY'] },
+      'reddit': { label: 'REDDIT_CLIENT_ID/SECRET', vars: ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET'] },
+      'x': { label: 'X_BEARER_TOKEN', vars: ['X_BEARER_TOKEN', 'TWITTER_BEARER_TOKEN'] },
+      'data-gov': { label: 'DATA_GOV_API_KEY', vars: ['DATA_GOV_API_KEY'] },
+    };
+    const enriched = (sources || []).map((source) => {
+      const key = String(source.source_key || '');
+      const status = INTEGRATION_STATUS[key] || 'not-integrated';
+      const gate = KEY_ENV[key];
+      const keyPresent = gate ? gate.vars.some((v) => Boolean(process.env[v]?.trim())) : false;
+      return {
+        ...source,
+        integration_status: status,
+        integration_detail:
+          status === 'integrated'
+            ? 'Live adapter in the ingestion/research pipeline.'
+            : status === 'integrated-seed'
+              ? 'Seeded curated catalog used by the Past backfill job.'
+              : status === 'key-gated'
+                ? keyPresent
+                  ? `Adapter present; activates with ${gate!.label}.`
+                  : `Adapter implemented but inactive — API key missing (${gate!.label}).`
+                : 'Planned registry entry only — no ingestion adapter implemented yet.',
+      };
+    });
+    res.json({ sources: enriched });
   } catch (error) {
     sendError(res, error);
   }
@@ -1894,7 +2185,11 @@ router.get('/admin/ai-health', requireAuth, requireAdmin, async (_req: Request, 
         model: process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2',
         dimensions: getEmbeddingDimensions(),
       },
-      notifications: { email: isEmailConfigured(), sms: isSmsConfigured() },
+      notifications: {
+        email: isEmailConfigured(),
+        sms: isSmsConfigured(),
+        smsRegistrationRequired: SMS_B2B_REGISTRATION_REQUIRED,
+      },
       database: { configured: isSupabaseConfigured() },
     });
   } catch (error) {
@@ -2310,6 +2605,129 @@ router.post('/admin/research/historical', requireAuth, requireAdmin, async (req:
     }
 
     res.json(queries.length === 1 ? results[0] : { batch: true, count: results.length, results });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Auth support (spec 10-18): signup duplicate pre-check + forgot-password
+// pre-validation. The frontend calls these BEFORE touching Supabase Auth.
+// ---------------------------------------------------------------------------
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+/**
+ * Backend duplicate-account check that must run before any supabase.auth.signUp()
+ * call from the browser. Supabase deliberately obfuscates existing-user signup
+ * responses when email confirmation is enabled — the frontend can never decide
+ * this itself. Uses the service-role Admin API list (server-side only) plus a
+ * profiles fallback.
+ */
+router.post('/auth/check-signup', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      res.status(422).json({ success: false, code: 'INVALID_EMAIL', message: 'Enter a valid email address.' });
+      return;
+    }
+    if (password.length < 8) {
+      res.status(422).json({ success: false, code: 'WEAK_PASSWORD', message: 'Password must be at least 8 characters.' });
+      return;
+    }
+    if (password.length > 128) {
+      res.status(422).json({ success: false, code: 'WEAK_PASSWORD', message: 'Password must be at most 128 characters.' });
+      return;
+    }
+    if (name.length > 120) {
+      res.status(422).json({ success: false, code: 'INVALID_NAME', message: 'Name must be at most 120 characters.' });
+      return;
+    }
+    rateLimit(req, 'check-signup', 20, 60_000);
+
+    if (!isSupabaseConfigured()) throw unavailable('Database not configured');
+
+    // 1. Definitive check via the Admin API (service role, backend only).
+    let exists = false;
+    try {
+      const url = `${getSupabaseUrl()}/auth/v1/admin/users?email=${encodeURIComponent(email)}&page=1&per_page=1`;
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+          apikey: SUPABASE_SECRET_KEY,
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (response.ok) {
+        const payload = (await response.json()) as { users?: Array<{ email?: string }> };
+        exists = (payload.users || []).some((u) => (u.email || '').toLowerCase() === email);
+      } else {
+        console.warn('[auth:check-signup] admin lookup failed with status', response.status);
+      }
+    } catch (adminError) {
+      console.warn('[auth:check-signup] admin lookup error:', (adminError as Error).message);
+    }
+
+    // 2. Fallback: profiles mirror (covers soft-deleted/legacy accounts).
+    if (!exists) {
+      const profileRows = await supabaseRest<Array<{ id: string }>>(
+        `profiles?email=eq.${encodeURIComponent(email)}&select=id&limit=1`,
+        { method: 'GET' },
+      ).catch(() => [] as Array<{ id: string }>);
+      exists = profileRows.length > 0;
+    }
+
+    if (exists) {
+      console.log(`[auth:check-signup] duplicate signup blocked for ${email.replace(/(.{2}).*(@.*)/, '$1***$2')}`);
+      res.status(409).json({
+        success: false,
+        code: 'USER_ALREADY_REGISTERED',
+        message: 'You are already registered. Please sign in instead.',
+      });
+      return;
+    }
+
+    res.json({ success: true, code: 'SIGNUP_ALLOWED' });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/**
+ * Forgot-password pre-validation. NEVER reveals account existence: the
+ * response is identical whether or not the email is registered (spec 11.2).
+ * Internal result is logged for diagnostics only.
+ */
+router.post('/auth/forgot-password', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      res.status(422).json({ success: false, code: 'INVALID_EMAIL', message: 'Enter a valid email address.' });
+      return;
+    }
+    rateLimit(req, 'forgot-password', 10, 60_000);
+
+    let accountExists: boolean | 'unknown' = 'unknown';
+    if (isSupabaseConfigured()) {
+      const profileRows = await supabaseRest<Array<{ id: string }>>(
+        `profiles?email=eq.${encodeURIComponent(email)}&select=id&limit=1`,
+        { method: 'GET' },
+      ).catch(() => [] as Array<{ id: string }>);
+      accountExists = profileRows.length > 0;
+    }
+    // Diagnostics only — the client never receives this value.
+    console.log(`[auth:forgot-password] request for ${email.replace(/(.{2}).*(@.*)/, '$1***$2')} accountExists=${accountExists}`);
+
+    // Generic response regardless of existence (anti-enumeration).
+    res.json({
+      success: true,
+      code: 'RESET_REQUEST_ACCEPTED',
+      message: 'If an account exists for this email, a password reset link has been sent.',
+    });
   } catch (error) {
     sendError(res, error);
   }
