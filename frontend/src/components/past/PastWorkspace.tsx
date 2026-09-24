@@ -138,6 +138,9 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
   const [isLoading, setIsLoading] = useState(true);
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Typo-tolerant search (spec 9.2): backend similarity suggestions for the
+  // last failed query, e.g. "aamphun" → likely match "Amphan".
+  const [suggestions, setSuggestions] = useState<Array<{ title: string; eventId: string; similarity: number }>>([]);
   const [selectedBundle, setSelectedBundle] = useState<EvidenceBundle | null>(null);
   const [activeChatBundle, setActiveChatBundle] = useState<EvidenceBundle | null>(null);
   const [localChatOpen, setLocalChatOpen] = useState(false);
@@ -203,15 +206,54 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
     return ['All States', ...states];
   }, [items]);
 
+  const handleSearchWithQuery = async (override: string) => {
+    const q = (override ?? query).trim();
+    if (!q) return;
+    setIsSearching(true);
+    setError(null);
+    setSuggestions([]);
+    try {
+      const data = await searchPastArchive(q);
+      if (!data?.bundle) {
+        setError(typeof data?.details === 'string' ? data.details : 'No verified evidence was found for that query.');
+        const similar = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        setSuggestions(similar.slice(0, 5));
+        return;
+      }
+      const bundle = data.bundle as ArchiveItem;
+      const year = getItemYear(bundle);
+      const decade = getItemDecade(bundle);
+      const enriched: ArchiveItem = {
+        ...bundle,
+        year: year > 0 ? year : undefined,
+        decade,
+        numericCasualties: extractImpactNumber(bundle),
+      };
+
+      setItems((prev) => {
+        const filtered = prev.filter((item) => item.eventName.toLowerCase() !== enriched.eventName.toLowerCase());
+        return [enriched, ...filtered];
+      });
+      setSelectedBundle(enriched);
+    } catch (err) {
+      setError((err as Error).message || 'Search failed');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
   const handleSearch = async () => {
     const q = query.trim();
     if (!q) return;
     setIsSearching(true);
     setError(null);
+    setSuggestions([]);
     try {
       const data = await searchPastArchive(q);
       if (!data?.bundle) {
         setError(typeof data?.details === 'string' ? data.details : 'No verified evidence was found for that query.');
+        const similar = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        setSuggestions(similar.slice(0, 5));
         return;
       }
       const bundle = data.bundle as ArchiveItem;
@@ -345,6 +387,30 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
           </div>
         )}
 
+        {/* Typo-tolerant suggestions (spec 9.2): offer the likely event name. */}
+        {suggestions.length > 0 && (
+          <div className="p-3 rounded-xl bg-[#ECF8F8] border border-[#B8BEC5]/60 text-xs text-[#0F1B29] space-y-2">
+            <p className="font-semibold">Did you mean:</p>
+            <div className="flex flex-wrap gap-2">
+              {suggestions.map((suggestion) => (
+                <button
+                  key={suggestion.eventId}
+                  type="button"
+                  onClick={() => {
+                    setQuery(suggestion.title);
+                    setSuggestions([]);
+                    setError(null);
+                    void handleSearchWithQuery(suggestion.title);
+                  }}
+                  className="px-3 py-1.5 rounded-full bg-white border border-[#B8BEC5] text-[11px] font-bold text-[#0F1B29] hover:bg-[#F3F4F5] transition-all cursor-pointer"
+                >
+                  {suggestion.title} · {Math.round(suggestion.similarity * 100)}% match
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
       </div>
 
       {isLoading && (
@@ -394,18 +460,21 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
                     </span>
                   </div>
 
-                  <div>
-                    <h4 className="font-bold text-base sm:text-lg text-[#0F1B29] group-hover:text-[#747F8D] transition-colors leading-snug">
-                      {item.eventName}
-                    </h4>
-                    <div className="flex items-center gap-1 text-xs text-[#747F8D] mt-1">
-                      <MapPin className="w-3.5 h-3.5 text-[#747F8D] shrink-0" />
-                      <span>{item.location}, {item.state}</span>
-                      <span className="text-[#DDDDDD]">•</span>
-                      <Calendar className="w-3.5 h-3.5 text-[#747F8D] shrink-0" />
-                      <span>{item.eventDate ? formatDisasterDate(item.eventDate) : item.dateRange}</span>
-                    </div>
+                <div className="min-w-0">
+                  <h4
+                    className="font-bold text-base sm:text-lg text-[#0F1B29] group-hover:text-[#747F8D] transition-colors leading-snug break-words line-clamp-3"
+                    title={item.eventName}
+                  >
+                    {item.eventName}
+                  </h4>
+                  <div className="flex items-center gap-1 text-xs text-[#747F8D] mt-1 min-w-0">
+                    <MapPin className="w-3.5 h-3.5 text-[#747F8D] shrink-0" />
+                    <span className="truncate">{item.location}, {item.state}</span>
+                    <span className="text-[#DDDDDD] shrink-0">•</span>
+                    <Calendar className="w-3.5 h-3.5 text-[#747F8D] shrink-0" />
+                    <span className="shrink-0">{item.eventDate ? formatDisasterDate(item.eventDate) : item.dateRange}</span>
                   </div>
+                </div>
                 </div>
 
                 {(hasCasualties || hasDamage) ? (
@@ -446,7 +515,7 @@ export const PastWorkspace: React.FC<PastWorkspaceProps> = ({
                 </p>
 
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-[#DDDDDD]">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
                     <button
                       type="button"
                       onClick={(e) => {

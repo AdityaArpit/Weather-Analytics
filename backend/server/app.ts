@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import compression from 'compression';
 import path from 'path';
 import apiRouter from './routes';
 
@@ -68,6 +69,10 @@ export function createApp(options: CreateAppOptions = {}) {
   const serveStatic = options.serveStatic ?? mode !== 'vercel';
 
   app.use(corsMiddleware);
+  // Gzip API payloads: list endpoints ship 100–250KB JSON; compression cuts
+  // transfer ~5-8x for text payloads and applies to the frontend bundle too
+  // when the backend serves the static build.
+  app.use(compression({ threshold: 1024 }));
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
 

@@ -1,0 +1,9 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /admin/login
+Disallow: /profile
+Disallow: /update-password
+Disallow: /report
+
+Sitemap: https://weather-analytics-kappa.vercel.app/sitemap.xml

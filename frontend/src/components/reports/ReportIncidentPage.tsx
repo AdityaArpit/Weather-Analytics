@@ -277,7 +277,7 @@ export const ReportIncidentPage: React.FC = () => {
 
           <PremiumPanel
             title="3 · Location"
-            description="High-accuracy coordinates are required (±150 m) so reports can be matched to official events."
+            description="GPS locations up to ±150 m are accepted; manually picked locations are capped at ±100 m so reports can be matched to official events."
             actions={coords ? <StatusBadge tone="success">±{Math.round(coords.accuracy)} m</StatusBadge> : <StatusBadge tone="warning">Required</StatusBadge>}
           >
             <div className="space-y-4">
@@ -325,7 +325,7 @@ export const ReportIncidentPage: React.FC = () => {
                         key={`${place.lat},${place.lng}`}
                         type="button"
                         onClick={() => {
-                          setCoords({ lat: place.lat, lng: place.lng, accuracy: 1000 });
+                          setCoords({ lat: place.lat, lng: place.lng, accuracy: MANUAL_LOCATION_ACCURACY_METERS });
                           setManualPlaces([]);
                         }}
                         className="w-full text-left px-3 py-2.5 rounded-xl border border-[#DDDDDD] hover:bg-[#F3F4F5] transition-colors text-xs text-[#0F1B29] cursor-pointer"
@@ -335,9 +335,9 @@ export const ReportIncidentPage: React.FC = () => {
                     ))}
                   </div>
                 )}
-                {coords?.accuracy >= 1000 && (
+                {coords?.accuracy >= MANUAL_LOCATION_ACCURACY_METERS && (
                   <p className="mt-2 text-[11px] text-[#0F1B29]">
-                    Manual locations carry reduced accuracy; the verification pipeline weights them accordingly.
+                    Manual locations carry ±{MANUAL_LOCATION_ACCURACY_METERS} m accuracy; the verification pipeline weights them accordingly.
                   </p>
                 )}
               </div>
@@ -484,3 +484,11 @@ function ZapLike(props: React.SVGProps<SVGSVGElement>) { return <AlertTriangle {
 function Mountain(props: React.SVGProps<SVGSVGElement>) { return <AlertTriangle {...props} />; }
 function Activity(props: React.SVGProps<SVGSVGElement>) { return <AlertTriangle {...props} />; }
 type ApiErr = Error;
+
+/**
+ * Manual (non-GPS) location buffer, in meters (spec section 1).
+ * Reduced from the legacy ±1000 to ±100. Must stay in sync with
+ * MANUAL_LOCATION_ACCURACY_METERS in backend/server/lib/platformConfig.ts —
+ * the backend independently enforces this limit at submission.
+ */
+const MANUAL_LOCATION_ACCURACY_METERS = 100;

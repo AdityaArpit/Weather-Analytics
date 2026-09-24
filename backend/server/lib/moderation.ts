@@ -7,7 +7,9 @@ const BLOCKED_PATTERNS: Array<{ category: ModerationResult['category']; pattern:
   { category: 'threat', pattern: /\b(?:kill|murder|rape|bomb|shoot)\s+(?:you|them|him|her|everyone)\b/i },
   { category: 'threat', pattern: /\b(?:kill yourself|go die|death threat)\b/i },
   { category: 'profanity', pattern: /\b(?:fuck|f+u+c+k|motherf+u+c+k|bitch|bastard|dick|cunt|slut|whore|asshole|bullshit|shithead)\b/i },
-  { category: 'profanity', pattern: /\b(?:chutiya|chutiy|gand+u|harami|madarchod|behenchod|bhosdi|lund|randi|lauda)\b/i },
+  { category: 'profanity', pattern: /\b(?:chut+?iya?|chutiy|chu+i?ya|chutiye|gand+u|ga?andu|harami|har?aam(?:khor|zada|zade)?|madar?chod|maadarchod|madarchod|behen?chod|behen?ch?od|bhosdi(?:ke|wale)?|bhos?a?da|lund|loda|lauda|la?ora|randi|rand|chodal|ch?odu|bhada?u|kutta|kuttiya|kamina|saala|saale|bkl|bsdk|mc|bc|terri? maa|gand mar|beti chod)\b/i },
+  // Common spelling variations / leet / spaced-out evasions ("f u c k", "ch*tiya").
+  { category: 'profanity', pattern: /(?:f+\s*[u@]+\s*c+\s*k+|c+\s*h+\s*u+\s*t+|m+\s*c+|b+\s*k+\s*l+|b+\s*s+\s*d+\s*k+)/i },
   { category: 'profanity', pattern: /(?:चूतिया|गांडू|हरामी|मादरचोद|बहनचोद|भोसड़ी|लौड़ा|रंडी)/u },
   { category: 'profanity', pattern: /(?:চোদা|চোদাচুদি|হারামি|বেশ্যা)/u },
   { category: 'profanity', pattern: /(?:தேவடியா|புண்டை|மயிரு|நாயே)/u },

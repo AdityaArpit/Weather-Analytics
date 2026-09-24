@@ -169,32 +169,37 @@ export function HealthDot({ status }: { status: string }) {
 // ---------------------------------------------------------------------------
 // Data table
 // ---------------------------------------------------------------------------
-
 export function DataTable<T>({
   columns,
   rows,
   keyOf,
   empty,
   dense,
+  /** Max height for the internal scroll container (spec 3: operational tables scroll inside the page). */
+  maxHeight,
 }: {
   columns: Array<{ key: string; label: string; className?: string; render: (row: T) => React.ReactNode }>;
   rows: T[];
   keyOf: (row: T) => string;
   empty?: React.ReactNode;
   dense?: boolean;
+  maxHeight?: string;
 }) {
   if (rows.length === 0 && empty) return <>{empty}</>;
   const cellPad = dense ? 'px-4 py-2' : 'px-4 py-3';
   return (
-    <div className="overflow-x-auto -mx-6 -mb-6">
+    <div
+      className="overflow-auto -mx-6 -mb-6"
+      style={maxHeight ? { maxHeight, overflowY: 'auto' as const } : undefined}
+    >
       <table className="w-full text-sm">
-        <thead>
-          <tr className="border-b border-[#DDDDDD]/80">
+        <thead className="sticky top-0 z-10">
+          <tr className="border-b border-[#DDDDDD]/80 bg-white">
             {columns.map((col) => (
               <th
                 key={col.key}
                 scope="col"
-                className={cx('text-left text-[10px] font-bold uppercase tracking-[0.14em] text-[#747F8D] px-4 py-3 whitespace-nowrap', col.className)}
+                className={cx('text-left text-[10px] font-bold uppercase tracking-[0.14em] text-[#747F8D] px-4 py-3 whitespace-nowrap bg-white', col.className)}
               >
                 {col.label}
               </th>
@@ -208,7 +213,7 @@ export function DataTable<T>({
                 <td key={col.key} className={cx(cellPad, 'text-[#0F1B29] align-middle', col.className)}>
                   {col.render(row)}
                 </td>
-                ))}
+              ))}
             </tr>
           ))}
         </tbody>

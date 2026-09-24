@@ -1,15 +1,35 @@
 import { supabaseRest, isSupabaseConfigured } from '../db/supabase';
 import { citizenReportVerification } from '../lib/verification';
 import { nearbyEvents } from '../lib/searchRetrieval';
+import { assessReportText } from '../lib/reportQuality';
+import { moderateChatInput } from '../lib/moderation';
+import { COMMUNITY_REPORT_THRESHOLD, REPORT_EVENT_MATCH_RADIUS_KM } from '../lib/platformConfig';
 import { startJobRun, finishJobRun, type JobResult } from './jobRunner';
 
-const REPORT_RADIUS_KM = 25;
 /** Reports within CLUSTER_RADIUS_KM of each other are one on-ground incident. */
 const CLUSTER_RADIUS_KM = 5;
-/** A cluster of at least this many independent citizen reports implies a real disaster even with zero official/news coverage. */
-export const CITIZEN_CLUSTER_MIN_REPORTS = 3;
 /** Parallel verification workers (bounded; each worker does only REST calls). */
 const WORKER_CONCURRENCY = 8;
+
+/**
+ * Community threshold (spec 7 step 5): a cluster needs at least this many
+ * VALID, INDEPENDENT reports to confirm an event with zero external
+ * evidence. The legacy constant CITIZEN_CLUSTER_MIN_REPORTS (=3) is kept as
+ * an export alias for backward compatibility with tests/scripts.
+ */
+export const CITIZEN_CLUSTER_MIN_REPORTS = COMMUNITY_REPORT_THRESHOLD;
+
+/** Per-report timeout: a verification pass must never wedge the whole job. */
+const CLUSTER_TIMEOUT_MS = 60_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
+    ),
+  ]);
+}
 
 interface PendingReport {
   id: string;
@@ -82,6 +102,38 @@ async function rejectReport(report: PendingReport, reason: string): Promise<void
       updated_at: new Date().toISOString(),
     }),
   }).catch(() => undefined);
+}
+
+/**
+ * Quality + independence gate (spec 7 step 5 anti-abuse): a report counts
+ * toward the community threshold only when its text is substantive, passes
+ * moderation, and is not a duplicate/replayed payload from the same user.
+ * Reports failing the gate are REJECTED with an explicit reason — never
+ * silently dropped, and never counted toward COMMUNITY_REPORT_THRESHOLD.
+ */
+function isSubstantiveReport(report: PendingReport, seenPayloads: Map<string, string>): boolean {
+  const quality = assessReportText(report.report_text || '');
+  if (!quality.accepted) {
+    void rejectReport(report, `Not substantive: ${quality.reason}`);
+    return false;
+  }
+  const moderation = moderateChatInput(report.report_text || '');
+  if (!moderation.allowed) {
+    void rejectReport(report, `Content blocked by moderation (${moderation.category}).`);
+    return false;
+  }
+  // Duplicate/replay detection: identical normalized payload from the SAME
+  // user (or from any user when text is identical) cannot inflate clusters.
+  const normalized = (report.report_text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 400);
+  const payloadKey = `${report.user_id}:${normalized}`;
+  const globalKey = normalized;
+  if (seenPayloads.has(payloadKey) || seenPayloads.get(globalKey) === report.user_id) {
+    void rejectReport(report, 'Duplicate submission: an identical report already exists in this verification run.');
+    return false;
+  }
+  seenPayloads.set(payloadKey, report.user_id);
+  seenPayloads.set(globalKey, report.user_id);
+  return true;
 }
 
 async function patchReport(report: PendingReport, patch: Record<string, unknown>): Promise<void> {
@@ -190,31 +242,45 @@ export async function runCitizenVerificationJob(): Promise<JobResult> {
 
   result.recordsProcessed = pendingReports.length;
 
-  // ---- Phase 0: quarantine high-risk reports immediately (parallel) ----
+  // ---- Phase 0: quarantine high-risk reports + drop garbage (parallel) ----
   const cleanReports: PendingReport[] = [];
+  const seenPayloads = new Map<string, string>();
   await Promise.all(pendingReports.map(async (report) => {
     const riskScore = Number(report.risk_score || 0);
     if (riskScore >= 0.6) {
       const factors = report.risk_factors || [];
       await rejectReport(report, `Quarantined by anti-abuse pipeline (risk ${riskScore}): ${factors.join(', ') || 'heuristics'}`);
       result.recordsRejected++;
-    } else {
+      return;
+    }
+    if (isSubstantiveReport(report, seenPayloads)) {
       cleanReports.push(report);
+    } else {
+      result.recordsRejected++;
     }
   }));
 
   // ---- Phase 1: spatial clustering of clean reports ----
   const clusters = clusterReports(cleanReports);
 
-  // ---- Phase 2: per-cluster decisions (parallel, bounded) ----
+  // ---- Phase 2: per-cluster decisions (parallel, bounded, timed) ----
   const cursor = { value: 0 };
   const workers = Array.from({ length: Math.min(WORKER_CONCURRENCY, clusters.length || 1) }, async () => {
     while (cursor.value < clusters.length) {
       const cluster = clusters[cursor.value++];
       try {
-        await processCluster(cluster, result);
+        await withTimeout(processCluster(cluster, result), CLUSTER_TIMEOUT_MS, 'cluster verification');
       } catch (err) {
+        // A failing/timeout cluster must still terminate: reports keep their
+        // VERIFYING state (a real terminal state for the UI) instead of
+        // being stuck in PENDING forever.
         console.warn('cluster verification failed:', (err as Error).message);
+        await Promise.all(cluster.reports.map((report) =>
+          patchReport(report, {
+            status: 'VERIFYING',
+            verification_reason: `Verification run failed (${((err as Error).message || 'error').slice(0, 200)}); will retry on the next scheduled run.`,
+          }),
+        ));
       }
     }
   });
@@ -236,7 +302,7 @@ async function processCluster(cluster: Cluster, result: JobResult): Promise<void
   // Corroboration: verified active canonical events near the cluster.
   let nearbyVerifiedCount = 0;
   let linkedEventId: string | null = null;
-  const nearby = await nearbyEvents(lat, lng, REPORT_RADIUS_KM).catch(() => []);
+  const nearby = await nearbyEvents(lat, lng, REPORT_EVENT_MATCH_RADIUS_KM).catch(() => []);
   nearbyVerifiedCount = nearby.length;
   if (nearby.length > 0) {
     const category = anchor.reported_category;

@@ -280,7 +280,9 @@ export const EventDetailView: React.FC<EventDetailViewProps> = ({
           </span>
         </div>
 
-        <h1 className="text-xl sm:text-2xl font-bold text-slate-900 tracking-tight">
+        {/* Full event name, always visible: wraps naturally, never clipped —
+            the archive cards truncate long titles, the detail view must not. */}
+        <h1 className="text-xl sm:text-2xl font-bold text-slate-900 tracking-tight break-words">
           {bundle.eventName}
         </h1>
 

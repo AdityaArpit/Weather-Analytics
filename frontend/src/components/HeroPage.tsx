@@ -1,22 +1,13 @@
-import React, { useEffect } from 'react';
+import React from 'react';
 import { Sparkles, Radio, Brain, ShieldAlert } from 'lucide-react';
 import { IndiaMapHero } from './IndiaMapHero';
-import { apiUrl } from '../lib/api';
 interface HeroPageProps {
   onExplore: () => void;
 }
 
 export const HeroPage: React.FC<HeroPageProps> = ({ onExplore }) => {
-
-  // Proactive non-blocking backend warm-up
-  useEffect(() => {
-    // 1. Existing Backend
-    const backendUrl = apiUrl('/api/health');
-    fetch(backendUrl, { mode: 'no-cors' }).catch(() => {
-      // Quiet fail - error tolerant
-    });
-
-  }, []);
+  // Backend warm-up moved to App.tsx: one /api/health ping fires on app mount
+  // (covers every route), so the Render instance wakes before real data calls.
 
   return (
     <div className="w-full min-h-[calc(100vh-64px)] md:h-[calc(100vh-64px)] md:min-h-0 md:max-h-[calc(100vh-64px)] bg-[#ECF8F8] text-[#0F1B29] flex flex-col justify-center font-sans px-4 sm:px-6 lg:px-8 py-2 select-none overflow-hidden">

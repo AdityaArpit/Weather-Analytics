@@ -82,7 +82,7 @@ function monthOf(iso: string | null): number | null {
   return Number.isNaN(date.getTime()) ? null : date.getUTCMonth() + 1;
 }
 
-export async function computeInsights(): Promise<InsightsPayload> {
+export async function computeInsights(eventType?: string): Promise<InsightsPayload> {
   if (!isSupabaseConfigured()) return { ...EMPTY };
 
   try {
@@ -98,13 +98,18 @@ export async function computeInsights(): Promise<InsightsPayload> {
       source_count: number | null;
     };
     const select = 'id,event_type,status,severity,state,started_at,verification_status,source_count';
+    // Optional server-side event-type filter (spec 6): the database narrows
+    // the dataset so every downstream metric truly reflects the selection.
+    const typeFilter = eventType && eventType.trim()
+      ? `&event_type=eq.${encodeURIComponent(eventType.trim())}`
+      : '';
     const [activeRows, pastRows] = await Promise.all([
       supabaseRest<InsightRow[]>(
-        `active_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=1000`,
+        `active_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})${typeFilter}&order=started_at.desc.nullslast&limit=1000`,
         { method: 'GET' },
       ),
       supabaseRest<InsightRow[]>(
-        `past_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})&order=started_at.desc.nullslast&limit=1000`,
+        `past_canonical_events?select=${select}&verification_status=in.(${PUBLIC_STATUSES})${typeFilter}&order=started_at.desc.nullslast&limit=1000`,
         { method: 'GET' },
       ),
     ]);
