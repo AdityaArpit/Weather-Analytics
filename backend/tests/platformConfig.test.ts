@@ -4,6 +4,7 @@ import {
   MANUAL_LOCATION_ACCURACY_METERS,
   COMMUNITY_REPORT_THRESHOLD,
   SMS_B2B_REGISTRATION_REQUIRED,
+  REPORT_MAX_ACCURACY_METERS,
   normalizeIndianPhone,
   isValidLocalIndianMobile,
 } from '../server/lib/platformConfig.ts';
@@ -17,6 +18,21 @@ import { stringSimilarity } from '../server/lib/fuzzyMatch.ts';
 test('manual location buffer is 100 meters, not the legacy 1000', () => {
   assert.equal(MANUAL_LOCATION_ACCURACY_METERS, 100);
   assert.ok(MANUAL_LOCATION_ACCURACY_METERS < 1000);
+});
+
+// ---------------------------------------------------------------------------
+// Location gate relationship (spec section 1): manual picks ALWAYS satisfy
+// the GPS submission gate. If either constant changes, both must be updated
+// together — otherwise manual locations regress to the legacy ±1000 and get
+// rejected by the backend LOCATION_ACCURACY gate at submission.
+// ---------------------------------------------------------------------------
+
+test('manual buffer (100 m) always passes the GPS accuracy gate (150 m)', () => {
+  assert.equal(REPORT_MAX_ACCURACY_METERS, 150);
+  assert.ok(
+    MANUAL_LOCATION_ACCURACY_METERS <= REPORT_MAX_ACCURACY_METERS,
+    `manual buffer ${MANUAL_LOCATION_ACCURACY_METERS} m must be within the ${REPORT_MAX_ACCURACY_METERS} m submission gate`,
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,10 @@ export async function runNotificationJob(): Promise<JobResult> {
 
   try {
     // Only publicly verified, active events are eligible for alerting.
+    // present_until is enforced HERE (not only in the SQL view): an expired
+    // event must never fire emails even if the lifecycle job has not retired
+    // it yet — the notification job runs more frequently than lifecycle.
+    const nowIso = new Date().toISOString();
     const events = await supabaseRest<Array<{
       id: string;
       title: string;
@@ -43,10 +47,18 @@ export async function runNotificationJob(): Promise<JobResult> {
       severity: string;
       location_name: string | null;
       description: string | null;
+      present_until: string | null;
     }>>(
-      `canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING)&verification_status=in.(${PUBLIC_VERIFICATION_STATUSES.join(',')})&select=id,title,event_type,severity,location_name,description&limit=50`,
+      `canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING)&verification_status=in.(${PUBLIC_VERIFICATION_STATUSES.join(',')})&select=id,title,event_type,severity,location_name,description,present_until&limit=50`,
       { method: 'GET' },
     );
+    const eligibleEvents = events.filter((event) =>
+      !event.present_until || Date.parse(event.present_until) > Date.parse(nowIso),
+    );
+    const expiredSkipped = events.length - eligibleEvents.length;
+    if (expiredSkipped > 0) {
+      console.log(`[notifications] skipped ${expiredSkipped} event(s) whose present window has expired (no alerts sent)`);
+    }
 
     // Any subscription row is a candidate; per-channel eligibility is checked
     // during fan-out (channel flag + provider configuration + verification).
@@ -77,7 +89,7 @@ export async function runNotificationJob(): Promise<JobResult> {
       if (!phoneMap.has(row.user_id)) phoneMap.set(row.user_id, row.phone_number);
     }
 
-    for (const event of events) {
+    for (const event of eligibleEvents) {
       if (severityValue(event.severity) < severityValue('Moderate')) continue;
       result.recordsProcessed++;
 
@@ -141,11 +153,21 @@ export async function runNotificationJob(): Promise<JobResult> {
                     sourceUrls: [],
                     platformUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
                   });
-                  if (!sent.success) throw new Error(sent.error || 'Email provider failed');
+                  if (!sent.success) {
+                    // Never swallow provider errors: the failure is stored on
+                    // the notification row and logged without the address.
+                    console.error(`[notifications] email dispatch failed user=${sub.user_id.slice(0, 8)}… event=${event.id.slice(0, 8)}…: ${sent.error}`);
+                    throw new Error(sent.error || 'Email provider failed');
+                  }
                 },
               });
               if (outcome === 'created') result.recordsCreated++;
-              else if (outcome === 'failed') result.recordsRejected++;
+              else if (outcome === 'failed') {
+                result.recordsRejected++;
+                console.warn(`[notifications] email notification FAILED for user=${sub.user_id.slice(0, 8)}… event=${event.id.slice(0, 8)}… (retry next run)`);
+              }
+            } else {
+              console.warn(`[notifications] email alert skipped: subscription ${sub.user_id.slice(0, 8)}… has no email address on the profile`);
             }
           }
 

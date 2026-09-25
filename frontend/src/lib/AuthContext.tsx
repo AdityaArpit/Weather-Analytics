@@ -9,6 +9,7 @@ import {
 } from 'react';
 import { supabase, getCurrentUser, isSupabaseConfigured, type SessionUser } from './supabaseClient';
 import { api, ApiError } from './api';
+import { checkAccountExists } from './authClient';
 import type { Session } from '@supabase/supabase-js';
 
 const AuthContext = createContext<AuthContextValue>({
@@ -83,6 +84,9 @@ function describeAuthError(error: unknown): { code: string; message: string } {
   if (/reset.*expired|invalid.*recovery|recovery.*invalid/i.test(message)) {
     return { code: 'RESET_LINK_INVALID', message: 'This reset link is invalid or has expired. Request a new one.' };
   }
+  if (/email not found|user not found|no user found/i.test(message)) {
+    return { code: 'ACCOUNT_NOT_FOUND', message: 'You are not registered. Please sign up.' };
+  }
   if (/failed to fetch|network/i.test(message)) {
     return { code: 'NETWORK', message: 'Could not reach the server. Check your connection and try again.' };
   }
@@ -146,6 +150,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [refreshUser]);
 
   const login = useCallback(async (email: string, password: string) => {
+    if (!email.trim() || !password) {
+      throw Object.assign(new Error('Enter your email and password to sign in.'), { code: 'MISSING_FIELDS' });
+    }
+    // Two-phase sign-in (spec 13.2): the backend first determines whether the
+    // account exists so an UNREGISTERED email gets the explicit "Please sign
+    // up" message instead of a misleading "incorrect password". The password
+    // is never sent to the precheck.
+    const precheck = await checkAccountExists(email);
+    if (precheck.code === 'ACCOUNT_NOT_FOUND') {
+      throw Object.assign(
+        new Error(precheck.message || 'You are not registered. Please sign up.'),
+        { code: 'ACCOUNT_NOT_FOUND' },
+      );
+    }
+    if (precheck.code === 'INVALID_EMAIL') {
+      throw Object.assign(new Error('Please enter a valid email address.'), { code: 'INVALID_EMAIL' });
+    }
+    // RATE_LIMITED / UNAVAILABLE: continue to the authoritative Supabase check.
+
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) {
       const described = describeAuthError(error);

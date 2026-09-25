@@ -96,12 +96,23 @@ async function request<T>(
 
     if (!response.ok) {
       const errorBody = await response.json().catch(() => ({}));
+      // The backend error envelope is { success, error: { code, message } };
+      // some endpoints (auth prechecks, moderation gates) ALSO send the code
+      // and message at the top level. Resolve both shapes so the structured
+      // code (e.g. USER_ALREADY_REGISTERED / ACCOUNT_NOT_FOUND) always reaches
+      // ApiError instead of a generic "Request failed (409)".
       const err = errorBody?.error;
-      throw new ApiError(
-        response.status,
-        err?.code || `HTTP_${response.status}`,
-        err?.message || errorBody?.error || errorBody?.details || `Request failed (${response.status})`,
-      );
+      const code: string =
+        (typeof err === 'object' && err !== null && err.code) ||
+        errorBody?.code ||
+        `HTTP_${response.status}`;
+      const message: string =
+        (typeof err === 'object' && err !== null && err.message) ||
+        (typeof err === 'string' && err) ||
+        errorBody?.message ||
+        errorBody?.details ||
+        `Request failed (${response.status})`;
+      throw new ApiError(response.status, String(code), String(message));
     }
 
     return (await response.json()) as T;

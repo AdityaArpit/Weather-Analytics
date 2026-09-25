@@ -38,6 +38,37 @@ export const SMS_B2B_REGISTRATION_REQUIRED =
 /** Radius (km) used when matching a report to nearby canonical events. */
 export const REPORT_EVENT_MATCH_RADIUS_KM = 25;
 
+/**
+ * Present-layer proximity-warning defaults (spec section 1).
+ *
+ * The per-category radii live in proximityAlerts.ts (they are hazard physics,
+ * not deployment config); this is the DEFAULT warning radius used when a user
+ * (or subscription) has no explicit radius configured, and the outer cap for
+ * guest (browser-location) alerting.
+ */
+export const ALERT_DEFAULT_RADIUS_KM =
+  Number(process.env.ALERT_DEFAULT_RADIUS_KM || 50) || 50;
+export const ALERT_MAX_RADIUS_KM =
+  Number(process.env.ALERT_MAX_RADIUS_KM || 200) || 200;
+
+/**
+ * Citizen-report geographic clustering radius (spec section 4.4): reports
+ * within this distance of a cluster centroid describe the same on-ground
+ * incident. Configurable so operations can tighten/loosen without code edits.
+ */
+export const CITIZEN_CLUSTER_RADIUS_KM =
+  Number(process.env.CITIZEN_CLUSTER_RADIUS_KM || 5) || 5;
+
+/**
+ * Citizen-event expiry (spec section 4.6): citizen-derived Present-layer
+ * events never live longer than 24 hours. The env override is CAPPED at 24 —
+ * a longer value is silently clamped, never honoured.
+ */
+export const CITIZEN_EVENT_TTL_HOURS = (() => {
+  const value = Number(process.env.CITIZEN_EVENT_TTL_HOURS || 24) || 24;
+  return Math.min(Math.max(value, 1), 24);
+})();
+
 /** Similarity (0..1) at which a fuzzy event-name match is offered as a suggestion. */
 export const SEARCH_SIMILARITY_THRESHOLD = 0.62;
 

@@ -3635,6 +3635,14 @@ function requireAdmin(req, _res, next) {
   }
   next();
 }
+async function optionalAuth(req, _res, next) {
+  const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  if (!token) {
+    next();
+    return;
+  }
+  await requireAuth(req, _res, next);
+}
 
 // server/lib/cache.ts
 var CacheService = class {
@@ -5641,6 +5649,13 @@ var MANUAL_LOCATION_ACCURACY_METERS = Number(process.env.MANUAL_LOCATION_ACCURAC
 var COMMUNITY_REPORT_THRESHOLD = Number(process.env.COMMUNITY_REPORT_THRESHOLD || 20) || 20;
 var SMS_B2B_REGISTRATION_REQUIRED = String(process.env.SMS_B2B_REGISTRATION_REQUIRED ?? "true").trim().toLowerCase() !== "false";
 var REPORT_EVENT_MATCH_RADIUS_KM = 25;
+var ALERT_DEFAULT_RADIUS_KM = Number(process.env.ALERT_DEFAULT_RADIUS_KM || 50) || 50;
+var ALERT_MAX_RADIUS_KM = Number(process.env.ALERT_MAX_RADIUS_KM || 200) || 200;
+var CITIZEN_CLUSTER_RADIUS_KM = Number(process.env.CITIZEN_CLUSTER_RADIUS_KM || 5) || 5;
+var CITIZEN_EVENT_TTL_HOURS = (() => {
+  const value = Number(process.env.CITIZEN_EVENT_TTL_HOURS || 24) || 24;
+  return Math.min(Math.max(value, 1), 24);
+})();
 var SEARCH_SIMILARITY_THRESHOLD = 0.62;
 function normalizeIndianPhone(raw) {
   if (typeof raw !== "string") return { e164: null, local10: null, reason: "NON_NUMERIC" };
@@ -5658,6 +5673,256 @@ function normalizeIndianPhone(raw) {
     return { e164: null, local10: null, reason: "NOT_INDIA_MOBILE" };
   }
   return { e164: `+91${national}`, local10: national };
+}
+
+// server/lib/proximityAlerts.ts
+function categoryRadiusKm(category) {
+  const override = process.env[`ALERT_RADIUS_${String(category || "").toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_KM`];
+  if (override) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  switch (category) {
+    case "Cyclone":
+      return 150;
+    // broad gale + storm-surge radius
+    case "Earthquake":
+      return 250;
+    // felt-tremor zone
+    case "Flood":
+      return 60;
+    // river basin / inundation impact
+    case "Urban Flood":
+      return 30;
+    case "Heavy Rain":
+      return 60;
+    case "Thunderstorm":
+      return 40;
+    case "Lightning":
+      return 30;
+    case "Landslide":
+      return 25;
+    // localized slope failure
+    case "Heat Wave":
+      return 100;
+    case "Cold Wave":
+      return 100;
+    case "Storm":
+      return 70;
+    case "Tsunami":
+      return 120;
+    // coastal surge perimeter
+    case "Avalanche":
+      return 30;
+    case "Forest Fire":
+      return 40;
+    case "Drought":
+      return 150;
+    case "Air Pollution":
+      return 80;
+    default:
+      return ALERT_DEFAULT_RADIUS_KM;
+  }
+}
+function effectiveRadiusKm(category, requestedRadiusKm) {
+  const requested = Number(requestedRadiusKm);
+  const cap = Number.isFinite(requested) && requested > 0 ? Math.min(requested, ALERT_MAX_RADIUS_KM) : ALERT_MAX_RADIUS_KM;
+  return Math.min(categoryRadiusKm(category), cap);
+}
+function isAlertableEvent(event) {
+  const publicStatuses = ["OFFICIAL_VERIFIED", "CROSS_SOURCE_VERIFIED", "PROVISIONALLY_VERIFIED"];
+  if (event.verificationStatus && !publicStatuses.includes(event.verificationStatus)) return false;
+  if (event.status && !["DEVELOPING", "ACTIVE", "UPDATING", "ENDING"].includes(event.status)) return false;
+  if (event.presentUntil) {
+    const expiry = Date.parse(event.presentUntil);
+    if (Number.isFinite(expiry) && expiry <= Date.now()) return false;
+  }
+  return true;
+}
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function levelFor(severity, insideRadius) {
+  if (severity === "Extreme") return "CRITICAL";
+  if (severity === "Severe") return "HIGH";
+  if (severity === "Moderate") return insideRadius ? "MODERATE" : "LOW";
+  return "LOW";
+}
+var PROXIMITY_ALERT_VERSION = "v1";
+function buildProximityAlert(event, userLat, userLng, options = {}) {
+  if (!isAlertableEvent(event)) return null;
+  if (typeof event.latitude !== "number" || typeof event.longitude !== "number" || !Number.isFinite(event.latitude) || !Number.isFinite(event.longitude)) {
+    return null;
+  }
+  const radiusKm = effectiveRadiusKm(event.eventType, options.requestedRadiusKm);
+  const dist = distanceKm(userLat, userLng, event.latitude, event.longitude);
+  if (dist > radiusKm) return null;
+  const severity = event.severity || "Unknown";
+  const insideRadius = true;
+  const level = levelFor(severity, insideRadius);
+  const rounded = Math.round(dist * 10) / 10;
+  const locationName = event.locationName || "your area";
+  return {
+    eventId: event.id,
+    eventKey: event.eventKey ?? null,
+    title: event.title,
+    eventType: event.eventType,
+    severity,
+    level,
+    alertLevel: level,
+    distanceKm: rounded,
+    radiusKm,
+    insideRadius,
+    locationName,
+    state: event.state ?? null,
+    description: event.description || "",
+    instruction: event.instruction || event.verificationReason || "Follow official local-authority guidance and monitor updates.",
+    headline: `${severity !== "Unknown" ? `${severity} ` : ""}${event.eventType} reported near ${locationName}`,
+    presentUntil: event.presentUntil ?? null,
+    startedAt: event.startedAt ?? null,
+    lastObservedAt: event.lastObservedAt ?? null,
+    verificationStatus: event.verificationStatus ?? null,
+    verificationScore: Number(event.verificationScore || 0),
+    verificationMethod: event.verificationMethod ?? null,
+    verificationReason: event.verificationReason ?? null,
+    sourceCount: Number(event.sourceCount || 0),
+    dedupeKey: `${PROXIMITY_ALERT_VERSION}:${event.id}`
+  };
+}
+function buildProximityAlerts(events, userLat, userLng, options = {}) {
+  const seen = /* @__PURE__ */ new Set();
+  const alerts = [];
+  for (const event of events) {
+    if (seen.has(event.id)) continue;
+    const alert = buildProximityAlert(event, userLat, userLng, options);
+    if (!alert) continue;
+    seen.add(event.id);
+    alerts.push(alert);
+  }
+  const levelRank = { CRITICAL: 0, HIGH: 1, MODERATE: 2, LOW: 3 };
+  alerts.sort((a, b) => {
+    const l = levelRank[a.level] - levelRank[b.level];
+    if (l !== 0) return l;
+    return a.distanceKm - b.distanceKm;
+  });
+  const max = options.maxAlerts ?? 10;
+  return max > 0 ? alerts.slice(0, max) : alerts;
+}
+
+// server/lib/chatIntent.ts
+var GENERIC_PATTERNS = [
+  {
+    pattern: /\b(who\s+are\s+you|what\s+are\s+you|your\s+name|tell\s+me\s+about\s+yourself)\b/i,
+    reply: [
+      "I am the **Aapda Drishti AI Research Assistant** \u2014 the grounded intelligence assistant of this disaster-intelligence platform.",
+      "",
+      "What I do:",
+      "- Answer questions about **verified Indian disaster events** using evidence retrieved from the platform database and trusted external sources.",
+      "- Always **cite my sources** and tell you plainly when the evidence is insufficient.",
+      "",
+      "What I do not do:",
+      "- I never invent casualties, dates, locations, warnings, or government actions.",
+      "",
+      'Try asking: *"What happened during Cyclone Amphan?"*, *"Floods in Assam last week"*, or *"Compare Bhola and Aila"*.'
+    ].join("\n")
+  },
+  {
+    pattern: /\b(what\s+can\s+you\s+do|how\s+do\s+you\s+work|your\s+(capabilities|features)|help\s+me\s+use|how\s+(do|to|can)\s+(i\s+|you\s+)?use)\b/i,
+    reply: [
+      "I help you research **verified disaster intelligence** for India. Here is how to use me:",
+      "",
+      '- **Ask about a specific event** \u2014 by name (*"Cyclone Fani"*), place (*"floods in Kerala"*) or time (*"earthquakes in 2025"*). I search the platform database first, then escalate to external research automatically when needed.',
+      "- **Ask follow-up questions** while an event is open \u2014 casualties, damage, response, timeline. I answer strictly from retrieved evidence with citations.",
+      '- **Request comparisons** \u2014 *"Compare Amphan and Aila"* produces a cited side-by-side analysis in the Past workspace.',
+      "",
+      "I cite every factual claim and say so explicitly when evidence is missing or a source is unreachable."
+    ].join("\n")
+  },
+  {
+    pattern: /\b(what\s+is\s+(this|the)\s+platform|what\s+is\s+aapda\s+drishti|about\s+(this\s+)?(platform|app|website|project))\b/i,
+    reply: [
+      "**Aapda Drishti** is an end-to-end disaster intelligence platform for India with three layers:",
+      "",
+      "- **Present** \u2014 a live map of verified active events, official SACHET/CAP alerts, and location-aware in-app warnings for your area.",
+      "- **Past** \u2014 citable historical disaster dossiers, universal search, and this AI research assistant.",
+      "- **Reports** \u2014 citizen incident reporting with automated verification (external evidence plus community corroboration).",
+      "",
+      "Every fact on the platform is tied to sources and a verification status \u2014 official, cross-source, or provisional."
+    ].join("\n")
+  },
+  {
+    pattern: /\b(present\s+layer|what\s+does\s+(the\s+)?present\s+(layer|mean))\b/i,
+    reply: [
+      "The **Present layer** is the live operational map: verified, currently active disaster events (official, cross-source, or provisionally verified only), official SACHET/CAP alerts, and location-aware warnings when an active event falls inside the warning radius of your saved home location or browser location.",
+      "",
+      "Events leave the Present layer automatically when their evidence window expires or the lifecycle pipeline marks them ended \u2014 expired events keep warning nobody."
+    ].join("\n")
+  },
+  {
+    pattern: /\b(past\s+layer|what\s+does\s+(the\s+)?past\s+(layer|mean))\b/i,
+    reply: [
+      "The **Past layer** is the historical archive: verified past disaster events with evidence-backed dossiers \u2014 impact figures, damage, government response, and per-claim citations, all traceable to their sources.",
+      "",
+      "It grows automatically: a scheduled discovery pipeline researches notable events, validates the evidence, and archives new events with full provenance."
+    ].join("\n")
+  },
+  {
+    pattern: /\b(future\s+layer|what\s+does\s+(the\s+)?future\s+(layer|mean))\b/i,
+    reply: [
+      "The **Future layer** is the forecasting surface: expected hazards derived from official warnings and forecast data (for example cyclone tracks and heavy-rain outlooks). It presents what official sources expect to happen \u2014 it never invents predictions of its own."
+    ].join("\n")
+  },
+  {
+    pattern: /\b(how\s+(do|are)\s+(reports?|citizen\s+reports)\s+(work|verified)|report\s+verification)\b/i,
+    reply: [
+      "Citizen reports pass an automated verification pipeline:",
+      "",
+      "1. **Quality + anti-abuse screening** \u2014 gibberish, spam and duplicated submissions are rejected before verification.",
+      "2. **External evidence search** \u2014 Google News and official sources are checked for coverage of the same event (location, type, time).",
+      "3. **Community corroboration** \u2014 when no external source covers it yet, a geographically clustered set of independent valid reports can confirm the incident on the Present map.",
+      "",
+      "Citizen-derived map events are temporary (they expire within 24 hours) and their descriptions distinguish citizen-reported information from authoritative confirmation."
+    ].join("\n")
+  },
+  {
+    pattern: /\b(hi|hello|hey|good\s+(morning|afternoon|evening)|namaste)\b[!. ]*$/i,
+    reply: [
+      "Hello. I am the Aapda Drishti research assistant.",
+      "",
+      'Ask me about any verified Indian disaster event \u2014 by name, place, or time \u2014 and I will answer strictly from retrieved evidence with citations. For example: *"What happened in the 2018 Kerala floods?"*'
+    ].join("\n")
+  },
+  {
+    pattern: /\b(thank(s|\s+you)|thanks\s+a\s+lot)\b/i,
+    reply: "You are welcome. Ask me anytime you need verified disaster intelligence \u2014 I will cite sources for every claim."
+  }
+];
+var DISASTER_HINT = /\b(cyclone|flood|earthquake|landslide|tsunami|storm|hurricane|typhoon|rain|rainfall|monsoon|cloudburst|heat\s*wave|cold\s*wave|drought|avalanche|wildfire|forest\s*fire|lightning|thunderstorm|casualt|death\s*toll|damage|evacuat|relief|rescue|ndrf|sdrf|disaster| IMD\b|ndma|warning|alert|magnitude|epicenter|inundat|deluge|glacier|dam\b)/i;
+function classifyChatIntent(message, context = {}) {
+  const text = String(message || "").trim();
+  if (context.hasAssociatedBundle && /\b(more|detail|details|elaborate|continue|also|what\s+else|and\s+then|why|how)\b/i.test(text)) {
+    return { intent: "FOLLOW_UP", reason: "follow-up on the associated dossier" };
+  }
+  for (const entry of GENERIC_PATTERNS) {
+    if (entry.pattern.test(text)) {
+      return { intent: "GENERIC", genericReply: entry.reply, reason: `generic match: ${entry.pattern.source.slice(0, 40)}` };
+    }
+  }
+  if (text.length <= 24 && !DISASTER_HINT.test(text)) {
+    return {
+      intent: "GENERIC",
+      genericReply: [
+        "I am the Aapda Drishti research assistant for **verified disaster intelligence**.",
+        "",
+        'Ask me about a specific event \u2014 *"Cyclone Amphan"*, *"floods in Assam"*, *"earthquake 2025 Nepal border"* \u2014 and I will ground the answer in retrieved evidence with citations.'
+      ].join("\n"),
+      reason: "short conversational message without disaster vocabulary"
+    };
+  }
+  return { intent: "DISASTER_QUERY", reason: "disaster research query" };
 }
 
 // server/jobs/jobRunner.ts
@@ -7489,10 +7754,18 @@ async function runNotificationJob() {
     return result;
   }
   try {
+    const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const events = await supabaseRest(
-      `canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING)&verification_status=in.(${PUBLIC_VERIFICATION_STATUSES2.join(",")})&select=id,title,event_type,severity,location_name,description&limit=50`,
+      `canonical_events?status=in.(DEVELOPING,ACTIVE,UPDATING)&verification_status=in.(${PUBLIC_VERIFICATION_STATUSES2.join(",")})&select=id,title,event_type,severity,location_name,description,present_until&limit=50`,
       { method: "GET" }
     );
+    const eligibleEvents = events.filter(
+      (event) => !event.present_until || Date.parse(event.present_until) > Date.parse(nowIso)
+    );
+    const expiredSkipped = events.length - eligibleEvents.length;
+    if (expiredSkipped > 0) {
+      console.log(`[notifications] skipped ${expiredSkipped} event(s) whose present window has expired (no alerts sent)`);
+    }
     const subscriptions = await supabaseRest(
       "subscriptions?select=user_id,nearby_radius_km,severity_threshold,email_enabled,sms_enabled,push_enabled&limit=1000",
       { method: "GET" }
@@ -7510,7 +7783,7 @@ async function runNotificationJob() {
     for (const row of phoneRows) {
       if (!phoneMap.has(row.user_id)) phoneMap.set(row.user_id, row.phone_number);
     }
-    for (const event of events) {
+    for (const event of eligibleEvents) {
       if (severityValue(event.severity) < severityValue("Moderate")) continue;
       result.recordsProcessed++;
       for (const sub of subscriptions) {
@@ -7529,9 +7802,9 @@ async function runNotificationJob() {
           const hit = nearby.find((n) => n.event_id === event.id);
           if (!hit) continue;
           if (severityValue(event.severity) < severityValue(sub.severity_threshold)) continue;
-          const distanceKm = Math.round(hit.distance_meters / 100) / 10;
+          const distanceKm2 = Math.round(hit.distance_meters / 100) / 10;
           const location = hit.location_name || "your area";
-          const reason = `${event.event_type} (${event.severity}) ${distanceKm} km from ${loc.id ? "a saved location" : "you"} near ${location}`;
+          const reason = `${event.event_type} (${event.severity}) ${distanceKm2} km from ${loc.id ? "a saved location" : "you"} near ${location}`;
           const inAppKey = `${sub.user_id}:${event.id}:IN_APP:v1`;
           const inApp = await recordNotification({
             userId: sub.user_id,
@@ -7563,11 +7836,19 @@ async function runNotificationJob() {
                     sourceUrls: [],
                     platformUrl: process.env.FRONTEND_URL || "http://localhost:5173"
                   });
-                  if (!sent.success) throw new Error(sent.error || "Email provider failed");
+                  if (!sent.success) {
+                    console.error(`[notifications] email dispatch failed user=${sub.user_id.slice(0, 8)}\u2026 event=${event.id.slice(0, 8)}\u2026: ${sent.error}`);
+                    throw new Error(sent.error || "Email provider failed");
+                  }
                 }
               });
               if (outcome === "created") result.recordsCreated++;
-              else if (outcome === "failed") result.recordsRejected++;
+              else if (outcome === "failed") {
+                result.recordsRejected++;
+                console.warn(`[notifications] email notification FAILED for user=${sub.user_id.slice(0, 8)}\u2026 event=${event.id.slice(0, 8)}\u2026 (retry next run)`);
+              }
+            } else {
+              console.warn(`[notifications] email alert skipped: subscription ${sub.user_id.slice(0, 8)}\u2026 has no email address on the profile`);
             }
           }
           if (sub.sms_enabled && isSmsConfigured()) {
@@ -7707,8 +7988,10 @@ function assessGibberish(rawText) {
 }
 
 // server/jobs/citizenVerificationJob.ts
-var CLUSTER_RADIUS_KM = 5;
+init_googleNews();
+var CLUSTER_RADIUS_KM = CITIZEN_CLUSTER_RADIUS_KM;
 var WORKER_CONCURRENCY = 8;
+var MAX_EXTERNAL_LOOKUPS_PER_RUN = 8;
 var CITIZEN_CLUSTER_MIN_REPORTS = COMMUNITY_REPORT_THRESHOLD;
 var CLUSTER_TIMEOUT_MS = 6e4;
 function withTimeout(promise, ms, label) {
@@ -7726,9 +8009,49 @@ function haversineKm3(lat1, lng1, lat2, lng2) {
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 function reportCoords(report) {
-  const coords = report.geometry?.coordinates;
-  if (!coords || coords.length < 2) return null;
-  return [coords[1], coords[0]];
+  return parseGeometryCoords(report.geometry);
+}
+function parseGeometryCoords(geometry) {
+  if (!geometry) return null;
+  if (typeof geometry === "object") {
+    const coords = geometry.coordinates;
+    if (Array.isArray(coords) && coords.length >= 2) {
+      const lng = Number(coords[0]);
+      const lat = Number(coords[1]);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) return [lat, lng];
+    }
+    return null;
+  }
+  if (typeof geometry !== "string") return null;
+  const value = geometry.trim();
+  const wkt = value.match(/point\s*\(\s*(-?[\d.]+)\s+(-?[\d.]+)/i);
+  if (wkt) {
+    const lng = Number(wkt[1]);
+    const lat = Number(wkt[2]);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) return [lat, lng];
+  }
+  if (/^[0-9a-f]+$/i.test(value) && value.length >= 42 && value.length % 2 === 0) {
+    try {
+      const buffer = Buffer.from(value, "hex");
+      if (buffer.length >= 21 && buffer[0] === 1) {
+        const typeWord = buffer.readUInt32LE(1);
+        const isPoint = (typeWord & 268435455) === 1;
+        const hasSrid = (typeWord & 536870912) !== 0;
+        const hasZ = (typeWord & 1073741824) !== 0;
+        const offset = hasSrid ? 9 : 5;
+        const minBytes = offset + (hasZ ? 24 : 16);
+        if (isPoint && buffer.length >= minBytes) {
+          const lng = buffer.readDoubleLE(offset);
+          const lat = buffer.readDoubleLE(offset + 8);
+          if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+            return [lat, lng];
+          }
+        }
+      }
+    } catch {
+    }
+  }
+  return null;
 }
 function clusterReports(reports) {
   const clusters = [];
@@ -7793,39 +8116,173 @@ async function patchReport(report, patch) {
     body: JSON.stringify({ ...patch, updated_at: (/* @__PURE__ */ new Date()).toISOString() })
   }).catch((err) => console.warn("report update failed:", err.message));
 }
-async function ensureClusterEvent(cluster, category) {
-  const anchor = cluster.reports[0];
+var CATEGORY_KEYWORDS = {
+  Flood: ["flood", "inundat", "waterlog"],
+  "Urban Flood": ["waterlog", "urban flood", "inundat"],
+  "Heavy Rain": ["rain", "downpour", "deluge", "showers"],
+  Cyclone: ["cyclone", "storm", "depression"],
+  Thunderstorm: ["thunderstorm", "squall", "storm"],
+  Lightning: ["lightning", "thunderbolt"],
+  Landslide: ["landslide", "mudslide", "debris"],
+  Earthquake: ["earthquake", "quake", "tremor", "seismic"],
+  "Heat Wave": ["heat wave", "heatwave", "heatwave"],
+  "Cold Wave": ["cold wave", "coldwave", "frost"],
+  "Forest Fire": ["forest fire", "wildfire", "bushfire"],
+  Avalanche: ["avalanche", "snow"],
+  Storm: ["storm", "gale"],
+  "Air Pollution": ["pollution", "smog", "air quality"],
+  "General Alert": ["disaster", "alert", "weather"]
+};
+function articleMatchesCluster(article, context) {
+  const text = `${article.title} ${article.summary}`.toLowerCase();
+  const keywords = CATEGORY_KEYWORDS[context.category] || [context.category.toLowerCase()];
+  const typeMatch = keywords.some((word) => text.includes(word));
+  if (!typeMatch) return false;
+  const specificPlaces = [context.city, context.district].filter((place) => Boolean(place && place.length >= 4)).map((place) => place.toLowerCase());
+  if (specificPlaces.length > 0) {
+    return specificPlaces.some((place) => text.includes(place));
+  }
+  return context.state ? text.includes(context.state.toLowerCase()) : false;
+}
+function isRecentEvidence(publishedAt) {
+  if (!publishedAt) return false;
+  const time = Date.parse(publishedAt);
+  if (!Number.isFinite(time)) return false;
+  const ageMs = Date.now() - time;
+  return ageMs >= -15 * 6e4 && ageMs <= 7 * 24 * 36e5;
+}
+async function searchExternalEvidence(cluster, category) {
+  const joinedText = cluster.reports.map((report) => report.report_text).join(" ").slice(0, 600);
+  const { city, district, state } = extractLocationsFromText(joinedText);
+  const place = [city, district].filter(Boolean).join(" ") || state || "";
+  const query = [category, place, "India"].filter(Boolean).join(" ");
+  const articles = await searchGoogleNews(query, { isCurrentNews: false, windowHours: 168, maxResults: 8 });
+  const matches = articles.filter(
+    (article) => isIndiaRelevantEvidence(article.title, article.summary) && isRecentEvidence(article.publishedAt) && articleMatchesCluster(article, { category, city, district, state })
+  );
+  return matches.slice(0, 4).map((article) => ({
+    title: article.title,
+    url: article.url,
+    publisher: article.publisher,
+    publishedAt: article.publishedAt,
+    summary: article.summary
+  }));
+}
+async function linkEvidenceObservations(eventId, evidence) {
+  if (evidence.length === 0) return;
+  const source = await resolveSource("google-news-rss").catch(() => null);
+  if (!source) return;
+  const now2 = (/* @__PURE__ */ new Date()).toISOString();
+  for (const item of evidence) {
+    const hash = contentHash(`${item.title}|${item.summary}|${item.url}`);
+    try {
+      const rows = await supabaseRest("source_observations?on_conflict=source_id,content_hash", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify({
+          source_id: source.id,
+          external_id: `citizen-evidence-${hash.slice(0, 32)}`,
+          content_hash: hash,
+          title: item.title.slice(0, 500),
+          raw_content: item.summary.slice(0, 8e3),
+          source_url: item.url?.slice(0, 2e3) || null,
+          publisher: item.publisher.slice(0, 200) || "News Media",
+          published_at: item.publishedAt || now2,
+          retrieved_at: now2,
+          event_category: "Citizen Report Corroboration"
+        })
+      });
+      let observationId = rows?.[0]?.id || null;
+      if (!observationId) {
+        const existing = await supabaseRest(
+          `source_observations?and=(source_id.eq.${source.id},content_hash.eq.${hash})&select=id&limit=1`,
+          { method: "GET" }
+        ).catch(() => []);
+        observationId = existing[0]?.id || null;
+      }
+      if (!observationId) continue;
+      await supabaseRest("event_sources?on_conflict=event_id,source_id,source_observation_id", {
+        method: "POST",
+        headers: { Prefer: "resolution=ignore-duplicates" },
+        body: JSON.stringify({ event_id: eventId, source_id: source.id, source_observation_id: observationId })
+      }).catch(() => void 0);
+    } catch (err) {
+      console.warn("[citizen-verification] evidence link failed:", err.message);
+    }
+  }
+}
+function buildClusterDescription(cluster, category, placeLabel, evidence) {
+  const times = cluster.reports.map((report) => Date.parse(report.reported_at)).filter(Number.isFinite).sort((a, b) => a - b);
+  const firstReported = times.length ? new Date(times[0]).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "recently";
+  const lines = [];
+  lines.push(
+    `${cluster.reports.length} independent citizen report${cluster.reports.length === 1 ? "" : "s"} describe ${category.toLowerCase()} conditions near ${placeLabel}, first reported ${firstReported}.`
+  );
+  lines.push("Reported by citizens (not yet verified against official damage figures):");
+  for (const report of cluster.reports.slice(0, 3)) {
+    lines.push(`- "${report.report_text.trim().slice(0, 220)}"`);
+  }
+  if (evidence.length > 0) {
+    lines.push("External corroboration (news coverage matching this event):");
+    for (const item of evidence) {
+      lines.push(`- ${item.title} (${item.publisher})`);
+    }
+  } else {
+    lines.push(
+      `Confirmed by community corroboration: ${cluster.reports.length} geographically clustered, independently validated reports. No external confirmation was available at promotion time.`
+    );
+  }
+  return lines.join("\n").slice(0, 5e3);
+}
+async function ensureClusterEvent(cluster, category, evidence) {
   const now2 = (/* @__PURE__ */ new Date()).toISOString();
   const dateStr = now2.split("T")[0];
-  const eventType = category || anchor.reported_category || "General Alert";
+  const eventType = category || cluster.reports[0].reported_category || "General Alert";
+  const joinedText = cluster.reports.map((report) => report.report_text).join(" ").slice(0, 600);
+  const { city, district, state } = extractLocationsFromText(joinedText);
+  const placeLabel = [city, district, state].filter(Boolean).join(", ") || `(${cluster.lat.toFixed(3)}, ${cluster.lng.toFixed(3)})`;
   const gridKey = `${eventType.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${dateStr}-${cluster.lat.toFixed(1)}-${cluster.lng.toFixed(1)}`;
   const eventKey = `citizen-cluster-${gridKey}`;
-  const title = `Citizen-reported ${eventType} \u2014 ${cluster.reports.length} corroborating reports`;
+  const title = `Citizen-reported ${eventType} \u2014 ${placeLabel}`.slice(0, 300);
   const geometryWkt = `SRID=4326;POINT(${cluster.lng} ${cluster.lat})`;
+  const meetsCommunityThreshold = cluster.reports.length >= CITIZEN_CLUSTER_MIN_REPORTS;
+  const promotedByExternal = evidence.length > 0;
+  if (!meetsCommunityThreshold && !promotedByExternal) return null;
+  const method = promotedByExternal && !meetsCommunityThreshold ? "CITIZEN_EXTERNAL_EVIDENCE" : meetsCommunityThreshold && promotedByExternal ? "CITIZEN_COMMUNITY_AND_EXTERNAL" : "CITIZEN_COMMUNITY_CONFIRMED";
+  const score = promotedByExternal ? 0.72 : 0.62;
+  const description = buildClusterDescription(cluster, eventType, placeLabel, evidence);
+  const reason = promotedByExternal ? `${cluster.reports.length} clustered citizen report(s) corroborated by external news coverage matching event type and location.` : `${cluster.reports.length} independent citizen reports clustered within ${CLUSTER_RADIUS_KM} km \u2014 community-confirmed ground truth with no external source yet.`;
   const rows = await supabaseRest("canonical_events?on_conflict=event_key", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=representation" },
     body: JSON.stringify({
       event_key: eventKey,
-      title: title.slice(0, 300),
+      title,
       event_type: eventType,
       status: "DEVELOPING",
       severity: "Unknown",
+      // honest: severity is not invented from reports
       urgency: "Expected",
       certainty: "Observed",
-      description: cluster.reports.slice(0, 10).map((r) => r.report_text.slice(0, 300)).join("\n---\n").slice(0, 5e3),
-      location_name: `Citizen-reported location (${cluster.lat.toFixed(3)}, ${cluster.lng.toFixed(3)})`,
+      description,
+      location_name: `Citizen-reported location \u2014 ${placeLabel}`.slice(0, 500),
+      city: city || null,
+      district: district || null,
+      state: state || null,
       country: "India",
       geometry: geometryWkt,
       centroid: geometryWkt,
-      started_at: cluster.reports.map((r) => r.reported_at).sort()[0] || now2,
+      started_at: cluster.reports.map((report) => report.reported_at).sort()[0] || now2,
       last_observed_at: now2,
       last_verified_at: now2,
-      present_until: new Date(Date.now() + 24 * 3600 * 1e3).toISOString(),
-      verification_status: "PENDING",
-      verification_score: 0.5,
-      verification_method: "CITIZEN_CLUSTER",
-      verification_reason: `${cluster.reports.length} independent citizen reports clustered within ${CLUSTER_RADIUS_KM} km \u2014 high-confidence ground truth with no official source yet.`,
+      // Spec 4.6: citizen events never live longer than 24h. present_until
+      // both expires them from the active view/RPC and lets the lifecycle
+      // job retire them to the archive afterwards.
+      present_until: new Date(Date.now() + CITIZEN_EVENT_TTL_HOURS * 36e5).toISOString(),
+      verification_status: "PROVISIONALLY_VERIFIED",
+      verification_score: score,
+      verification_method: method,
+      verification_reason: reason.slice(0, 500),
       location_confidence: 0.6
     })
   }).catch(() => []);
@@ -7838,6 +8295,7 @@ async function ensureClusterEvent(cluster, category) {
     eventId = existing[0]?.id || null;
   }
   if (!eventId) return null;
+  if (promotedByExternal) await linkEvidenceObservations(eventId, evidence);
   return { eventId, created: Boolean(rows?.[0]?.id) };
 }
 async function runCitizenVerificationJob() {
@@ -7859,7 +8317,10 @@ async function runCitizenVerificationJob() {
   const pendingReports = await supabaseRest(
     "citizen_reports?status=in.(PENDING,VERIFYING)&select=id,user_id,report_text,reported_category,geometry,reported_at,risk_score,risk_factors&order=reported_at.asc&limit=100",
     { method: "GET" }
-  ).catch(() => []);
+  ).catch((error) => {
+    console.error("[citizen-verification] failed to fetch pending reports:", error.message);
+    return [];
+  });
   result.recordsProcessed = pendingReports.length;
   const cleanReports = [];
   const seenPayloads = /* @__PURE__ */ new Map();
@@ -7877,13 +8338,35 @@ async function runCitizenVerificationJob() {
       result.recordsRejected++;
     }
   }));
-  const clusters = clusterReports(cleanReports);
+  const clusterableReports = [];
+  for (const report of cleanReports) {
+    if (reportCoords(report)) {
+      clusterableReports.push(report);
+    } else {
+      await patchReport(report, {
+        status: "VERIFYING",
+        verification_score: 0.3,
+        verification_reason: "No usable location data was attached to this report, so it cannot be spatially verified. Text-only reports require manual review."
+      });
+      result.recordsRejected++;
+    }
+  }
+  const clusters = clusterReports(clusterableReports);
+  let externalLookupsUsed = 0;
   const cursor = { value: 0 };
   const workers = Array.from({ length: Math.min(WORKER_CONCURRENCY, clusters.length || 1) }, async () => {
     while (cursor.value < clusters.length) {
       const cluster = clusters[cursor.value++];
       try {
-        await withTimeout(processCluster(cluster, result), CLUSTER_TIMEOUT_MS, "cluster verification");
+        await withTimeout(
+          processCluster(cluster, result, () => {
+            if (externalLookupsUsed >= MAX_EXTERNAL_LOOKUPS_PER_RUN) return false;
+            externalLookupsUsed += 1;
+            return true;
+          }),
+          CLUSTER_TIMEOUT_MS,
+          "cluster verification"
+        );
       } catch (err) {
         console.warn("cluster verification failed:", err.message);
         await Promise.all(cluster.reports.map(
@@ -7896,28 +8379,31 @@ async function runCitizenVerificationJob() {
     }
   });
   await Promise.all(workers);
-  if (result.recordsProcessed === 0) {
+  if (result.recordsProcessed > 0 && result.recordsCreated === 0 && result.recordsUpdated === 0 && result.recordsRejected === 0) {
+    console.warn(
+      `[citizen-verification] run completed with NO decisions (processed=${result.recordsProcessed}) \u2014 reports may have failed to update; investigate geometry/status filters`
+    );
   }
   if (runId) await finishJobRun(runId, result);
   return result;
 }
-async function processCluster(cluster, result) {
+async function processCluster(cluster, result, claimExternalLookup) {
   const anchor = cluster.reports[0];
   const lat = cluster.lat;
   const lng = cluster.lng;
+  const category = anchor.reported_category || "General Alert";
   let nearbyVerifiedCount = 0;
   let linkedEventId = null;
   const nearby = await nearbyEvents(lat, lng, REPORT_EVENT_MATCH_RADIUS_KM).catch(() => []);
   nearbyVerifiedCount = nearby.length;
   if (nearby.length > 0) {
-    const category = anchor.reported_category;
-    const matching = nearby.find((hit) => category && hit.event_type === category);
+    const matching = nearby.find((hit) => anchor.reported_category && hit.event_type === anchor.reported_category);
     linkedEventId = (matching || nearby[0]).event_id;
   }
   const duplicateCount = Math.max(0, cluster.reports.length - 1);
   const isStrongCluster = cluster.reports.length >= CITIZEN_CLUSTER_MIN_REPORTS;
   if (isStrongCluster && !linkedEventId) {
-    const ensured = await ensureClusterEvent(cluster, anchor.reported_category || "General Alert");
+    const ensured = await ensureClusterEvent(cluster, category, []);
     if (ensured) {
       linkedEventId = ensured.eventId;
       if (ensured.created) result.recordsCreated++;
@@ -7925,12 +8411,42 @@ async function processCluster(cluster, result) {
         (report) => patchReport(report, {
           status: "VERIFIED",
           verification_score: 0.85,
-          verification_reason: `Corroborated by ${cluster.reports.length} independent citizen reports within ${CLUSTER_RADIUS_KM} km. Merged into citizen cluster event.`,
+          verification_reason: `Corroborated by ${cluster.reports.length} independent citizen reports within ${CLUSTER_RADIUS_KM} km. Promoted to the Present layer by community confirmation.`,
           linked_event_id: ensured.eventId
         })
       ));
       result.recordsUpdated += cluster.reports.length;
       return;
+    }
+  }
+  if (!isStrongCluster && !linkedEventId && claimExternalLookup()) {
+    try {
+      const evidence = await searchExternalEvidence(cluster, category);
+      if (evidence.length > 0) {
+        const joinedText = cluster.reports.map((report) => report.report_text).join(" ").slice(0, 600);
+        const { city, district } = extractLocationsFromText(joinedText);
+        const hasSpecificPlace = Boolean(city || district);
+        const promotable = hasSpecificPlace || evidence.length >= 2;
+        if (promotable) {
+          const ensured = await ensureClusterEvent(cluster, category, evidence);
+          if (ensured) {
+            linkedEventId = ensured.eventId;
+            if (ensured.created) result.recordsCreated++;
+            await Promise.all(cluster.reports.map(
+              (report) => patchReport(report, {
+                status: "VERIFIED",
+                verification_score: 0.8,
+                verification_reason: `Corroborated by external coverage: ${evidence.map((item) => item.title).join("; ").slice(0, 260)}`,
+                linked_event_id: ensured.eventId
+              })
+            ));
+            result.recordsUpdated += cluster.reports.length;
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[citizen-verification] external evidence lookup failed:", err.message);
     }
   }
   for (const report of cluster.reports) {
@@ -7974,51 +8490,71 @@ var NOTIFICATION_INTERVAL = minutes(Number(process.env.NOTIFICATION_INTERVAL_MIN
 var DISCOVERY_INTERVAL = minutes(Number(process.env.PAST_DISCOVERY_INTERVAL_MIN), 720) * 6e4;
 var CITIZEN_INTERVAL = minutes(Number(process.env.CITIZEN_VERIFICATION_INTERVAL_MIN), 2) * 6e4;
 var SCHEDULED_JOBS = [
-  { name: "ingestion", intervalMs: INGEST_INTERVAL, run: () => runIngestionJob() },
-  { name: "notification", intervalMs: NOTIFICATION_INTERVAL, run: () => runNotificationJob() },
-  { name: "lifecycle", intervalMs: LIFECYCLE_INTERVAL, run: () => runLifecycleJob() },
-  { name: "reconciliation", intervalMs: RECONCILE_INTERVAL, run: () => runReconciliationJob() },
-  { name: "embedding", intervalMs: EMBEDDING_INTERVAL, run: () => runEmbeddingJob() },
-  { name: "past_discovery", intervalMs: DISCOVERY_INTERVAL, run: () => runPastDiscoveryJob() },
-  { name: "citizen_verification", intervalMs: CITIZEN_INTERVAL, run: () => runCitizenVerificationJob() }
+  { name: "ingestion", intervalMs: INGEST_INTERVAL, run: () => runIngestionJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 },
+  { name: "notification", intervalMs: NOTIFICATION_INTERVAL, run: () => runNotificationJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 },
+  { name: "lifecycle", intervalMs: LIFECYCLE_INTERVAL, run: () => runLifecycleJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 },
+  { name: "reconciliation", intervalMs: RECONCILE_INTERVAL, run: () => runReconciliationJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 },
+  { name: "embedding", intervalMs: EMBEDDING_INTERVAL, run: () => runEmbeddingJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 },
+  { name: "past_discovery", intervalMs: DISCOVERY_INTERVAL, run: () => runPastDiscoveryJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 },
+  { name: "citizen_verification", intervalMs: CITIZEN_INTERVAL, run: () => runCitizenVerificationJob(), lastRunAt: 0, lastDurationMs: 0, consecutiveFailures: 0 }
 ];
+var runningNow = /* @__PURE__ */ new Set();
 var schedulerTimer = null;
 var schedulerTickTimer = null;
-var lastRunAt = /* @__PURE__ */ new Map();
-var runningNow = /* @__PURE__ */ new Set();
+var MAX_FAILURE_BACKOFF_MS = 30 * 6e4;
+function effectiveIntervalMs(job) {
+  if (job.consecutiveFailures <= 0) return job.intervalMs;
+  const backoff = Math.min(job.intervalMs * 2 ** Math.min(job.consecutiveFailures, 5), MAX_FAILURE_BACKOFF_MS);
+  return Math.max(backoff, job.intervalMs);
+}
 function tick() {
   if (!isSupabaseConfigured()) return;
   const now2 = Date.now();
   for (const job of SCHEDULED_JOBS) {
     if (runningNow.has(job.name)) continue;
-    const last = lastRunAt.get(job.name) || 0;
-    if (now2 - last < job.intervalMs) continue;
+    const due = now2 - job.lastRunAt >= effectiveIntervalMs(job);
+    if (!due) continue;
     runningNow.add(job.name);
-    lastRunAt.set(job.name, now2);
+    const startedAt = now2;
     job.run().then((result) => {
       const summary = result || {};
+      const failed = summary.status === "FAILED";
+      if (failed) job.consecutiveFailures += 1;
+      else job.consecutiveFailures = 0;
+      job.lastDurationMs = Date.now() - startedAt;
       console.log(
-        `[scheduler] ${job.name}: ${summary.status || "done"} created=${summary.recordsCreated ?? "-"} updated=${summary.recordsUpdated ?? "-"}`
+        `[scheduler] ${job.name}: ${summary.status || "done"} created=${summary.recordsCreated ?? "-"} updated=${summary.recordsUpdated ?? "-"} duration=${(job.lastDurationMs / 1e3).toFixed(1)}s` + (summary.errorMessage ? ` error=${summary.errorMessage.slice(0, 160)}` : "") + (job.consecutiveFailures > 1 ? ` (backoff: next attempt delayed x${2 ** Math.min(job.consecutiveFailures - 1, 5)})` : "")
       );
-    }).catch((error) => console.warn(`[scheduler] ${job.name} failed:`, error.message.slice(0, 200))).finally(() => runningNow.delete(job.name));
+    }).catch((error) => {
+      job.consecutiveFailures += 1;
+      console.warn(
+        `[scheduler] ${job.name} threw after ${((Date.now() - startedAt) / 1e3).toFixed(1)}s:`,
+        error.message.slice(0, 200)
+      );
+    }).finally(() => {
+      job.lastRunAt = Date.now();
+      runningNow.delete(job.name);
+    });
   }
 }
-var STARTUP_DELAY_MS = 8e3;
+var STARTUP_DELAY_MS = 8e3 + Math.floor(Math.random() * 4e3);
 function startJobScheduler() {
-  if (schedulerTimer) return;
+  if (schedulerTimer || schedulerTickTimer) return;
   console.log(
-    `[scheduler] started: ingest ${INGEST_INTERVAL / 6e4}min \xB7 reconcile ${RECONCILE_INTERVAL / 6e4}min \xB7 lifecycle ${LIFECYCLE_INTERVAL / 6e4}min \xB7 notifications ${NOTIFICATION_INTERVAL / 6e4}min \xB7 embeddings ${EMBEDDING_INTERVAL / 6e4}min  \xB7 past-discovery ${DISCOVERY_INTERVAL / 6e4}min \xB7 citizen ${CITIZEN_INTERVAL / 6e4}min`
+    `[scheduler] started: ingest ${INGEST_INTERVAL / 6e4}min \xB7 reconcile ${RECONCILE_INTERVAL / 6e4}min \xB7 lifecycle ${LIFECYCLE_INTERVAL / 6e4}min \xB7 notifications ${NOTIFICATION_INTERVAL / 6e4}min \xB7 embeddings ${EMBEDDING_INTERVAL / 6e4}min \xB7 past-discovery ${DISCOVERY_INTERVAL / 6e4}min \xB7 citizen ${CITIZEN_INTERVAL / 6e4}min`
   );
-  setTimeout(tick, STARTUP_DELAY_MS);
+  const startupTimer = setTimeout(tick, STARTUP_DELAY_MS);
+  if (typeof startupTimer.unref === "function") startupTimer.unref();
   schedulerTickTimer = setInterval(tick, 6e4);
-  if (schedulerTickTimer && typeof schedulerTickTimer.unref === "function") schedulerTickTimer.unref();
 }
 function getSchedulerStatus() {
   return SCHEDULED_JOBS.map((job) => ({
     name: job.name,
     intervalMinutes: Math.round(job.intervalMs / 6e4),
-    lastRunAt: lastRunAt.has(job.name) ? new Date(lastRunAt.get(job.name)).toISOString() : null,
-    running: runningNow.has(job.name)
+    lastRunAt: job.lastRunAt > 0 ? new Date(job.lastRunAt).toISOString() : null,
+    running: runningNow.has(job.name),
+    lastDurationMs: job.lastDurationMs,
+    consecutiveFailures: job.consecutiveFailures
   }));
 }
 
@@ -8908,6 +9444,116 @@ router.get("/events/nearby", async (req, res) => {
     sendError(res, error);
   }
 });
+router.get("/events/nearby-alerts", optionalAuth, async (req, res) => {
+  try {
+    const lat = readNumber(req.query.lat);
+    const lng = readNumber(req.query.lng);
+    const requestedRadiusKm = readNumber(req.query.radiusKm);
+    if (lat !== void 0 && (Math.abs(lat) > 90 || Math.abs(lng ?? 0) > 180)) {
+      throw badRequest("lat and lng must be valid WGS84 coordinates");
+    }
+    if (!isSupabaseConfigured()) throw unavailable("Database not configured");
+    if (!req.user && (lat === void 0 || lng === void 0)) {
+      throw badRequest("lat and lng are required for guest proximity checks");
+    }
+    if (!req.user) rateLimit(req, "nearby-alerts", 30, 6e4);
+    let source = "gps";
+    let userLat = lat;
+    let userLng = lng;
+    let radiusKm = requestedRadiusKm ?? ALERT_DEFAULT_RADIUS_KM;
+    if (req.user) {
+      const homeLocations = await supabaseRest(
+        "rpc/user_locations_geo",
+        {
+          method: "POST",
+          body: JSON.stringify({ p_user_id: req.user.id }),
+          headers: { select: "id,latitude,longitude" }
+        }
+      ).catch(() => []);
+      const home = homeLocations.find((loc) => loc.latitude != null && loc.longitude != null);
+      if (home) {
+        userLat = Number(home.latitude);
+        userLng = Number(home.longitude);
+        source = "home_location";
+      } else if (lat === void 0 || lng === void 0) {
+        res.json({
+          alerts: [],
+          count: 0,
+          location: { source: "none" },
+          message: "No saved home location found \u2014 save one on the Profile page, or allow location access in the Present layer.",
+          databaseReachable: true,
+          evaluatedAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+        return;
+      }
+      const subs = await supabaseRest(
+        `subscriptions?user_id=eq.${encodeURIComponent(req.user.id)}&select=nearby_radius_km&limit=1`,
+        { method: "GET" }
+      ).catch(() => []);
+      if (requestedRadiusKm === void 0 && subs[0]?.nearby_radius_km) {
+        radiusKm = Math.max(1, Math.min(Number(subs[0].nearby_radius_km) || ALERT_DEFAULT_RADIUS_KM, ALERT_MAX_RADIUS_KM));
+      }
+    }
+    if (userLat === void 0 || userLng === void 0) {
+      throw badRequest("A valid location is required");
+    }
+    const fetchRadiusKm = Math.max(
+      Math.min(Number(radiusKm) || ALERT_DEFAULT_RADIUS_KM, ALERT_MAX_RADIUS_KM),
+      250
+    );
+    const candidates = await nearbyEvents(userLat, userLng, fetchRadiusKm);
+    const alertInputs = await Promise.all(
+      candidates.map(async (hit) => {
+        const rows = await supabaseRest(
+          `canonical_events?id=eq.${hit.event_id}&select=id,event_key,title,event_type,status,severity,description,instruction,location_name,state,started_at,last_observed_at,present_until,verification_status,verification_score,verification_method,verification_reason&limit=1`,
+          { method: "GET" }
+        ).catch(() => []);
+        const row = rows[0];
+        if (!row) return null;
+        return {
+          id: String(row.id),
+          eventKey: row.event_key || null,
+          title: String(row.title || ""),
+          eventType: String(row.event_type || "General Alert"),
+          status: row.status || null,
+          severity: row.severity || null,
+          description: row.description || null,
+          instruction: row.instruction || null,
+          locationName: row.location_name || hit.location_name || null,
+          state: row.state || hit.state || null,
+          latitude: hit.latitude,
+          longitude: hit.longitude,
+          presentUntil: row.present_until || null,
+          startedAt: row.started_at || null,
+          lastObservedAt: row.last_observed_at || null,
+          verificationStatus: row.verification_status || null,
+          verificationScore: Number(row.verification_score || 0),
+          verificationMethod: row.verification_method || null,
+          verificationReason: row.verification_reason || null
+        };
+      })
+    );
+    const alerts = buildProximityAlerts(
+      alertInputs.filter((input) => input !== null),
+      userLat,
+      userLng,
+      { requestedRadiusKm: radiusKm }
+    );
+    res.setHeader("Cache-Control", "private, max-age=30");
+    res.json({
+      alerts,
+      count: alerts.length,
+      location: {
+        source,
+        ...typeof userLat === "number" && typeof userLng === "number" ? { lat: userLat, lng: userLng } : {}
+      },
+      evaluatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      databaseReachable: true
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
 router.get("/events/:id", async (req, res) => {
   try {
     if (!isSupabaseConfigured()) throw unavailable("Database not configured");
@@ -9385,7 +10031,23 @@ router.post("/search", async (req, res) => {
     res.json(response);
   } catch (error) {
     if (error instanceof Error && /no live google news sources|insufficient relevant historical evidence/i.test(error.message)) {
-      res.json({ results: [], source: "none", provenance: "none", message: "No verified information was found for this query." });
+      res.json({
+        results: [],
+        source: "none",
+        provenance: "none",
+        message: "No verified information was found for this query in the platform database or external sources.",
+        retrievalState: "NO_DATA"
+      });
+      return;
+    }
+    if (error instanceof Error && /fetch failed|network|ECONN|ETIMEDOUT|timeout|unreachable/i.test(error.message)) {
+      res.json({
+        results: [],
+        source: "unavailable",
+        provenance: "none",
+        message: "The data sources could not be reached while researching this query. Please try again shortly.",
+        retrievalState: "SOURCES_UNREACHABLE"
+      });
       return;
     }
     sendError(res, error);
@@ -9453,11 +10115,13 @@ router.post("/past/search", async (req, res) => {
     }
     if (research.source === "none") {
       const suggestions = await suggestSimilarEvents(query, { limit: 5, threshold: SEARCH_SIMILARITY_THRESHOLD }).catch(() => []);
+      const allProvidersFailed = research.retrieval.sourcesQueried.length > 0 && research.retrieval.sourcesSucceeded.length === 0 && research.retrieval.sourcesFailed.length > 0;
       res.json({
         bundle: null,
         noResults: true,
         error: null,
-        details: "No sufficiently reliable evidence was available from the database or external sources.",
+        details: allProvidersFailed ? `The research sources (${research.retrieval.sourcesFailed.map((f) => f.source).join(", ")}) could not be reached. Please try again shortly.` : "No sufficiently reliable evidence was available from the database or external sources.",
+        retrievalState: allProvidersFailed ? "SOURCES_UNREACHABLE" : "NO_DATA",
         suggestions: suggestions.map((s) => ({ title: s.title, eventId: s.eventId, similarity: s.similarity })),
         retrieval: research.retrieval
       });
@@ -9514,6 +10178,14 @@ router.post("/past/chat", async (req, res) => {
     }
     const history = Array.isArray(req.body?.history) ? req.body.history : [];
     const associatedBundle = req.body?.associatedBundle || null;
+    const intent = classifyChatIntent(message, {
+      hasAssociatedBundle: Boolean(associatedBundle),
+      historyTurns: history.length
+    });
+    if (intent.intent === "GENERIC" && intent.genericReply) {
+      res.json({ reply: intent.genericReply, sources: [], groundingSource: "system" });
+      return;
+    }
     let groundingBundle = associatedBundle;
     let groundingSource = "conversation";
     if (!groundingBundle) {
@@ -9533,6 +10205,27 @@ router.post("/past/chat", async (req, res) => {
           groundingSource = "multi_source_research";
         } catch {
           groundingBundle = null;
+        }
+      } else if (research.source === "none" && /(happened|news|latest|current|recent|today|update)/i.test(message)) {
+        try {
+          const escalated = await researchHistoricalDisaster(message, { historical: false, forceResearch: true });
+          if (escalated.source === "multi_source_research" && escalated.evidence.length > 0) {
+            const builtBundle = await buildHistoricalEvidenceBundle(message);
+            const eventId = escalated.persistence?.eventId || escalated.event?.id || null;
+            if (eventId) await persistRichEvidenceBundle(eventId, builtBundle).catch(() => void 0);
+            groundingBundle = eventId ? { ...builtBundle, id: eventId } : builtBundle;
+            groundingSource = "multi_source_research";
+          } else if (escalated.retrieval.sourcesFailed.length > 0 && escalated.retrieval.sourcesSucceeded.length === 0) {
+            const failedList = escalated.retrieval.sourcesFailed.map((f) => f.source).join(", ");
+            res.json({
+              reply: `I could not complete this research: the external data sources (${failedList}) were unreachable just now, and the platform database has no verified record matching your question. Please try again in a few minutes.`,
+              sources: [],
+              groundingSource: "system",
+              retrievalState: "SOURCES_UNREACHABLE"
+            });
+            return;
+          }
+        } catch {
         }
       }
     }
@@ -10695,6 +11388,44 @@ router.post("/auth/check-signup", async (req, res) => {
       return;
     }
     res.json({ success: true, code: "SIGNUP_ALLOWED" });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+router.post("/auth/check-login", async (req, res) => {
+  try {
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      res.status(422).json({ success: false, code: "INVALID_EMAIL", message: "Please enter a valid email address." });
+      return;
+    }
+    rateLimit(req, "check-login", 30, 6e4);
+    if (!isSupabaseConfigured()) {
+      res.status(503).json({
+        success: false,
+        code: "UNAVAILABLE",
+        message: "The authentication service is temporarily unavailable. Please try again."
+      });
+      return;
+    }
+    const profileRows = await supabaseRest(
+      `profiles?email=eq.${encodeURIComponent(email)}&select=id&limit=1`,
+      { method: "GET" }
+    ).catch(() => []);
+    const exists = profileRows.length > 0;
+    console.log(
+      `[auth:check-login] ${exists ? "existing" : "unknown"} account for ${email.replace(/(.{2}).*(@.*)/, "$1***$2")}`
+    );
+    if (!exists) {
+      res.json({
+        success: false,
+        code: "ACCOUNT_NOT_FOUND",
+        exists: false,
+        message: "You are not registered. Please sign up."
+      });
+      return;
+    }
+    res.json({ success: true, code: "ACCOUNT_EXISTS", exists: true });
   } catch (error) {
     sendError(res, error);
   }

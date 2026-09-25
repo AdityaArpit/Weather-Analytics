@@ -60,6 +60,8 @@ export const ReportIncidentPage: React.FC = () => {
   const [submittedReport, setSubmittedReport] = useState<ReportRow | null>(null);
   const [myReports, setMyReports] = useState<ReportRow[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
+  // True when the attached coordinates came from manual search rather than GPS.
+  const [isManualLocation, setIsManualLocation] = useState(false);
 
   const loadHistory = useCallback(async () => {
     if (!user) { setMyReports([]); setLoadingHistory(false); return; }
@@ -85,6 +87,18 @@ export const ReportIncidentPage: React.FC = () => {
     setLocating(true);
     navigator.geolocation.getCurrentPosition(
       (position) => {
+        // Spec section 1: GPS fixes weaker than the submission gate (±150 m)
+        // are refused here with guidance, instead of failing server-side after
+        // the report was composed. Manual search always provides coordinates
+        // that pass the gate.
+        if (position.coords.accuracy > GPS_MAX_ACCURACY_METERS) {
+          setLocationError(
+            `Your GPS fix is too weak (±${Math.round(position.coords.accuracy)} m; ${GPS_MAX_ACCURACY_METERS} m or better required). Search for the location manually below — manual picks carry a ±${MANUAL_LOCATION_ACCURACY_METERS} m buffer and are always accepted.`,
+          );
+          setLocating(false);
+          return;
+        }
+        setIsManualLocation(false);
         setCoords({
           lat: position.coords.latitude,
           lng: position.coords.longitude,
@@ -121,6 +135,11 @@ export const ReportIncidentPage: React.FC = () => {
     if (reportText.trim().length < 20) return 'Describe the situation in at least 20 characters so responders have context.';
     if (reportText.length > 4000) return 'Report text exceeds 4000 characters.';
     if (!coords) return 'Attach your current location or pick one manually before submitting.';
+    // Mirror of the backend LOCATION_ACCURACY gate: refuse weak fixes before
+    // uploading media so the user never loses a composed report.
+    if (coords.accuracy > GPS_MAX_ACCURACY_METERS) {
+      return `Location accuracy must be ${GPS_MAX_ACCURACY_METERS} meters or better (currently ±${Math.round(coords.accuracy)} m). Re-detect GPS or pick the location manually.`;
+    }
     if (mediaFiles.length > 3) return 'Attach at most 3 media files.';
     return null;
   };
@@ -193,8 +212,6 @@ export const ReportIncidentPage: React.FC = () => {
       </div>
     );
   }
-
-  const maxAccuracy = 150;
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 space-y-6">
@@ -277,7 +294,7 @@ export const ReportIncidentPage: React.FC = () => {
 
           <PremiumPanel
             title="3 · Location"
-            description="GPS locations up to ±150 m are accepted; manually picked locations are capped at ±100 m so reports can be matched to official events."
+            description={`GPS locations up to ±${GPS_MAX_ACCURACY_METERS} m are accepted; manually picked locations carry a ±${MANUAL_LOCATION_ACCURACY_METERS} m buffer so they always pass the gate and can be matched to official events.`}
             actions={coords ? <StatusBadge tone="success">±{Math.round(coords.accuracy)} m</StatusBadge> : <StatusBadge tone="warning">Required</StatusBadge>}
           >
             <div className="space-y-4">
@@ -325,6 +342,10 @@ export const ReportIncidentPage: React.FC = () => {
                         key={`${place.lat},${place.lng}`}
                         type="button"
                         onClick={() => {
+                          // Manual picks always satisfy the ±150 m submission
+                          // gate: they carry the ±100 m manual buffer (spec 1).
+                          setIsManualLocation(true);
+                          setLocationError(null);
                           setCoords({ lat: place.lat, lng: place.lng, accuracy: MANUAL_LOCATION_ACCURACY_METERS });
                           setManualPlaces([]);
                         }}
@@ -335,9 +356,9 @@ export const ReportIncidentPage: React.FC = () => {
                     ))}
                   </div>
                 )}
-                {coords?.accuracy >= MANUAL_LOCATION_ACCURACY_METERS && (
+                {isManualLocation && coords && (
                   <p className="mt-2 text-[11px] text-[#0F1B29]">
-                    Manual locations carry ±{MANUAL_LOCATION_ACCURACY_METERS} m accuracy; the verification pipeline weights them accordingly.
+                    Manual picks always pass the ±{GPS_MAX_ACCURACY_METERS} m submission gate — they carry a ±{MANUAL_LOCATION_ACCURACY_METERS} m buffer, and the verification pipeline weights them accordingly.
                   </p>
                 )}
               </div>
@@ -485,10 +506,13 @@ function Mountain(props: React.SVGProps<SVGSVGElement>) { return <AlertTriangle 
 function Activity(props: React.SVGProps<SVGSVGElement>) { return <AlertTriangle {...props} />; }
 type ApiErr = Error;
 
-/**
- * Manual (non-GPS) location buffer, in meters (spec section 1).
- * Reduced from the legacy ±1000 to ±100. Must stay in sync with
- * MANUAL_LOCATION_ACCURACY_METERS in backend/server/lib/platformConfig.ts —
- * the backend independently enforces this limit at submission.
- */
+// ---------------------------------------------------------------------------
+// Location accuracy gates (spec section 1), mirroring
+// backend/server/lib/platformConfig.ts. The backend independently enforces
+// both limits at submission, so a stale client can never widen them:
+//   - GPS-derived locations must be ≤ GPS_MAX_ACCURACY_METERS (±150 m)
+//   - manual picks always carry MANUAL_LOCATION_ACCURACY_METERS (±100 m),
+//     reduced from the legacy ±1000 so they always pass the gate
+// ---------------------------------------------------------------------------
+const GPS_MAX_ACCURACY_METERS = 150;
 const MANUAL_LOCATION_ACCURACY_METERS = 100;

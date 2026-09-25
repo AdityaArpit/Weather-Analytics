@@ -52,6 +52,9 @@ Migrations in `supabase/migrations/` run **from zero, in order**:
    event changes → `events` topic) + `notifications` added to the `supabase_realtime`
    publication, idempotent `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER` `updated_at` triggers,
    and the `schema_validation` view for post-migration verification.
+6. `202609190006_present_alert_expiry.sql` — the `events_nearby` RPC excludes
+   expired-present events so proximity alerts, warning emails and citizen-report
+   correlation can never fire for stale disasters.
 
 Apply:
 
@@ -97,16 +100,32 @@ never trusted (`401` unauthenticated, `403` authenticated non-admin).
 
 ```bash
 cd backend  && npm install && npm run dev
-cd frontend && npm install && npm run dev
 ```
+
+### Production (Render)
+
+- Build command: `npm install && npm run build` (esbuild → `dist/server.cjs`).
+- Start command: `npm start` → `node dist/server.cjs` — serves the API and starts the
+  in-process scheduler in the same Node process.
+- Set every variable from `backend/.env.example` in the Render dashboard (including
+  `CORS_ORIGINS` with the Vercel frontend URL, `FRONTEND_URL`, and `CRON_SECRET`).
 
 ## Background jobs
 
-Scheduler → `POST /api/jobs/:job` with header `x-cron-secret: $CRON_SECRET`.
+**Production scheduling.** The Render web service runs `npm start` (`node dist/server.cjs`),
+which boots the Express API **and** the in-process scheduler in the same Node process
+(`server.ts` calls `startJobScheduler()` on listen). The scheduler is
+the primary production scheduler: it starts with the service, re-arms after every run,
+never stops on job failure (per-job exponential failure backoff, 30 min cap), and
+serialises runs via `job_runs` + per-job locks. The GitHub Actions cron
+(`.github/workflows/aapda-jobs.yml`) remains an independent safety net — both schedulers
+are idempotent under overlap.
+
+External trigger: `POST /api/jobs/:job` with header `x-cron-secret: $CRON_SECRET`.
 Job names: `ingest`, `reconcile`, `lifecycle`, `embeddings`, `verify-reports`,
-`notifications`, `backfill`. Each run is recorded in `job_runs` (status, counts, errors,
-duration) and visible in the admin console. Admins can trigger the identical job bodies
-manually via `POST /api/admin/jobs/:job`.
+`notifications`, `backfill`, `discovery`. Each run is recorded in `job_runs` (status,
+counts, errors, duration) and visible in the admin console. Admins can trigger the
+identical job bodies manually via `POST /api/admin/jobs/:job`.
 
 Recommended cadence: ingest every 10 min; reconcile hourly; lifecycle every 15 min;
 notifications every 5 min; embeddings every 30 min; backfill weekly.

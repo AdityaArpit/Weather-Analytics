@@ -23,7 +23,7 @@ import {
   searchCanonicalEventsLexical,
 } from './repositories/canonicalEvents';
 import type { CanonicalEventDto, CanonicalEventListResponse } from './types/canonicalEvent';
-import { requireAdmin, requireAuth } from './auth';
+import { requireAdmin, requireAuth, optionalAuth } from './auth';
 import { supabaseRest, isSupabaseConfigured, getSupabaseUrl, SUPABASE_SECRET_KEY } from './db/supabase';
 import { cache } from './lib/cache';
 import { isEmbeddingAvailable, getEmbeddingDimensions } from './lib/embedding';
@@ -46,7 +46,8 @@ import {
   type FactTopic,
 } from './lib/evidenceUtils';
 import { isIndiaRelevantEvidence } from './lib/researchOrchestrator';
-import { SEARCH_SIMILARITY_THRESHOLD } from './lib/platformConfig';
+import { SEARCH_SIMILARITY_THRESHOLD, ALERT_DEFAULT_RADIUS_KM, ALERT_MAX_RADIUS_KM } from './lib/platformConfig';
+import { buildProximityAlerts, type ProximityAlertEventInput } from './lib/proximityAlerts';
 import {
   badRequest,
   forbidden,
@@ -56,6 +57,7 @@ import {
   unavailable,
 } from './lib/httpError';
 import { researchHistoricalDisaster, titleCaseEventName, type PersistedResearch } from './lib/researchOrchestrator';
+import { classifyChatIntent } from './lib/chatIntent';
 import { runPastDiscoveryJob } from './jobs/pastDiscoveryJob';
 import { getSchedulerStatus } from './jobs/scheduler';
 import { scoreReportRisk } from './lib/reportRisk';
@@ -193,7 +195,9 @@ function canonicalEventToEvidenceBundle(event: CanonicalEventDto, claims?: Recor
       ? `${reconciled.rangeMin.toLocaleString('en-IN')} reported in retrieved source coverage.${outliersSuffix}`
       : `${reconciled.rangeMin.toLocaleString('en-IN')}-${reconciled.rangeMax.toLocaleString('en-IN')} reported in retrieved source coverage.${outliersSuffix}`;
   }
-  // No usable mortality numbers at all: fall back to quantified fact snippets  // (already quality-gated) or leave EMPTY — a placeholder sentence is worse  // than nothing because the UI hides empty fields.
+  // No usable mortality numbers at all: fall back to quantified fact snippets
+  // (already quality-gated) or leave EMPTY — a placeholder sentence is worse
+  // than nothing because the UI hides empty fields.
   if (!reportedCasualties) reportedCasualties = casualtyFacts.join('; ');
   if (!reportedCasualties) reportedCasualties = extractCasualtyFallback(sourceText, sources[0]?.id) || '';
 
@@ -334,7 +338,9 @@ function buildTimelineFromSources(
     // ----------------------------------------------------------
     // India gate: a source whose text never anchors to India (or, for a
     // non-India event, never anchors to the event's own country) describes a
-    // DIFFERENT disaster ("Indonesia Earthquake… Flores" carried by an    // India-branded outlet). Such items must never appear in this event's    // chronological timeline.
+    // DIFFERENT disaster ("Indonesia Earthquake… Flores" carried by an
+    // India-branded outlet). Such items must never appear in this event's
+    // chronological timeline.
     // ----------------------------------------------------------
     const anchorCountry = (eventCountry && eventCountry !== 'India' && eventCountry !== ''
       ? eventCountry
@@ -456,6 +462,154 @@ router.get('/events/nearby', async (req: Request, res: Response) => {
     const events = await nearbyEvents(lat, lng, radiusKm);
     res.setHeader('Cache-Control', 'public, max-age=30');
     res.json({ events, count: events.length });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/**
+ * Present-layer proximity alerts (spec section 1).
+ *
+ * Backend-driven: the SERVER decides whether the caller's location is inside
+ * an active disaster's warning radius — the frontend never decides relevance
+ * on its own for this surface.
+ *
+ *   Registered user (Authorization header present)
+ *     -> uses the profile's saved HOME location + the subscription radius.
+ *   Guest (no Authorization header)
+ *     -> uses the explicit lat/lng the browser sent (location access was
+ *        granted by the user in the Present layer; registration never required).
+ *
+ * Expired-present and non-public events are excluded server-side, and alerts
+ * are deduplicated per event id. Guests are rate-limited (they are unthrottled
+ * by identity), and the payload carries `databaseReachable` so the client can
+ * distinguish "no nearby disasters" from "source unreachable".
+ */
+router.get('/events/nearby-alerts', optionalAuth, async (req: Request, res: Response) => {
+  try {
+    const lat = readNumber(req.query.lat);
+    const lng = readNumber(req.query.lng);
+    const requestedRadiusKm = readNumber(req.query.radiusKm);
+
+    if (lat !== undefined && (Math.abs(lat) > 90 || Math.abs(lng ?? 0) > 180)) {
+      throw badRequest('lat and lng must be valid WGS84 coordinates');
+    }
+
+    if (!isSupabaseConfigured()) throw unavailable('Database not configured');
+    if (!req.user && (lat === undefined || lng === undefined)) {
+      throw badRequest('lat and lng are required for guest proximity checks');
+    }
+    if (!req.user) rateLimit(req, 'nearby-alerts', 30, 60_000);
+
+    type LocationSource = 'gps' | 'home_location';
+    let source: LocationSource = 'gps';
+    let userLat = lat;
+    let userLng = lng;
+    let radiusKm = requestedRadiusKm ?? ALERT_DEFAULT_RADIUS_KM;
+
+    if (req.user) {
+      // Saved home location is authoritative for registered users.
+      const homeLocations = await supabaseRest<Array<{ latitude: number | null; longitude: number | null }>>(
+        'rpc/user_locations_geo',
+        {
+          method: 'POST',
+          body: JSON.stringify({ p_user_id: req.user.id }),
+          headers: { select: 'id,latitude,longitude' },
+        },
+      ).catch(() => [] as Array<{ latitude: number | null; longitude: number | null }>);
+      const home = homeLocations.find((loc) => loc.latitude != null && loc.longitude != null);
+      if (home) {
+        userLat = Number(home.latitude);
+        userLng = Number(home.longitude);
+        source = 'home_location';
+      } else if (lat === undefined || lng === undefined) {
+        // Registered but no saved location and no GPS fallback: nothing to check.
+        res.json({
+          alerts: [],
+          count: 0,
+          location: { source: 'none' as const },
+          message: 'No saved home location found — save one on the Profile page, or allow location access in the Present layer.',
+          databaseReachable: true,
+          evaluatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      // Respect the subscription radius when the caller did not send one.
+      const subs = await supabaseRest<Array<{ nearby_radius_km: number }>>(
+        `subscriptions?user_id=eq.${encodeURIComponent(req.user.id)}&select=nearby_radius_km&limit=1`,
+        { method: 'GET' },
+      ).catch(() => [] as Array<{ nearby_radius_km: number }>);
+      if (requestedRadiusKm === undefined && subs[0]?.nearby_radius_km) {
+        radiusKm = Math.max(1, Math.min(Number(subs[0].nearby_radius_km) || ALERT_DEFAULT_RADIUS_KM, ALERT_MAX_RADIUS_KM));
+      }
+    }
+
+    if (userLat === undefined || userLng === undefined) {
+      throw badRequest('A valid location is required');
+    }
+
+    // Candidate set: PostGIS pre-filter at the widest relevant radius. Category
+    // radii (up to 250 km for earthquakes) can exceed the user's personal cap,
+    // so fetch at the union and let the alert engine apply exact per-category
+    // radii. The RPC clamps at 500 km, matching ALERT_MAX_RADIUS_KM <= 500.
+    const fetchRadiusKm = Math.max(
+      Math.min(Number(radiusKm) || ALERT_DEFAULT_RADIUS_KM, ALERT_MAX_RADIUS_KM),
+      250,
+    );
+    const candidates = await nearbyEvents(userLat, userLng, fetchRadiusKm);
+
+    const alertInputs = await Promise.all(
+      candidates.map(async (hit) => {
+        const rows = await supabaseRest<Array<Record<string, unknown>>>(
+          `canonical_events?id=eq.${hit.event_id}&select=id,event_key,title,event_type,status,severity,description,instruction,location_name,state,started_at,last_observed_at,present_until,verification_status,verification_score,verification_method,verification_reason&limit=1`,
+          { method: 'GET' },
+        ).catch(() => [] as Array<Record<string, unknown>>);
+        const row = rows[0];
+        if (!row) return null;
+        return {
+          id: String(row.id),
+          eventKey: (row.event_key as string) || null,
+          title: String(row.title || ''),
+          eventType: String(row.event_type || 'General Alert'),
+          status: (row.status as string) || null,
+          severity: (row.severity as string) || null,
+          description: (row.description as string) || null,
+          instruction: (row.instruction as string) || null,
+          locationName: (row.location_name as string) || hit.location_name || null,
+          state: (row.state as string) || hit.state || null,
+          latitude: hit.latitude,
+          longitude: hit.longitude,
+          presentUntil: (row.present_until as string) || null,
+          startedAt: (row.started_at as string) || null,
+          lastObservedAt: (row.last_observed_at as string) || null,
+          verificationStatus: (row.verification_status as string) || null,
+          verificationScore: Number(row.verification_score || 0),
+          verificationMethod: (row.verification_method as string) || null,
+          verificationReason: (row.verification_reason as string) || null,
+        } as ProximityAlertEventInput;
+      }),
+    );
+
+    const alerts = buildProximityAlerts(
+      alertInputs.filter((input): input is ProximityAlertEventInput => input !== null),
+      userLat,
+      userLng,
+      { requestedRadiusKm: radiusKm },
+    );
+
+    res.setHeader('Cache-Control', 'private, max-age=30');
+    res.json({
+      alerts,
+      count: alerts.length,
+      location: {
+        source,
+        ...(typeof userLat === 'number' && typeof userLng === 'number'
+          ? { lat: userLat, lng: userLng }
+          : {}),
+      },
+      evaluatedAt: new Date().toISOString(),
+      databaseReachable: true,
+    });
   } catch (error) {
     sendError(res, error);
   }
@@ -1041,7 +1195,25 @@ router.post('/search', async (req: Request, res: Response) => {
     res.json(response);
   } catch (error) {
     if (error instanceof Error && /no live google news sources|insufficient relevant historical evidence/i.test(error.message)) {
-      res.json({ results: [], source: 'none', provenance: 'none', message: 'No verified information was found for this query.' });
+      // "No data" must be honest about WHY: no evidence exists vs the sources
+      // could not be reached (spec section 14).
+      res.json({
+        results: [],
+        source: 'none',
+        provenance: 'none',
+        message: 'No verified information was found for this query in the platform database or external sources.',
+        retrievalState: 'NO_DATA',
+      });
+      return;
+    }
+    if (error instanceof Error && /fetch failed|network|ECONN|ETIMEDOUT|timeout|unreachable/i.test(error.message)) {
+      res.json({
+        results: [],
+        source: 'unavailable',
+        provenance: 'none',
+        message: 'The data sources could not be reached while researching this query. Please try again shortly.',
+        retrievalState: 'SOURCES_UNREACHABLE',
+      });
       return;
     }
     sendError(res, error);
@@ -1129,11 +1301,20 @@ router.post('/past/search', async (req: Request, res: Response) => {
     if (research.source === 'none') {
       // Stage 2 (spec 9.2): offer similar event names before declaring no data.
       const suggestions = await suggestSimilarEvents(query, { limit: 5, threshold: SEARCH_SIMILARITY_THRESHOLD }).catch(() => []);
+      // Honest retrieval state (spec section 14): every provider failing is an
+      // availability problem, not an absence of evidence.
+      const allProvidersFailed =
+        research.retrieval.sourcesQueried.length > 0 &&
+        research.retrieval.sourcesSucceeded.length === 0 &&
+        research.retrieval.sourcesFailed.length > 0;
       res.json({
         bundle: null,
         noResults: true,
         error: null,
-        details: 'No sufficiently reliable evidence was available from the database or external sources.',
+        details: allProvidersFailed
+          ? `The research sources (${research.retrieval.sourcesFailed.map((f) => f.source).join(', ')}) could not be reached. Please try again shortly.`
+          : 'No sufficiently reliable evidence was available from the database or external sources.',
+        retrievalState: allProvidersFailed ? 'SOURCES_UNREACHABLE' : 'NO_DATA',
         suggestions: suggestions.map((s) => ({ title: s.title, eventId: s.eventId, similarity: s.similarity })),
         retrieval: research.retrieval,
       });
@@ -1202,10 +1383,23 @@ router.post('/past/chat', async (req: Request, res: Response) => {
     const history = Array.isArray(req.body?.history) ? req.body.history : [];
     const associatedBundle = req.body?.associatedBundle || null;
 
+    // ---- Intent routing (spec sections 5 & 8) --------------------------------
+    // Generic/system/platform questions are answered from a safe static
+    // capability layer WITHOUT touching the disaster database; they must never
+    // collapse into "no data found". Disaster queries continue below.
+    const intent = classifyChatIntent(message, {
+      hasAssociatedBundle: Boolean(associatedBundle),
+      historyTurns: history.length,
+    });
+    if (intent.intent === 'GENERIC' && intent.genericReply) {
+      res.json({ reply: intent.genericReply, sources: [], groundingSource: 'system' });
+      return;
+    }
+
     // Ground the answer in canonical events retrieved from the database when
     // the user is not already discussing a specific dossier.
     let groundingBundle = associatedBundle;
-    let groundingSource: 'database' | 'multi_source_research' | 'conversation' = 'conversation';
+    let groundingSource: 'database' | 'multi_source_research' | 'conversation' | 'system' = 'conversation';
     if (!groundingBundle) {
       const research = await researchHistoricalDisaster(message, { historical: true });
       if (research.source === 'database' && research.event?.id) {
@@ -1225,6 +1419,37 @@ router.post('/past/chat', async (req: Request, res: Response) => {
           groundingSource = 'multi_source_research';
         } catch {
           groundingBundle = null;
+        }
+      } else if (research.source === 'none' && /(happened|news|latest|current|recent|today|update)/i.test(message)) {
+        // Automatic external escalation (spec section 6): when the database has
+        // NO relevant evidence and the query seeks event information, run the
+        // external research pipeline WITHOUT waiting for the user to ask for
+        // "detailed research". researchHistoricalDisaster already attempted
+        // providers; a plain DB miss here means providers were skipped — force
+        // the external path once.
+        try {
+          const escalated = await researchHistoricalDisaster(message, { historical: false, forceResearch: true });
+          if (escalated.source === 'multi_source_research' && escalated.evidence.length > 0) {
+            const builtBundle = await buildHistoricalEvidenceBundle(message);
+            const eventId = escalated.persistence?.eventId || escalated.event?.id || null;
+            if (eventId) await persistRichEvidenceBundle(eventId, builtBundle).catch(() => undefined);
+            groundingBundle = eventId ? { ...builtBundle, id: eventId } : builtBundle;
+            groundingSource = 'multi_source_research';
+          } else if (escalated.retrieval.sourcesFailed.length > 0 && escalated.retrieval.sourcesSucceeded.length === 0) {
+            // Every external provider failed: say so instead of pretending the
+            // event does not exist (spec section 14).
+            const failedList = escalated.retrieval.sourcesFailed.map((f) => f.source).join(', ');
+            res.json({
+              reply: `I could not complete this research: the external data sources (${failedList}) were unreachable just now, and the platform database has no verified record matching your question. Please try again in a few minutes.`,
+              sources: [],
+              groundingSource: 'system',
+              retrievalState: 'SOURCES_UNREACHABLE',
+            });
+            return;
+          }
+        } catch {
+          // Escalation failure is non-fatal; the grounded chat below explains
+          // the evidence shortfall honestly.
         }
       }
     }
@@ -2698,6 +2923,60 @@ router.post('/auth/check-signup', async (req: Request, res: Response) => {
 });
 
 /**
+ * Login pre-check (spec 13.2): the backend determines whether the email is
+ * registered so the frontend can show "You are not registered. Please sign
+ * up." instead of a misleading "incorrect password" for an unknown account.
+ *
+ * Security posture (spec 13.5): registration on this platform is open
+ * self-service signup, so account existence is already public knowledge —
+ * the duplicate-signup precheck reveals the same fact in the other direction.
+ * The endpoint receives the EMAIL ONLY (never the password), is strictly
+ * rate-limited, logs a masked address, and maps failures to structured codes.
+ */
+router.post('/auth/check-login', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      res.status(422).json({ success: false, code: 'INVALID_EMAIL', message: 'Please enter a valid email address.' });
+      return;
+    }
+    rateLimit(req, 'check-login', 30, 60_000);
+
+    if (!isSupabaseConfigured()) {
+      res.status(503).json({
+        success: false,
+        code: 'UNAVAILABLE',
+        message: 'The authentication service is temporarily unavailable. Please try again.',
+      });
+      return;
+    }
+
+    const profileRows = await supabaseRest<Array<{ id: string }>>(
+      `profiles?email=eq.${encodeURIComponent(email)}&select=id&limit=1`,
+      { method: 'GET' },
+    ).catch(() => [] as Array<{ id: string }>);
+    const exists = profileRows.length > 0;
+
+    console.log(
+      `[auth:check-login] ${exists ? 'existing' : 'unknown'} account for ${email.replace(/(.{2}).*(@.*)/, '$1***$2')}`,
+    );
+
+    if (!exists) {
+      res.json({
+        success: false,
+        code: 'ACCOUNT_NOT_FOUND',
+        exists: false,
+        message: 'You are not registered. Please sign up.',
+      });
+      return;
+    }
+    res.json({ success: true, code: 'ACCOUNT_EXISTS', exists: true });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+/**
  * Forgot-password pre-validation. NEVER reveals account existence: the
  * response is identical whether or not the email is registered (spec 11.2).
  * Internal result is logged for diagnostics only.
@@ -2799,12 +3078,5 @@ router.get('/health', async (_req: Request, res: Response) => {
   });
 });
 
-router.get('/health', async (_req: Request, res: Response) => {
-  return res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    version: '2.1.0'
-  });
-});
 
 export default router;

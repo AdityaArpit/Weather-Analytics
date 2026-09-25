@@ -615,6 +615,7 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [resetSent, setResetSent] = useState(false);
 
@@ -623,6 +624,7 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setErrorCode(null);
     setNotice(null);
     if (mode === 'forgot') {
       if (!validEmail(email)) {
@@ -644,6 +646,11 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
     setSubmitting(true);
     try {
       if (mode === 'register') {
+        if (!name.trim()) {
+          setError('Enter your full name to create an account.');
+          setSubmitting(false);
+          return;
+        }
         if (password.length < 8) {
           setError('Password must be at least 8 characters.');
           setSubmitting(false);
@@ -660,7 +667,9 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
         onSuccess();
       }
     } catch (err) {
-      setError((err as Error).message);
+      const code = (err as { code?: string }).code || null;
+      setErrorCode(code);
+      setError((err as Error).message || 'Authentication failed. Please try again.');
     } finally {
       setSubmitting(false);
     }
@@ -669,6 +678,7 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
   const switchMode = (next: 'login' | 'register' | 'forgot') => {
     setMode(next);
     setError(null);
+    setErrorCode(null);
     setNotice(null);
     setResetSent(false);
   };
@@ -733,7 +743,30 @@ function AuthPanel({ onSuccess, push }: { onSuccess: () => void; push: (kind: 's
               <div role="status" className="p-3.5 rounded-xl bg-[#ECF8F8] border border-[#B8BEC5]/60 text-xs text-[#0F1B29] leading-relaxed">{notice}</div>
             )}
             {error && (
-              <div role="alert" className="p-3.5 rounded-xl bg-[#F3F4F5] border border-[#DDDDDD] text-xs text-[#0F1B29] leading-relaxed">{error}</div>
+              <div role="alert" className="p-3.5 rounded-xl bg-[#F3F4F5] border border-[#DDDDDD] text-xs text-[#0F1B29] leading-relaxed">
+                {error}
+                {/* Structured auth errors carry an explicit next-step CTA
+                    (spec 13): "already registered" routes to Sign in,
+                    "not registered" routes to Sign up. */}
+                {errorCode === 'USER_ALREADY_REGISTERED' && mode !== 'login' && (
+                  <button
+                    type="button"
+                    onClick={() => switchMode('login')}
+                    className="mt-2 block font-bold text-[#0F1B29] underline cursor-pointer"
+                  >
+                    Go to Sign in →
+                  </button>
+                )}
+                {errorCode === 'ACCOUNT_NOT_FOUND' && mode !== 'register' && (
+                  <button
+                    type="button"
+                    onClick={() => switchMode('register')}
+                    className="mt-2 block font-bold text-[#0F1B29] underline cursor-pointer"
+                  >
+                    Create an account →
+                  </button>
+                )}
+              </div>
             )}
 
             <PrimaryButton type="submit" loading={submitting} className="w-full">

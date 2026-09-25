@@ -19,6 +19,13 @@ import { apiUrl } from '../../lib/api';
 import { canonicalEventToSachetAlert, type CanonicalEventDto } from '../../lib/canonicalEvents';
 import { dataCache } from '../../lib/dataCache';
 import { useRealtime } from '../../lib/useRealtime';
+import { useAuth } from '../../lib/AuthContext';
+import {
+  fetchServerProximityAlerts,
+  dismissProximityAlerts,
+  topProximityAlert,
+  type ProximityAlertDto,
+} from '../../lib/proximityAlerts';
 
 interface PresentWorkspaceProps {
   onFeedStatusChange?: (status: 'LIVE_FETCH' | 'ETAG_CACHED' | 'FALLBACK_SNAPSHOT' | 'ERROR', lastUpdated: string) => void;
@@ -27,11 +34,14 @@ interface PresentWorkspaceProps {
 export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
   onFeedStatusChange,
 }) => {
+  const { user } = useAuth();
   const [alerts, setAlerts] = useState<SachetAlert[]>([]);
   const [etag, setEtag] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [selectedAlert, setSelectedAlert] = useState<SachetAlert | null>(null);
   const [mobileTab, setMobileTab] = useState<'india' | 'nearme'>('india');
+  const [serverProximity, setServerProximity] = useState<ReturnType<typeof topProximityAlert>>(null);
+  const [serverProximityError, setServerProximityError] = useState<string | null>(null);
 
   const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
 
@@ -132,6 +142,45 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
     }
   }, [alerts, userLocation]);
 
+  // ---- Server-driven proximity alerts (spec section 1) ---------------------
+  // The BACKEND decides whether the active disaster set intersects the user's
+  // location (saved home location for registered users, explicit browser
+  // location for guests). Guests without granted location access are skipped
+  // silently — a proximity check must never nag for permissions.
+  useEffect(() => {
+    if (!user && !userLocation) {
+      setServerProximity(null);
+      return;
+    }
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const result = await fetchServerProximityAlerts(userLocation, Boolean(user));
+        if (cancelled) return;
+        setServerProximityError(null);
+        setServerProximity(topProximityAlert(result.all));
+        const freshDtos: ProximityAlertDto[] = result.fresh.map((entry) => entry.dto);
+        if (freshDtos.length > 0) {
+          // Surface the strongest fresh alert, then remember ALL of them so a
+          // 60s poll never re-toasts the same disaster.
+          dismissProximityAlerts(freshDtos);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setServerProximityError((err as Error).message);
+          // Distinguish "no nearby disasters" from "the check failed" in logs
+          console.warn('[present] proximity check failed:', (err as Error).message);
+        }
+      }
+    };
+    void check();
+    const timer = setInterval(check, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [user, userLocation?.lat, userLocation?.lng]);
+
   // True realtime: database-triggered broadcast when a verified event appears
   // or changes. Refresh the map immediately instead of waiting for polling;
   // a SACHET-style toast surfaces the event through the relevance engine.
@@ -156,7 +205,11 @@ export const PresentWorkspace: React.FC<PresentWorkspaceProps> = ({
     .map((r) => r.alert);
 
   const topRelevance =
-    relevanceResults.find((r) => r.isInsideBoundary && r.status !== 'NOT_RELEVANT') || null;
+    relevanceResults.find((r) => r.isInsideBoundary && r.status !== 'NOT_RELEVANT') ||
+    // Server-verified proximity result (authoritative for registered users
+    // whose home location differs from the browser location).
+    serverProximity ||
+    null;
 
   const handleSelectAlert = async (alert: SachetAlert) => {
     setSelectedAlert(alert);

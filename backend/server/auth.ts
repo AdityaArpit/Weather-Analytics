@@ -84,3 +84,18 @@ export function requireAdmin(req: Request, _res: Response, next: NextFunction): 
   }
   next();
 }
+
+/**
+ * Optional authentication for public alert surfaces: an anonymous guest gets
+ * `req.user = undefined` and the request continues; a guest who PRESENTS a
+ * token is still validated (never silently downgraded), so an expired token
+ * surfaces as a 401 instead of being treated as a logged-out visitor.
+ */
+export async function optionalAuth(req: Request, _res: Response, next: NextFunction): Promise<void> {
+  const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (!token) {
+    next();
+    return;
+  }
+  await requireAuth(req, _res, next);
+}
