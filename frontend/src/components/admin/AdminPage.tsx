@@ -972,16 +972,6 @@ const loadAll = useCallback(async (options?: { silent?: boolean; eventType?: str
                   { label: 'Timeout', value: (jobs || []).filter((j) => j.status === 'TIMEOUT').length, color: '#F59E0B' },
                 ]}
               />
-              <div>
-                <p className="text-[10px] uppercase tracking-wider font-bold text-[#747F8D] mb-2">By event type</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {insights.byType.slice(0, 10).map((type) => (
-                    <StatusBadge key={type.eventType} tone={type.severeCount > 0 ? 'warning' : 'neutral'}>
-                      {type.eventType} · {type.count}{type.severeCount > 0 ? ` (${type.severeCount} severe)` : ''}
-                    </StatusBadge>
-                  ))}
-                </div>
-              </div>
             </div>
           </div>
         )}
