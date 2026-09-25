@@ -1,4 +1,5 @@
 import { cache } from './cache';
+import { geocodeFirstMatch } from './geocodeClient';
 
 const GEOCODE_CACHE_TTL = 86400;
 
@@ -92,36 +93,22 @@ export async function geocodeLocation(locationText: string): Promise<GeocodeResu
   const { city, state, district } = extractLocationsFromText(locationText);
 
   try {
-    const query = encodeURIComponent(locationText);
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${query}`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'AapdaDrishti/1.0 (disaster-intelligence)',
-        Accept: 'application/json',
-      },
-    });
-
-    if (response.ok) {
-      const results = await response.json();
-      if (Array.isArray(results) && results.length > 0) {
-        const item = results[0];
-        const lat = parseFloat(item.lat);
-        const lng = parseFloat(item.lon);
-        if (Number.isFinite(lat) && Number.isFinite(lng)) {
-          const result: GeocodeResult = {
-            lat,
-            lng,
-            confidence: 0.85,
-            resolvedName: item.display_name || locationText,
-            city: city || item.address?.city || item.address?.town || undefined,
-            district: district || item.address?.county || item.address?.district || undefined,
-            state: state || item.address?.state || undefined,
-            country: item.address?.country || 'India',
-          };
-          cache.set('geocode', cacheKey, result, GEOCODE_CACHE_TTL);
-          return result;
-        }
-      }
+    // Shared resilient client: timeout + retry + Photon fallback (see
+    // geocodeClient.ts). Falls through to the state-centroid below on null.
+    const match = await geocodeFirstMatch(locationText);
+    if (match) {
+      const result: GeocodeResult = {
+        lat: match.lat,
+        lng: match.lng,
+        confidence: 0.85,
+        resolvedName: match.resolvedName || locationText,
+        city,
+        district,
+        state,
+        country: 'India',
+      };
+      cache.set('geocode', cacheKey, result, GEOCODE_CACHE_TTL);
+      return result;
     }
   } catch {
     // Geocoder unavailable, fall through to centroid

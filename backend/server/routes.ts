@@ -36,6 +36,7 @@ import {
   embedAndStoreSearchDocument,
 } from './lib/searchRetrieval';
 import { rateLimit } from './lib/rateLimit';
+import { geocodePlaces } from './lib/geocodeClient';
 import {
   isSubstantiveFact,
   normalizeFactKey,
@@ -1526,27 +1527,12 @@ router.get('/geocode', async (req: Request, res: Response) => {
       return;
     }
 
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&q=${encodeURIComponent(query)}`;
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'AapdaDrishti/2.0 (geocoding)', Accept: 'application/json' },
-    });
-
-    if (!response.ok) throw unavailable('Geocoding service unavailable');
-
-    const results = (await response.json()) as Array<Record<string, unknown>>;
-    const places = (Array.isArray(results) ? results : [])
-      .map((item) => {
-        const address = (item.address || {}) as Record<string, string>;
-        return {
-          name: String(item.display_name || item.name || query),
-          lat: Number(item.lat),
-          lng: Number(item.lon),
-          state: address.state || address.state_district || address.county || undefined,
-          district: address.county || address.city_district || address.district || undefined,
-          country: address.country || 'India',
-        };
-      })
-      .filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng));
+    // Resilient lookup: Nominatim primary, Photon fallback, timeout + retry on
+    // both. Nominatim's free tier (~1 req/s per IP) is shared with the
+    // ingestion jobs, so transient 429/5xx must degrade gracefully instead of
+    // surfacing "Geocoding service unavailable" to users.
+    const places = await geocodePlaces(query);
+    if (places === null) throw unavailable('Geocoding service temporarily unavailable, please try again in a moment');
 
     const payload = { query, count: places.length, places, timestamp: new Date().toISOString() };
     cache.set('geocode', cacheKey, payload, cache.getTTL('geocode'));
